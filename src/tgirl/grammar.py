@@ -433,8 +433,23 @@ def diff(a: GrammarOutput, b: GrammarOutput) -> GrammarDiff:
 
     Returns:
         Diff showing added, removed, and changed productions.
-
-    Raises:
-        NotImplementedError: Stub -- not yet implemented.
     """
-    raise NotImplementedError
+    a_map = {p.name: p for p in a.productions}
+    b_map = {p.name: p for p in b.productions}
+
+    a_names = set(a_map)
+    b_names = set(b_map)
+
+    added = tuple(
+        b_map[n] for n in sorted(b_names - a_names)
+    )
+    removed = tuple(
+        a_map[n] for n in sorted(a_names - b_names)
+    )
+    changed = tuple(
+        (a_map[n], b_map[n])
+        for n in sorted(a_names & b_names)
+        if a_map[n].rule != b_map[n].rule
+    )
+
+    return GrammarDiff(added=added, removed=removed, changed=changed)

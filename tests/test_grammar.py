@@ -117,7 +117,7 @@ class TestGrammarStubs:
         assert output.text
         assert output.snapshot_hash
 
-    def test_diff_stub_exists(self) -> None:
+    def test_diff_exists(self) -> None:
         from tgirl.grammar import GrammarOutput, diff
 
         go = GrammarOutput(
@@ -127,8 +127,10 @@ class TestGrammarStubs:
             tool_quotas={},
             cost_remaining=None,
         )
-        with pytest.raises(NotImplementedError):
-            diff(go, go)
+        result = diff(go, go)
+        assert result.added == ()
+        assert result.removed == ()
+        assert result.changed == ()
 
 
 # --- Task 2: Type-to-production converter ---
@@ -941,3 +943,126 @@ class TestDeterminism:
         # Productions should not have duplicates
         names = [p.name for p in output.productions]
         assert len(names) == len(set(names))
+
+
+# --- Task 7: Grammar diffing ---
+
+
+class TestDiff:
+    """Verify diff() between two grammars."""
+
+    def _make_output(
+        self, tools: tuple, quotas: dict | None = None
+    ) -> GrammarOutput:  # noqa: F821
+        import time
+
+        from tgirl.grammar import generate
+        from tgirl.types import RegistrySnapshot
+
+        snap = RegistrySnapshot(
+            tools=tools,
+            quotas=quotas or {},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        return generate(snap)
+
+    def test_diff_identical_grammars(self) -> None:
+        from tgirl.grammar import diff
+        from tgirl.types import (
+            PrimitiveType,
+            ToolDefinition,
+        )
+
+        tool = ToolDefinition(
+            name="ping",
+            parameters=(),
+            return_type=PrimitiveType(kind="str"),
+        )
+        out1 = self._make_output((tool,))
+        out2 = self._make_output((tool,))
+        result = diff(out1, out2)
+        assert result.added == ()
+        assert result.removed == ()
+        assert result.changed == ()
+
+    def test_diff_added_tool(self) -> None:
+        from tgirl.grammar import diff
+        from tgirl.types import (
+            PrimitiveType,
+            ToolDefinition,
+        )
+
+        tool1 = ToolDefinition(
+            name="ping",
+            parameters=(),
+            return_type=PrimitiveType(kind="str"),
+        )
+        tool2 = ToolDefinition(
+            name="pong",
+            parameters=(),
+            return_type=PrimitiveType(kind="str"),
+        )
+        out1 = self._make_output((tool1,))
+        out2 = self._make_output((tool1, tool2))
+        result = diff(out1, out2)
+        added_names = {p.name for p in result.added}
+        assert "call_pong" in added_names
+
+    def test_diff_removed_tool(self) -> None:
+        from tgirl.grammar import diff
+        from tgirl.types import (
+            PrimitiveType,
+            ToolDefinition,
+        )
+
+        tool1 = ToolDefinition(
+            name="ping",
+            parameters=(),
+            return_type=PrimitiveType(kind="str"),
+        )
+        tool2 = ToolDefinition(
+            name="pong",
+            parameters=(),
+            return_type=PrimitiveType(kind="str"),
+        )
+        out1 = self._make_output((tool1, tool2))
+        out2 = self._make_output((tool1,))
+        result = diff(out1, out2)
+        removed_names = {p.name for p in result.removed}
+        assert "call_pong" in removed_names
+
+    def test_diff_changed_parameter(self) -> None:
+        from tgirl.grammar import diff
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            ToolDefinition,
+        )
+
+        tool_v1 = ToolDefinition(
+            name="fetch",
+            parameters=(
+                ParameterDef(
+                    name="url",
+                    type_repr=PrimitiveType(kind="str"),
+                ),
+            ),
+            return_type=PrimitiveType(kind="str"),
+        )
+        tool_v2 = ToolDefinition(
+            name="fetch",
+            parameters=(
+                ParameterDef(
+                    name="url",
+                    type_repr=PrimitiveType(kind="int"),
+                ),
+            ),
+            return_type=PrimitiveType(kind="str"),
+        )
+        out1 = self._make_output((tool_v1,))
+        out2 = self._make_output((tool_v2,))
+        result = diff(out1, out2)
+        # The param type production should differ
+        assert len(result.changed) > 0
