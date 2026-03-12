@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tgirl"
+version = "0.1.0"
+description = "Transformational Grammar for Inference-Restricting Languages"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Maddy Muscari" },
+]
+dependencies = [
+    "pydantic>=2.0",
+    "annotated-types>=0.6",
+    "structlog>=24.0",
+]
+
+[project.optional-dependencies]
+grammar = ["jinja2>=3.0"]
+compile = ["hy>=1.0,<2.0", "RestrictedPython>=7.0"]
+transport = ["torch>=2.0", "pot>=0.9"]
+sample = ["outlines>=0.1", "torch>=2.0"]
+serve = ["fastapi>=0.110", "uvicorn>=0.28", "transformers>=4.48"]
+bridge = ["mcp>=1.0"]
+all = [
+    "tgirl[grammar]",
+    "tgirl[compile]",
+    "tgirl[transport]",
+    "tgirl[sample]",
+    "tgirl[serve]",
+    "tgirl[bridge]",
+]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "hypothesis>=6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,18 @@
+#!/bin/bash
+# Push Hands pre-commit hook: Lint + type check (fast gate)
+#
+# Replace these commands with your stack's equivalents:
+#   Python: ruff check src/ --fix && mypy src/ --ignore-missing-imports
+#   JS/TS:  eslint src/ --fix && tsc --noEmit
+#   Rust:   cargo clippy -- -D warnings && cargo check
+#   Go:     golangci-lint run ./... && go vet ./...
+
+set -e
+
+# Skip if no source files exist (e.g., template repo with only .gitkeep)
+find src/ -name '*.py' -print -quit 2>/dev/null | grep -q . || exit 0
+
+# --- Customize below for your stack ---
+
+ruff check src/ --fix
+mypy src/ --ignore-missing-imports

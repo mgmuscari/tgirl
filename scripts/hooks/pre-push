@@ -1,0 +1,17 @@
+#!/bin/bash
+# Push Hands pre-push hook: Full test suite (slower gate)
+#
+# Replace with your stack's equivalents:
+#   Python: pytest tests/ -v --tb=short
+#   JS/TS:  npm test
+#   Rust:   cargo test
+#   Go:     go test ./...
+
+set -e
+
+# Skip if no test files exist (e.g., template repo with only .gitkeep)
+find tests/ -name '*.py' -print -quit 2>/dev/null | grep -q . || exit 0
+
+# --- Customize below for your stack ---
+
+pytest tests/ -v --tb=short

@@ -1,0 +1,27 @@
+#!/bin/bash
+# Push Hands commit-msg hook: Enforce Conventional Commits
+# https://www.conventionalcommits.org/
+
+FIRST_LINE=$(head -1 "$1")
+PATTERN="^(feat|fix|docs|test|refactor|chore|style|perf|ci|build|revert)(\(.+\))?: .{1,}$"
+
+if ! echo "$FIRST_LINE" | grep -qE "$PATTERN"; then
+    echo "ERROR: Commit message must follow Conventional Commits format"
+    echo ""
+    echo "  <type>(<optional scope>): <description>"
+    echo ""
+    echo "  Types: feat, fix, docs, test, refactor, chore, style, perf, ci, build, revert"
+    echo ""
+    echo "  Examples:"
+    echo "    feat: add user authentication flow"
+    echo "    fix: prevent IDOR in claim-analysis endpoint"
+    echo "    docs: update CLAUDE.md — never use raw SQL in handlers"
+    echo "    test: add integration tests for payment processing"
+    exit 1
+fi
+
+if [ ${#FIRST_LINE} -gt 72 ]; then
+    echo "ERROR: Commit message first line exceeds 72 characters (${#FIRST_LINE})"
+    echo "  Shorten the subject line and move details to the commit body."
+    exit 1
+fi
