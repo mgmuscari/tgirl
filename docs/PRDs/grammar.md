@@ -1,6 +1,6 @@
 # PRD: tgirl.grammar — Dynamic CFG Generation
 
-## Status: DRAFT
+## Status: IMPLEMENTED
 ## Author: agent (Proposer)
 ## Date: 2026-03-12
 ## Branch: feature/grammar
