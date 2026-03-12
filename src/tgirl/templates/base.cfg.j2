@@ -1,0 +1,25 @@
+// tgirl grammar - auto-generated, do not edit
+// Lark EBNF format for Outlines CFGGuide
+
+?start: expr | insufficient
+
+{% if tool_alternatives %}
+expr: tool_call | composition
+tool_call: {{ tool_alternatives }}
+{% else %}
+expr: composition
+{% endif %}
+
+insufficient: "(" "insufficient-resources" " " reason ")"
+reason: "\"quota-exhausted\"" | "\"cost-exceeded\"" | "\"scope-denied\"" | "\"type-mismatch\"" | "\"no-valid-plan\""
+
+{% include "tools.cfg.j2" %}
+{% include "types.cfg.j2" %}
+{% include "composition.cfg.j2" %}
+
+// Shared terminals
+%import common.ESCAPED_STRING
+%import common.SIGNED_INT
+%import common.SIGNED_FLOAT
+%import common.WS
+%ignore WS

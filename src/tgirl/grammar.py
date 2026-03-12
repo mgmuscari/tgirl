@@ -7,8 +7,10 @@ s-expressions invoking registered tools.
 
 from __future__ import annotations
 
+import importlib.resources
 from collections.abc import Mapping
 
+import jinja2
 import structlog
 from pydantic import BaseModel, ConfigDict
 
@@ -315,6 +317,62 @@ def _tool_to_rules(
     rule = f'"(" "{tool.name}" " " {args} ")"'
     prods.insert(0, Production(name=f"call_{tool.name}", rule=rule))
     return prods
+
+
+
+def _load_templates() -> jinja2.Environment:
+    """Load Jinja2 templates from the templates package."""
+    templates_path = importlib.resources.files('tgirl.templates')
+    loader = jinja2.FileSystemLoader(str(templates_path))
+    return jinja2.Environment(loader=loader, keep_trailing_newline=True)
+
+
+def _render_grammar(
+    snapshot: RegistrySnapshot,
+    config: GrammarConfig,
+) -> str:
+    """Render the complete grammar from a snapshot.
+
+    Args:
+        snapshot: Registry snapshot to render grammar for.
+        config: Grammar generation configuration.
+
+    Returns:
+        Complete grammar text in Lark EBNF format.
+    """
+    env = _load_templates()
+
+    # Collect all productions
+    tool_prods: list[Production] = []
+    type_prods: list[Production] = []
+    tool_call_names: list[str] = []
+
+    for tool in snapshot.tools:
+        rules = _tool_to_rules(tool, config)
+        # First production is the call_<name> rule
+        tool_call_names.append(rules[0].name)
+        tool_prods.append(rules[0])
+        # Remaining are parameter type productions
+        for p in rules[1:]:
+            type_prods.append(p)
+
+    # Deduplicate type productions by name (keep first occurrence)
+    seen: set[str] = set()
+    deduped_type_prods: list[Production] = []
+    for p in type_prods:
+        if p.name not in seen:
+            seen.add(p.name)
+            deduped_type_prods.append(p)
+
+    tool_alternatives = ' | '.join(tool_call_names) if tool_call_names else ''
+
+    template = env.get_template('base.cfg.j2')
+    return template.render(
+        tool_alternatives=tool_alternatives,
+        tool_productions=tool_prods,
+        type_productions=deduped_type_prods,
+    )
+
 
 def generate(
     snapshot: RegistrySnapshot,

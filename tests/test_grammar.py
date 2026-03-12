@@ -507,3 +507,125 @@ class TestToolProductions:
         assert len(prods) >= 2
         rule_names = [p.name for p in prods]
         assert "call_process" in rule_names
+
+
+# --- Task 4: Jinja2 template system ---
+
+
+class TestTemplateLoading:
+    """Verify templates load without error."""
+
+    def test_load_templates(self) -> None:
+        from tgirl.grammar import _load_templates
+
+        env = _load_templates()
+        assert env is not None
+        # Should be able to get the base template
+        tmpl = env.get_template("base.cfg.j2")
+        assert tmpl is not None
+
+    def test_all_templates_exist(self) -> None:
+        from tgirl.grammar import _load_templates
+
+        env = _load_templates()
+        for name in [
+            "base.cfg.j2",
+            "tools.cfg.j2",
+            "types.cfg.j2",
+            "composition.cfg.j2",
+        ]:
+            tmpl = env.get_template(name)
+            assert tmpl is not None
+
+
+class TestTemplateRendering:
+    """Verify rendered output is valid Lark EBNF."""
+
+    def test_empty_snapshot_produces_valid_grammar(self) -> None:
+        import time
+
+        import lark
+
+        from tgirl.grammar import GrammarConfig, _render_grammar
+        from tgirl.types import RegistrySnapshot
+
+        snap = RegistrySnapshot(
+            tools=(),
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        grammar_text = _render_grammar(snap, GrammarConfig())
+        assert grammar_text
+        # Must parse as valid Lark LALR(1) grammar
+        parser = lark.Lark(grammar_text, parser="lalr")
+        assert parser is not None
+
+    def test_single_tool_produces_valid_grammar(self) -> None:
+        import time
+
+        import lark
+
+        from tgirl.grammar import GrammarConfig, _render_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tool = ToolDefinition(
+            name="greet",
+            parameters=(
+                ParameterDef(
+                    name="name",
+                    type_repr=PrimitiveType(kind="str"),
+                ),
+            ),
+            return_type=PrimitiveType(kind="str"),
+        )
+        snap = RegistrySnapshot(
+            tools=(tool,),
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        grammar_text = _render_grammar(snap, GrammarConfig())
+        assert grammar_text
+        assert "greet" in grammar_text
+        # Must parse as valid Lark LALR(1) grammar
+        parser = lark.Lark(grammar_text, parser="lalr")
+        assert parser is not None
+
+    def test_single_tool_call_alternatives(self) -> None:
+        import time
+
+        from tgirl.grammar import GrammarConfig, _render_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tool = ToolDefinition(
+            name="greet",
+            parameters=(
+                ParameterDef(
+                    name="name",
+                    type_repr=PrimitiveType(kind="str"),
+                ),
+            ),
+            return_type=PrimitiveType(kind="str"),
+        )
+        snap = RegistrySnapshot(
+            tools=(tool,),
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        grammar_text = _render_grammar(snap, GrammarConfig())
+        assert "call_greet" in grammar_text
