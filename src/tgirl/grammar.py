@@ -138,7 +138,7 @@ def _type_to_rule(
     if isinstance(type_repr, ListType):
         elem_name = f"{rule_name}_elem"
         elem_prods = _type_to_rule(type_repr.element, elem_name, config)
-        rule = f'"[" ({elem_name} (" " {elem_name})*)? "]"'
+        rule = f'"[" ({elem_name} (SPACE {elem_name})*)? "]"'
         return [Production(name=rule_name, rule=rule)] + elem_prods
 
     if isinstance(type_repr, DictType):
@@ -146,8 +146,8 @@ def _type_to_rule(
         val_name = f"{rule_name}_val"
         key_prods = _type_to_rule(type_repr.key, key_name, config)
         val_prods = _type_to_rule(type_repr.value, val_name, config)
-        pair = f'{key_name} " " {val_name}'
-        rule = f'"{{" ({pair} (" " {pair})*)? "}}"'
+        pair = f'{key_name} SPACE {val_name}'
+        rule = f'"{{" ({pair} (SPACE {pair})*)? "}}"'
         return (
             [Production(name=rule_name, rule=rule)]
             + key_prods
@@ -189,14 +189,14 @@ def _type_to_rule(
             fv_name = f"{rule_name}_f_{fd.name}"
             fd_prods = _type_to_rule(fd.type_repr, fv_name, config)
             field_prods.extend(fd_prods)
-            pair = f'"\\"{fd.name}\\"" " " {fv_name}'
+            pair = f'"\\"{fd.name}\\"" SPACE {fv_name}'
             if fd.required:
                 required_parts.append(pair)
             else:
                 optional_parts.append(pair)
         all_parts = required_parts + optional_parts
         if all_parts:
-            body = ' " " '.join(all_parts)
+            body = ' SPACE '.join(all_parts)
             rule = f'"{{" {body} "}}"'
         else:
             rule = '"{"  "}"'
@@ -295,10 +295,10 @@ def _tool_to_rules(
     if opt_count > 0:
         # Start with the last optional param
         last_opt_idx = req_count + opt_count - 1
-        chain = f'" " {param_type_names[last_opt_idx]}'
+        chain = f'SPACE {param_type_names[last_opt_idx]}'
         # Wrap remaining optionals from inside out
         for i in range(last_opt_idx - 1, req_count - 1, -1):
-            chain = f'" " {param_type_names[i]} ({chain})?'
+            chain = f'SPACE {param_type_names[i]} ({chain})?'
     else:
         chain = None
 
@@ -307,14 +307,14 @@ def _tool_to_rules(
 
     if chain is not None:
         args = (
-            ' " " '.join(parts) + f' ({chain})?'
+            ' SPACE '.join(parts) + f' ({chain})?'
             if req_count > 0
             else f'({chain})?'
         )
     else:
-        args = ' " " '.join(parts)
+        args = ' SPACE '.join(parts)
 
-    rule = f'"(" "{tool.name}" " " {args} ")"'
+    rule = f'"(" "{tool.name}" SPACE {args} ")"'
     prods.insert(0, Production(name=f"call_{tool.name}", rule=rule))
     return prods
 

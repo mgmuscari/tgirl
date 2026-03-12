@@ -3,9 +3,9 @@ composition: threading | let_expr | if_expr | try_expr | pmap_expr
 
 SYMBOL: /[a-zA-Z_][a-zA-Z0-9_-]*/
 
-threading: "(" "->" " " expr (" " expr)+ ")"
-let_expr: "(" "let" " " "[" binding (" " binding)* "]" " " expr ")"
-binding: SYMBOL " " expr
-if_expr: "(" "if" " " expr " " expr " " expr ")"
-try_expr: "(" "try" " " expr " " "(" "catch" " " SYMBOL " " expr ")" ")"
-pmap_expr: "(" "pmap" " " "[" expr (" " expr)* "]" " " expr ")"
+threading: "(" "->" SPACE expr (SPACE expr)+ ")"
+let_expr: "(" "let" SPACE "[" binding (SPACE binding)* "]" SPACE expr ")"
+binding: SYMBOL SPACE expr
+if_expr: "(" "if" SPACE expr SPACE expr SPACE expr ")"
+try_expr: "(" "try" SPACE expr SPACE "(" "catch" SPACE SYMBOL SPACE expr ")" ")"
+pmap_expr: "(" "pmap" SPACE "[" expr (SPACE expr)* "]" SPACE expr ")"

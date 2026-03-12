@@ -629,3 +629,122 @@ class TestTemplateRendering:
         )
         grammar_text = _render_grammar(snap, GrammarConfig())
         assert "call_greet" in grammar_text
+
+
+# --- Task 5: Composition operator productions ---
+
+
+class TestCompositionProductions:
+    """Verify composition operators produce valid grammar rules."""
+
+    def _make_grammar_with_tool(self) -> str:
+        import time
+
+        from tgirl.grammar import GrammarConfig, _render_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tool = ToolDefinition(
+            name="fetch",
+            parameters=(
+                ParameterDef(
+                    name="url",
+                    type_repr=PrimitiveType(kind="str"),
+                ),
+            ),
+            return_type=PrimitiveType(kind="str"),
+        )
+        snap = RegistrySnapshot(
+            tools=(tool,),
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        return _render_grammar(snap, GrammarConfig())
+
+    def test_composition_rules_in_grammar(self) -> None:
+        grammar_text = self._make_grammar_with_tool()
+        assert "threading" in grammar_text
+        assert "let_expr" in grammar_text
+        assert "if_expr" in grammar_text
+        assert "try_expr" in grammar_text
+        assert "pmap_expr" in grammar_text
+
+    def test_threading_parses(self) -> None:
+        import lark
+
+        grammar_text = self._make_grammar_with_tool()
+        parser = lark.Lark(grammar_text, parser="lalr")
+        # (-> (fetch "url1") (fetch "url2"))
+        tree = parser.parse('(-> (fetch "url1") (fetch "url2"))')
+        assert tree is not None
+
+    def test_let_parses(self) -> None:
+        import lark
+
+        grammar_text = self._make_grammar_with_tool()
+        parser = lark.Lark(grammar_text, parser="lalr")
+        # (let [x (fetch "url")] (fetch "other"))
+        tree = parser.parse('(let [x (fetch "url")] (fetch "other"))')
+        assert tree is not None
+
+    def test_if_parses(self) -> None:
+        import lark
+
+        grammar_text = self._make_grammar_with_tool()
+        parser = lark.Lark(grammar_text, parser="lalr")
+        # (if (fetch "check") (fetch "yes") (fetch "no"))
+        tree = parser.parse(
+            '(if (fetch "check") (fetch "yes") (fetch "no"))'
+        )
+        assert tree is not None
+
+    def test_try_parses(self) -> None:
+        import lark
+
+        grammar_text = self._make_grammar_with_tool()
+        parser = lark.Lark(grammar_text, parser="lalr")
+        # (try (fetch "url") (catch e (fetch "fallback")))
+        tree = parser.parse(
+            '(try (fetch "url") (catch e (fetch "fallback")))'
+        )
+        assert tree is not None
+
+    def test_pmap_parses(self) -> None:
+        import lark
+
+        grammar_text = self._make_grammar_with_tool()
+        parser = lark.Lark(grammar_text, parser="lalr")
+        # (pmap [(fetch "a") (fetch "b")] (fetch "combine"))
+        tree = parser.parse(
+            '(pmap [(fetch "a") (fetch "b")] (fetch "combine"))'
+        )
+        assert tree is not None
+
+    def test_nested_threading_in_let(self) -> None:
+        import lark
+
+        grammar_text = self._make_grammar_with_tool()
+        parser = lark.Lark(grammar_text, parser="lalr")
+        # (let [x (fetch "url")] (-> (fetch "a") (fetch "b")))
+        tree = parser.parse(
+            '(let [x (fetch "url")] (-> (fetch "a") (fetch "b")))'
+        )
+        assert tree is not None
+
+    def test_conditional_containing_pipeline(self) -> None:
+        import lark
+
+        grammar_text = self._make_grammar_with_tool()
+        parser = lark.Lark(grammar_text, parser="lalr")
+        tree = parser.parse(
+            '(if (fetch "check") '
+            '(-> (fetch "a") (fetch "b")) '
+            '(fetch "fallback"))'
+        )
+        assert tree is not None
