@@ -315,7 +315,11 @@ def _tool_to_rules(
     else:
         args = ' SPACE '.join(parts)
 
-    rule = f'"(" "{tool.name}" SPACE {args} ")"'
+    if req_count > 0:
+        rule = f'"(" "{tool.name}" SPACE {args} ")"'
+    else:
+        # All-optional: space is part of the optional group
+        rule = f'"(" "{tool.name}" {args} ")"'
     prods.insert(0, Production(name=f"call_{tool.name}", rule=rule))
     return prods
 

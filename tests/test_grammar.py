@@ -485,6 +485,10 @@ class TestToolProductions:
         call_rule = next(p for p in prods if p.name == "call_configure")
         # Entire args section should be optional
         assert "?" in call_rule.rule
+        # No mandatory space between tool name and optional args
+        # Rule should be: "(" "configure" (SPACE ...)? ")"
+        # NOT: "(" "configure" SPACE (SPACE ...)? ")"
+        assert '"configure" SPACE (' not in call_rule.rule
 
     def test_tool_with_complex_types(self) -> None:
         from tgirl.grammar import GrammarConfig, _tool_to_rules
