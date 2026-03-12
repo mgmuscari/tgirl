@@ -12,7 +12,20 @@ from collections.abc import Mapping
 import structlog
 from pydantic import BaseModel, ConfigDict
 
-from tgirl.types import RegistrySnapshot
+from tgirl.types import (
+    AnnotatedType,
+    AnyType,
+    DictType,
+    EnumType,
+    ListType,
+    LiteralType,
+    ModelType,
+    OptionalType,
+    PrimitiveType,
+    RegistrySnapshot,
+    TypeRepr,
+    UnionType,
+)
 
 logger = structlog.get_logger()
 
@@ -52,6 +65,186 @@ class GrammarConfig(BaseModel):
     enumeration_threshold: int = 256
 
 
+# --- Type-to-production converter ---
+
+
+def _type_name_slug(type_repr: TypeRepr) -> str:
+    """Generate a deterministic name slug from a TypeRepr."""
+    if isinstance(type_repr, PrimitiveType):
+        return type_repr.kind
+    if isinstance(type_repr, ListType):
+        return f"list_{_type_name_slug(type_repr.element)}"
+    if isinstance(type_repr, DictType):
+        k = _type_name_slug(type_repr.key)
+        v = _type_name_slug(type_repr.value)
+        return f"dict_{k}_{v}"
+    if isinstance(type_repr, LiteralType):
+        return f"lit_{'_'.join(str(x) for x in type_repr.values)}"
+    if isinstance(type_repr, EnumType):
+        return f"enum_{type_repr.name.lower()}"
+    if isinstance(type_repr, OptionalType):
+        return f"opt_{_type_name_slug(type_repr.inner)}"
+    if isinstance(type_repr, UnionType):
+        parts = "_".join(_type_name_slug(m) for m in type_repr.members)
+        return f"union_{parts}"
+    if isinstance(type_repr, ModelType):
+        return f"model_{type_repr.name.lower()}"
+    if isinstance(type_repr, AnnotatedType):
+        return f"ann_{_type_name_slug(type_repr.base)}"
+    if isinstance(type_repr, AnyType):
+        return "any"
+    msg = f"Unknown TypeRepr: {type_repr}"  # pragma: no cover
+    raise TypeError(msg)  # pragma: no cover
+
+
+def _literal_value_to_grammar(val: str | int | float | bool) -> str:
+    """Convert a literal value to a Lark grammar alternative."""
+    if isinstance(val, bool):
+        return f'"{"true" if val else "false"}"'
+    if isinstance(val, str):
+        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"\\"{escaped}\\""'
+    return f'"{val}"'
+
+
+def _type_to_rule(
+    type_repr: TypeRepr,
+    rule_name: str,
+    config: GrammarConfig,
+) -> list[Production]:
+    """Convert a TypeRepr to one or more grammar productions.
+
+    Args:
+        type_repr: The type to convert.
+        rule_name: Name for the top-level production rule.
+        config: Grammar generation configuration.
+
+    Returns:
+        List of Production objects (may include sub-rules for recursive types).
+    """
+    if isinstance(type_repr, PrimitiveType):
+        rule_map = {
+            "str": "ESCAPED_STRING",
+            "int": "SIGNED_INT",
+            "float": "SIGNED_FLOAT",
+            "bool": '"true" | "false"',
+            "none": '"nil"',
+        }
+        return [Production(name=rule_name, rule=rule_map[type_repr.kind])]
+
+    if isinstance(type_repr, ListType):
+        elem_name = f"{rule_name}_elem"
+        elem_prods = _type_to_rule(type_repr.element, elem_name, config)
+        rule = f'"[" ({elem_name} (" " {elem_name})*)? "]"'
+        return [Production(name=rule_name, rule=rule)] + elem_prods
+
+    if isinstance(type_repr, DictType):
+        key_name = f"{rule_name}_key"
+        val_name = f"{rule_name}_val"
+        key_prods = _type_to_rule(type_repr.key, key_name, config)
+        val_prods = _type_to_rule(type_repr.value, val_name, config)
+        pair = f'{key_name} " " {val_name}'
+        rule = f'"{{" ({pair} (" " {pair})*)? "}}"'
+        return (
+            [Production(name=rule_name, rule=rule)]
+            + key_prods
+            + val_prods
+        )
+
+    if isinstance(type_repr, LiteralType):
+        parts = [_literal_value_to_grammar(v) for v in type_repr.values]
+        return [Production(name=rule_name, rule=" | ".join(parts))]
+
+    if isinstance(type_repr, EnumType):
+        parts = []
+        for ev in type_repr.values:
+            escaped = ev.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'"\\"{escaped}\\""')
+        return [Production(name=rule_name, rule=" | ".join(parts))]
+
+    if isinstance(type_repr, OptionalType):
+        inner_name = f"{rule_name}_inner"
+        inner_prods = _type_to_rule(type_repr.inner, inner_name, config)
+        rule = f'{inner_name} | "nil"'
+        return [Production(name=rule_name, rule=rule)] + inner_prods
+
+    if isinstance(type_repr, UnionType):
+        member_names = []
+        all_prods: list[Production] = []
+        for i, m in enumerate(type_repr.members):
+            m_name = f"{rule_name}_m{i}"
+            member_names.append(m_name)
+            all_prods.extend(_type_to_rule(m, m_name, config))
+        rule = " | ".join(member_names)
+        return [Production(name=rule_name, rule=rule)] + all_prods
+
+    if isinstance(type_repr, ModelType):
+        field_prods: list[Production] = []
+        required_parts: list[str] = []
+        optional_parts: list[str] = []
+        for fd in type_repr.fields:
+            fv_name = f"{rule_name}_f_{fd.name}"
+            fd_prods = _type_to_rule(fd.type_repr, fv_name, config)
+            field_prods.extend(fd_prods)
+            pair = f'"\\"{fd.name}\\"" " " {fv_name}'
+            if fd.required:
+                required_parts.append(pair)
+            else:
+                optional_parts.append(pair)
+        all_parts = required_parts + optional_parts
+        if all_parts:
+            body = ' " " '.join(all_parts)
+            rule = f'"{{" {body} "}}"'
+        else:
+            rule = '"{"  "}"'
+        return [Production(name=rule_name, rule=rule)] + field_prods
+
+    if isinstance(type_repr, AnnotatedType):
+        if not type_repr.constraints:
+            return _type_to_rule(type_repr.base, rule_name, config)
+
+        # Check for enumerable integer range
+        if (
+            isinstance(type_repr.base, PrimitiveType)
+            and type_repr.base.kind == "int"
+        ):
+            lo: int | None = None
+            hi: int | None = None
+            for c in type_repr.constraints:
+                if c.kind == "ge":
+                    lo = int(c.value)
+                elif c.kind == "gt":
+                    lo = int(c.value) + 1
+                elif c.kind == "le":
+                    hi = int(c.value)
+                elif c.kind == "lt":
+                    hi = int(c.value) - 1
+
+            if lo is not None and hi is not None:
+                range_size = hi - lo + 1
+                if 0 < range_size <= config.enumeration_threshold:
+                    parts = [f'"{i}"' for i in range(lo, hi + 1)]
+                    return [
+                        Production(
+                            name=rule_name,
+                            rule=" | ".join(parts),
+                        )
+                    ]
+
+        # Fall back to base type
+        return _type_to_rule(type_repr.base, rule_name, config)
+
+    if isinstance(type_repr, AnyType):
+        rule = (
+            'ESCAPED_STRING | SIGNED_INT | SIGNED_FLOAT'
+            ' | "true" | "false" | "nil"'
+        )
+        return [Production(name=rule_name, rule=rule)]
+
+    msg = f"Unknown TypeRepr: {type_repr}"  # pragma: no cover
+    raise TypeError(msg)  # pragma: no cover
+
+
 def generate(
     snapshot: RegistrySnapshot,
     config: GrammarConfig | None = None,
@@ -66,7 +259,7 @@ def generate(
         Complete grammar output with text and metadata.
 
     Raises:
-        NotImplementedError: Stub — not yet implemented.
+        NotImplementedError: Stub -- not yet implemented.
     """
     raise NotImplementedError
 
@@ -82,6 +275,6 @@ def diff(a: GrammarOutput, b: GrammarOutput) -> GrammarDiff:
         Diff showing added, removed, and changed productions.
 
     Raises:
-        NotImplementedError: Stub — not yet implemented.
+        NotImplementedError: Stub -- not yet implemented.
     """
     raise NotImplementedError

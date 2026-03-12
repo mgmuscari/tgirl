@@ -128,3 +128,244 @@ class TestGrammarStubs:
         )
         with pytest.raises(NotImplementedError):
             diff(go, go)
+
+
+# --- Task 2: Type-to-production converter ---
+
+
+class TestTypeProductions:
+    """Verify _type_to_rule for each TypeRepr variant."""
+
+    def test_primitive_str(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import PrimitiveType
+
+        t = PrimitiveType(kind="str")
+        prods = _type_to_rule(t, "str_val", GrammarConfig())
+        assert len(prods) >= 1
+        assert prods[0].name == "str_val"
+        assert "ESCAPED_STRING" in prods[0].rule
+
+    def test_primitive_int(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import PrimitiveType
+
+        t = PrimitiveType(kind="int")
+        prods = _type_to_rule(t, "int_val", GrammarConfig())
+        assert len(prods) >= 1
+        assert prods[0].name == "int_val"
+        assert "SIGNED_INT" in prods[0].rule
+
+    def test_primitive_float(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import PrimitiveType
+
+        t = PrimitiveType(kind="float")
+        prods = _type_to_rule(t, "float_val", GrammarConfig())
+        assert len(prods) >= 1
+        assert prods[0].name == "float_val"
+        assert "SIGNED_FLOAT" in prods[0].rule
+
+    def test_primitive_bool(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import PrimitiveType
+
+        t = PrimitiveType(kind="bool")
+        prods = _type_to_rule(t, "bool_val", GrammarConfig())
+        assert len(prods) >= 1
+        assert prods[0].name == "bool_val"
+        assert '"true"' in prods[0].rule
+        assert '"false"' in prods[0].rule
+
+    def test_primitive_none(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import PrimitiveType
+
+        t = PrimitiveType(kind="none")
+        prods = _type_to_rule(t, "none_val", GrammarConfig())
+        assert len(prods) >= 1
+        assert prods[0].name == "none_val"
+        assert '"nil"' in prods[0].rule
+
+    def test_list_type(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import ListType, PrimitiveType
+
+        t = ListType(element=PrimitiveType(kind="int"))
+        prods = _type_to_rule(t, "list_int", GrammarConfig())
+        assert len(prods) >= 1
+        # Should have list rule with brackets
+        list_rule = prods[0].rule
+        assert '"["' in list_rule
+        assert '"]"' in list_rule
+
+    def test_dict_type(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import DictType, PrimitiveType
+
+        t = DictType(key=PrimitiveType(kind="str"), value=PrimitiveType(kind="int"))
+        prods = _type_to_rule(t, "dict_str_int", GrammarConfig())
+        assert len(prods) >= 1
+        dict_rule = prods[0].rule
+        assert '"{"' in dict_rule
+        assert '"}"' in dict_rule
+
+    def test_literal_type_strings(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import LiteralType
+
+        t = LiteralType(values=("hello", "world"))
+        prods = _type_to_rule(t, "lit_val", GrammarConfig())
+        assert len(prods) >= 1
+        rule = prods[0].rule
+        # String literals should be double-quoted in grammar
+        assert "hello" in rule
+        assert "world" in rule
+
+    def test_literal_type_numbers(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import LiteralType
+
+        t = LiteralType(values=(1, 2, 3))
+        prods = _type_to_rule(t, "lit_num", GrammarConfig())
+        assert len(prods) >= 1
+        rule = prods[0].rule
+        assert '"1"' in rule
+        assert '"2"' in rule
+        assert '"3"' in rule
+
+    def test_enum_type(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import EnumType
+
+        t = EnumType(name="Color", values=("red", "green", "blue"))
+        prods = _type_to_rule(t, "color_val", GrammarConfig())
+        assert len(prods) >= 1
+        rule = prods[0].rule
+        assert "red" in rule
+        assert "green" in rule
+        assert "blue" in rule
+
+    def test_optional_type(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import OptionalType, PrimitiveType
+
+        t = OptionalType(inner=PrimitiveType(kind="str"))
+        prods = _type_to_rule(t, "opt_str", GrammarConfig())
+        assert len(prods) >= 1
+        rule = prods[0].rule
+        assert '"nil"' in rule
+
+    def test_union_type(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import PrimitiveType, UnionType
+
+        t = UnionType(
+            members=(PrimitiveType(kind="str"), PrimitiveType(kind="int"))
+        )
+        prods = _type_to_rule(t, "union_val", GrammarConfig())
+        assert len(prods) >= 1
+        # Union should reference member type rules
+        rule = prods[0].rule
+        assert "|" in rule
+
+    def test_model_type(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import FieldDef, ModelType, PrimitiveType
+
+        t = ModelType(
+            name="Point",
+            fields=(
+                FieldDef(
+                    name="x", type_repr=PrimitiveType(kind="float"), required=True
+                ),
+                FieldDef(
+                    name="y", type_repr=PrimitiveType(kind="float"), required=True
+                ),
+            ),
+        )
+        prods = _type_to_rule(t, "point_val", GrammarConfig())
+        assert len(prods) >= 1
+        rule = prods[0].rule
+        assert '"{"' in rule
+        assert '"}"' in rule
+
+    def test_annotated_type_no_constraints(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import AnnotatedType, PrimitiveType
+
+        t = AnnotatedType(base=PrimitiveType(kind="int"), constraints=())
+        prods = _type_to_rule(t, "ann_int", GrammarConfig())
+        assert len(prods) >= 1
+        # Should delegate to base type
+        assert "SIGNED_INT" in prods[0].rule
+
+    def test_annotated_type_enumerable_range(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import AnnotatedType, ConstraintRepr, PrimitiveType
+
+        t = AnnotatedType(
+            base=PrimitiveType(kind="int"),
+            constraints=(
+                ConstraintRepr(kind="ge", value=1),
+                ConstraintRepr(kind="le", value=5),
+            ),
+        )
+        prods = _type_to_rule(t, "ann_range", GrammarConfig())
+        assert len(prods) >= 1
+        rule = prods[0].rule
+        # Should enumerate: "1" | "2" | "3" | "4" | "5"
+        for i in range(1, 6):
+            assert f'"{i}"' in rule
+
+    def test_annotated_type_large_range_uses_base(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import AnnotatedType, ConstraintRepr, PrimitiveType
+
+        t = AnnotatedType(
+            base=PrimitiveType(kind="int"),
+            constraints=(
+                ConstraintRepr(kind="ge", value=1),
+                ConstraintRepr(kind="le", value=1000),
+            ),
+        )
+        config = GrammarConfig(enumeration_threshold=256)
+        prods = _type_to_rule(t, "ann_big", config)
+        assert len(prods) >= 1
+        # Range > threshold, should fall back to base type
+        assert "SIGNED_INT" in prods[0].rule
+
+    def test_any_type(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import AnyType
+
+        t = AnyType()
+        prods = _type_to_rule(t, "any_val", GrammarConfig())
+        assert len(prods) >= 1
+        rule = prods[0].rule
+        # Should include string, int, float, bool, nil
+        assert "ESCAPED_STRING" in rule
+        assert "SIGNED_INT" in rule
+        assert "SIGNED_FLOAT" in rule
+        assert '"true"' in rule
+        assert '"false"' in rule
+        assert '"nil"' in rule
+
+    def test_recursive_list_of_lists(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import ListType, PrimitiveType
+
+        inner = ListType(element=PrimitiveType(kind="int"))
+        outer = ListType(element=inner)
+        prods = _type_to_rule(outer, "list_of_list_int", GrammarConfig())
+        # Should produce multiple productions (outer list + inner list element)
+        assert len(prods) >= 2
+
+    def test_deterministic_rule_naming(self) -> None:
+        from tgirl.grammar import GrammarConfig, _type_to_rule
+        from tgirl.types import ListType, PrimitiveType
+
+        t = ListType(element=PrimitiveType(kind="int"))
+        prods1 = _type_to_rule(t, "my_list", GrammarConfig())
+        prods2 = _type_to_rule(t, "my_list", GrammarConfig())
+        assert prods1 == prods2
