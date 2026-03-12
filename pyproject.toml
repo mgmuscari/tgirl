@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-grammar = ["jinja2>=3.0"]
+grammar = ["jinja2>=3.0", "lark>=1.0"]
 compile = ["hy>=1.0,<2.0", "RestrictedPython>=7.0"]
 transport = ["torch>=2.0", "pot>=0.9"]
 sample = ["outlines>=0.1", "torch>=2.0"]

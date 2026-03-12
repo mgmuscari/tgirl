@@ -2,6 +2,17 @@
 
 from annotated_types import Ge, Gt, Le, Lt, MultipleOf
 
+from tgirl.grammar import (
+    GrammarConfig,
+    GrammarDiff,
+    GrammarOutput,
+)
+from tgirl.grammar import (
+    diff as grammar_diff,
+)
+from tgirl.grammar import (
+    generate as generate_grammar,
+)
 from tgirl.registry import ToolRegistry
 from tgirl.types import (
     AnnotatedType,
@@ -34,6 +45,9 @@ __all__ = [
     "EnumType",
     "FieldDef",
     "Ge",
+    "GrammarConfig",
+    "GrammarDiff",
+    "GrammarOutput",
     "Gt",
     "Le",
     "ListType",
@@ -49,6 +63,8 @@ __all__ = [
     "TelemetryRecord",
     "ToolDefinition",
     "ToolRegistry",
+    "generate_grammar",
+    "grammar_diff",
     "TypeRepr",
     "UnionType",
 ]
