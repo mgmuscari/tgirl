@@ -369,3 +369,141 @@ class TestTypeProductions:
         prods1 = _type_to_rule(t, "my_list", GrammarConfig())
         prods2 = _type_to_rule(t, "my_list", GrammarConfig())
         assert prods1 == prods2
+
+
+# --- Task 3: Tool-to-production converter ---
+
+
+class TestToolProductions:
+    """Verify _tool_to_rules for various tool signatures."""
+
+    def test_tool_no_parameters(self) -> None:
+        from tgirl.grammar import GrammarConfig, _tool_to_rules
+        from tgirl.types import PrimitiveType, ToolDefinition
+
+        tool = ToolDefinition(
+            name="ping",
+            parameters=(),
+            return_type=PrimitiveType(kind="str"),
+        )
+        prods = _tool_to_rules(tool, GrammarConfig())
+        # Should produce call_ping rule with no args
+        call_rule = next(p for p in prods if p.name == "call_ping")
+        assert '"(" "ping" ")"' in call_rule.rule
+
+    def test_tool_single_required_param(self) -> None:
+        from tgirl.grammar import GrammarConfig, _tool_to_rules
+        from tgirl.types import ParameterDef, PrimitiveType, ToolDefinition
+
+        tool = ToolDefinition(
+            name="greet",
+            parameters=(
+                ParameterDef(
+                    name="name",
+                    type_repr=PrimitiveType(kind="str"),
+                ),
+            ),
+            return_type=PrimitiveType(kind="str"),
+        )
+        prods = _tool_to_rules(tool, GrammarConfig())
+        call_rule = next(p for p in prods if p.name == "call_greet")
+        assert '"greet"' in call_rule.rule
+
+    def test_tool_multiple_required_params(self) -> None:
+        from tgirl.grammar import GrammarConfig, _tool_to_rules
+        from tgirl.types import ParameterDef, PrimitiveType, ToolDefinition
+
+        tool = ToolDefinition(
+            name="add",
+            parameters=(
+                ParameterDef(
+                    name="a", type_repr=PrimitiveType(kind="int")
+                ),
+                ParameterDef(
+                    name="b", type_repr=PrimitiveType(kind="int")
+                ),
+            ),
+            return_type=PrimitiveType(kind="int"),
+        )
+        prods = _tool_to_rules(tool, GrammarConfig())
+        call_rule = next(p for p in prods if p.name == "call_add")
+        assert '"add"' in call_rule.rule
+
+    def test_tool_with_optional_params(self) -> None:
+        from tgirl.grammar import GrammarConfig, _tool_to_rules
+        from tgirl.types import ParameterDef, PrimitiveType, ToolDefinition
+
+        tool = ToolDefinition(
+            name="search",
+            parameters=(
+                ParameterDef(
+                    name="query",
+                    type_repr=PrimitiveType(kind="str"),
+                ),
+                ParameterDef(
+                    name="limit",
+                    type_repr=PrimitiveType(kind="int"),
+                    has_default=True,
+                    default=10,
+                ),
+                ParameterDef(
+                    name="offset",
+                    type_repr=PrimitiveType(kind="int"),
+                    has_default=True,
+                    default=0,
+                ),
+            ),
+            return_type=PrimitiveType(kind="str"),
+        )
+        prods = _tool_to_rules(tool, GrammarConfig())
+        call_rule = next(p for p in prods if p.name == "call_search")
+        # Should have trailing optional chain
+        assert '"search"' in call_rule.rule
+        # The optional params should be wrapped in (...)?
+        assert "?" in call_rule.rule
+
+    def test_tool_all_optional_params(self) -> None:
+        from tgirl.grammar import GrammarConfig, _tool_to_rules
+        from tgirl.types import ParameterDef, PrimitiveType, ToolDefinition
+
+        tool = ToolDefinition(
+            name="configure",
+            parameters=(
+                ParameterDef(
+                    name="verbose",
+                    type_repr=PrimitiveType(kind="bool"),
+                    has_default=True,
+                    default=False,
+                ),
+            ),
+            return_type=PrimitiveType(kind="none"),
+        )
+        prods = _tool_to_rules(tool, GrammarConfig())
+        call_rule = next(p for p in prods if p.name == "call_configure")
+        # Entire args section should be optional
+        assert "?" in call_rule.rule
+
+    def test_tool_with_complex_types(self) -> None:
+        from tgirl.grammar import GrammarConfig, _tool_to_rules
+        from tgirl.types import (
+            ListType,
+            ParameterDef,
+            PrimitiveType,
+            ToolDefinition,
+        )
+
+        tool = ToolDefinition(
+            name="process",
+            parameters=(
+                ParameterDef(
+                    name="items",
+                    type_repr=ListType(element=PrimitiveType(kind="str")),
+                ),
+            ),
+            return_type=PrimitiveType(kind="int"),
+        )
+        prods = _tool_to_rules(tool, GrammarConfig())
+        # Should produce call rule + type productions for the list
+        assert len(prods) >= 2
+        rule_names = [p.name for p in prods]
+        assert "call_process" in rule_names

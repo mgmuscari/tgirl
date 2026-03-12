@@ -23,6 +23,7 @@ from tgirl.types import (
     OptionalType,
     PrimitiveType,
     RegistrySnapshot,
+    ToolDefinition,
     TypeRepr,
     UnionType,
 )
@@ -244,6 +245,76 @@ def _type_to_rule(
     msg = f"Unknown TypeRepr: {type_repr}"  # pragma: no cover
     raise TypeError(msg)  # pragma: no cover
 
+
+
+
+def _tool_to_rules(
+    tool: ToolDefinition,
+    config: GrammarConfig,
+) -> list[Production]:
+    """Convert a ToolDefinition to grammar productions.
+
+    Uses positional, trailing-optional chain convention:
+    required params first in fixed order, then optional params
+    as a nested optional chain.
+
+    Args:
+        tool: The tool definition.
+        config: Grammar generation configuration.
+
+    Returns:
+        List of Production objects for this tool.
+    """
+    prods: list[Production] = []
+
+    # Split required and optional parameters
+    required = [p for p in tool.parameters if not p.has_default]
+    optional = [p for p in tool.parameters if p.has_default]
+
+    # Generate type productions for each parameter
+    param_type_names: list[str] = []
+    for param in tool.parameters:
+        type_name = f"param_{tool.name}_{param.name}"
+        param_type_names.append(type_name)
+        prods.extend(_type_to_rule(param.type_repr, type_name, config))
+
+    if not tool.parameters:
+        # No parameters: (tool_name)
+        rule = f'"(" "{tool.name}" ")"'
+        prods.insert(0, Production(name=f"call_{tool.name}", rule=rule))
+        return prods
+
+    # Build the args portion with trailing optional chain
+    # Required params are positional, optional params nest
+    req_count = len(required)
+    opt_count = len(optional)
+
+    # Build from innermost optional outward
+    if opt_count > 0:
+        # Start with the last optional param
+        last_opt_idx = req_count + opt_count - 1
+        chain = f'" " {param_type_names[last_opt_idx]}'
+        # Wrap remaining optionals from inside out
+        for i in range(last_opt_idx - 1, req_count - 1, -1):
+            chain = f'" " {param_type_names[i]} ({chain})?'
+    else:
+        chain = None
+
+    # Build the full args
+    parts = [param_type_names[i] for i in range(req_count)]
+
+    if chain is not None:
+        args = (
+            ' " " '.join(parts) + f' ({chain})?'
+            if req_count > 0
+            else f'({chain})?'
+        )
+    else:
+        args = ' " " '.join(parts)
+
+    rule = f'"(" "{tool.name}" " " {args} ")"'
+    prods.insert(0, Production(name=f"call_{tool.name}", rule=rule))
+    return prods
 
 def generate(
     snapshot: RegistrySnapshot,
