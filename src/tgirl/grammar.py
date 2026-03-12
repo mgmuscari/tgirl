@@ -7,6 +7,7 @@ s-expressions invoking registered tools.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.resources
 from collections.abc import Mapping
 
@@ -386,11 +387,41 @@ def generate(
 
     Returns:
         Complete grammar output with text and metadata.
-
-    Raises:
-        NotImplementedError: Stub -- not yet implemented.
     """
-    raise NotImplementedError
+    cfg = config or GrammarConfig()
+
+    # Collect all productions
+    all_prods: list[Production] = []
+    for tool in snapshot.tools:
+        all_prods.extend(_tool_to_rules(tool, cfg))
+
+    # Also collect type productions from return types
+    for tool in snapshot.tools:
+        ret_name = f"ret_{tool.name}"
+        all_prods.extend(_type_to_rule(tool.return_type, ret_name, cfg))
+
+    # Deduplicate by name (keep first occurrence)
+    seen: set[str] = set()
+    deduped: list[Production] = []
+    for p in all_prods:
+        if p.name not in seen:
+            seen.add(p.name)
+            deduped.append(p)
+
+    # Render grammar text
+    text = _render_grammar(snapshot, cfg)
+
+    # Compute snapshot hash (exclude timestamp for determinism)
+    hash_data = snapshot.model_dump_json(exclude={"timestamp"})
+    snapshot_hash = hashlib.sha256(hash_data.encode()).hexdigest()[:16]
+
+    return GrammarOutput(
+        text=text,
+        productions=tuple(deduped),
+        snapshot_hash=snapshot_hash,
+        tool_quotas=dict(snapshot.quotas),
+        cost_remaining=snapshot.cost_remaining,
+    )
 
 
 def diff(a: GrammarOutput, b: GrammarOutput) -> GrammarDiff:

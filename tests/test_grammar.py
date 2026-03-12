@@ -109,12 +109,13 @@ class TestGrammarStubs:
             timestamp=time.time(),
         )
 
-    def test_generate_stub_exists(self) -> None:
+    def test_generate_exists(self) -> None:
         from tgirl.grammar import generate
 
         snap = self._make_empty_snapshot()
-        with pytest.raises(NotImplementedError):
-            generate(snap)
+        output = generate(snap)
+        assert output.text
+        assert output.snapshot_hash
 
     def test_diff_stub_exists(self) -> None:
         from tgirl.grammar import GrammarOutput, diff
@@ -748,3 +749,195 @@ class TestCompositionProductions:
             '(fetch "fallback"))'
         )
         assert tree is not None
+
+
+# --- Task 6: Grammar generation and determinism ---
+
+
+class TestGenerate:
+    """Verify full generate() from realistic snapshots."""
+
+    def test_generate_empty_snapshot(self) -> None:
+        import time
+
+        from tgirl.grammar import generate
+        from tgirl.types import RegistrySnapshot
+
+        snap = RegistrySnapshot(
+            tools=(),
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        output = generate(snap)
+        assert output.text
+        assert output.snapshot_hash
+        assert output.tool_quotas == {}
+        assert output.cost_remaining is None
+
+    def test_generate_single_tool(self) -> None:
+        import time
+
+        import lark
+
+        from tgirl.grammar import generate
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tool = ToolDefinition(
+            name="greet",
+            parameters=(
+                ParameterDef(
+                    name="name",
+                    type_repr=PrimitiveType(kind="str"),
+                ),
+            ),
+            return_type=PrimitiveType(kind="str"),
+            quota=5,
+            cost=0.1,
+        )
+        snap = RegistrySnapshot(
+            tools=(tool,),
+            quotas={"greet": 5},
+            cost_remaining=10.0,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        output = generate(snap)
+        assert "greet" in output.text
+        assert output.tool_quotas == {"greet": 5}
+        assert output.cost_remaining == 10.0
+        assert len(output.productions) > 0
+        # Must parse as valid Lark grammar
+        parser = lark.Lark(output.text, parser="lalr")
+        assert parser is not None
+
+    def test_generate_multiple_tools(self) -> None:
+        import time
+
+        import lark
+
+        from tgirl.grammar import generate
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tools = tuple(
+            ToolDefinition(
+                name=name,
+                parameters=(
+                    ParameterDef(
+                        name="x",
+                        type_repr=PrimitiveType(kind="str"),
+                    ),
+                ),
+                return_type=PrimitiveType(kind="str"),
+            )
+            for name in ["alpha", "beta", "gamma"]
+        )
+        snap = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        output = generate(snap)
+        for name in ["alpha", "beta", "gamma"]:
+            assert name in output.text
+        parser = lark.Lark(output.text, parser="lalr")
+        assert parser is not None
+
+
+class TestDeterminism:
+    """Verify same snapshot (different timestamps) produces identical grammar."""
+
+    def test_same_snapshot_same_grammar(self) -> None:
+        from tgirl.grammar import generate
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tool = ToolDefinition(
+            name="search",
+            parameters=(
+                ParameterDef(
+                    name="query",
+                    type_repr=PrimitiveType(kind="str"),
+                ),
+                ParameterDef(
+                    name="limit",
+                    type_repr=PrimitiveType(kind="int"),
+                    has_default=True,
+                    default=10,
+                ),
+            ),
+            return_type=PrimitiveType(kind="str"),
+            quota=3,
+        )
+        snap1 = RegistrySnapshot(
+            tools=(tool,),
+            quotas={"search": 3},
+            cost_remaining=5.0,
+            scopes=frozenset(),
+            timestamp=1000.0,
+        )
+        snap2 = RegistrySnapshot(
+            tools=(tool,),
+            quotas={"search": 3},
+            cost_remaining=5.0,
+            scopes=frozenset(),
+            timestamp=2000.0,
+        )
+        out1 = generate(snap1)
+        out2 = generate(snap2)
+        assert out1.text == out2.text
+        assert out1.snapshot_hash == out2.snapshot_hash
+
+    def test_shared_types_deduplicated(self) -> None:
+        import time
+
+        from tgirl.grammar import generate
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        # Two tools sharing the same parameter type
+        tools = tuple(
+            ToolDefinition(
+                name=name,
+                parameters=(
+                    ParameterDef(
+                        name="x",
+                        type_repr=PrimitiveType(kind="str"),
+                    ),
+                ),
+                return_type=PrimitiveType(kind="str"),
+            )
+            for name in ["foo", "bar"]
+        )
+        snap = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        output = generate(snap)
+        # Productions should not have duplicates
+        names = [p.name for p in output.productions]
+        assert len(names) == len(set(names))
