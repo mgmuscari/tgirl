@@ -133,8 +133,15 @@ class ToolRouter:
             context_tokens=routing_context_tokens,
         )
 
-        # Step 7: Parse output
+        # Step 7: Parse and validate output
         selected_tool = gen_result.hy_source.strip()
+        valid_names = {t.name for t in filtered_tools}
+        if selected_tool not in valid_names:
+            msg = (
+                f"Routing produced '{selected_tool}' which is not "
+                f"in valid tool set {valid_names}"
+            )
+            raise ValueError(msg)
 
         latency_ms = (time.monotonic() - start_time) * 1000
 

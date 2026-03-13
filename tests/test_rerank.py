@@ -401,3 +401,30 @@ class TestToolRouterPromptTokenization:
             # should be routing_prompt_tokens + original context_tokens
             _, kwargs = mock_gen.call_args
             assert kwargs["context_tokens"] == [100, 101, 102, 1, 2, 3]
+
+
+class TestToolRouterValidation:
+    """Tests for output validation."""
+
+    def test_invalid_tool_name_raises(self) -> None:
+        """If generation produces a name not in the tool set, raise ValueError."""
+        from tgirl.rerank import ToolRouter
+
+        mock_gs = _make_mock_grammar_state()
+        factory = MagicMock(return_value=mock_gs)
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        encode = MagicMock(return_value=[10])
+        decode = MagicMock(return_value="bogus_tool")
+        embeddings = torch.randn(100, 32)
+
+        router = ToolRouter(
+            grammar_guide_factory=factory,
+            forward_fn=forward_fn,
+            tokenizer_encode=encode,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+        )
+        snap = _make_snapshot(["alpha", "beta"])
+
+        with pytest.raises(ValueError, match="not in valid tool set"):
+            router.route(snap, context_tokens=[1, 2])
