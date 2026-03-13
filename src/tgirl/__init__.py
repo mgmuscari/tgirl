@@ -20,6 +20,7 @@ from tgirl.grammar import (
     generate as generate_grammar,
 )
 from tgirl.registry import ToolRegistry
+from tgirl.rerank import ToolRouter
 from tgirl.sample import (
     ConstrainedGenerationResult,
     DelimiterDetector,
@@ -55,6 +56,8 @@ from tgirl.types import (
     PipelineError,
     PrimitiveType,
     RegistrySnapshot,
+    RerankConfig,
+    RerankResult,
     SessionConfig,
     TelemetryRecord,
     ToolDefinition,
@@ -96,6 +99,8 @@ __all__ = [
     "PipelineResult",
     "PrimitiveType",
     "RegistrySnapshot",
+    "RerankConfig",
+    "RerankResult",
     "SamplingResult",
     "SamplingSession",
     "SessionConfig",
@@ -103,6 +108,7 @@ __all__ = [
     "ToolCallRecord",
     "ToolDefinition",
     "ToolRegistry",
+    "ToolRouter",
     "TransportConfig",
     "TransportResult",
     "apply_penalties",
