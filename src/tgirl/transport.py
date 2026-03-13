@@ -177,3 +177,43 @@ def _sinkhorn_log_domain(
     wasserstein = (plan * cost_matrix).sum().item()
 
     return plan, wasserstein, iterations
+
+
+def _apply_transport_plan(
+    plan: torch.Tensor,
+    valid_indices: torch.Tensor,
+    original_logits: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Apply transport plan to produce redistributed log-space logits.
+
+    Steps:
+    1. Sum plan columns -> redistributed probability per valid token
+    2. Add existing valid probabilities from original logits
+    3. Convert to log-space
+    4. Set invalid tokens to -inf
+
+    Args:
+        plan: (n_invalid, n_valid) transport plan matrix.
+        valid_indices: indices of valid tokens.
+        original_logits: original logit tensor (full vocab).
+        vocab_size: total vocabulary size.
+
+    Returns:
+        Log-space logits tensor of shape (vocab_size,).
+    """
+    # Get original probabilities for valid tokens
+    original_probs = torch.softmax(original_logits, dim=-1)
+    valid_probs = original_probs[valid_indices]
+
+    # Sum plan columns: mass redistributed to each valid token
+    redistributed = plan.sum(dim=0)
+
+    # Combined probability = original valid + redistributed
+    combined_probs = valid_probs + redistributed
+
+    # Build output: -inf everywhere, then fill valid positions
+    result = torch.full((vocab_size,), float("-inf"), dtype=original_logits.dtype)
+    result[valid_indices] = torch.log(combined_probs)
+
+    return result

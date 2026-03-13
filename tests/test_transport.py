@@ -469,3 +469,83 @@ class TestSinkhornLogDomain:
             assert torch.allclose(plan.sum(dim=0), target, atol=1e-3)
 
         _check()
+
+
+class TestApplyTransportPlan:
+    """Task 6: _apply_transport_plan converts plan to redistributed logits."""
+
+    def _make_plan_and_indices(self) -> tuple:
+        """Helper: create a simple transport plan scenario."""
+        # Vocab size 5, tokens 0,2 invalid, tokens 1,3,4 valid
+        # Invalid token 0 has prob 0.3, invalid token 2 has prob 0.2
+        # Valid tokens 1,3,4 have probs 0.2, 0.15, 0.15
+        valid_idx = torch.tensor([1, 3, 4])
+        # Plan: 2 invalid sources → 3 valid targets
+        plan = torch.tensor([
+            [0.15, 0.10, 0.05],  # invalid 0 sends mass
+            [0.05, 0.05, 0.10],  # invalid 2 sends mass
+        ])
+        original_logits = torch.log(
+            torch.tensor([0.30, 0.20, 0.20, 0.15, 0.15])
+        )
+        return plan, valid_idx, original_logits, 5
+
+    def test_output_shape(self) -> None:
+        from tgirl.transport import _apply_transport_plan
+
+        plan, valid_idx, logits, vocab_size = self._make_plan_and_indices()
+        result = _apply_transport_plan(plan, valid_idx, logits, vocab_size)
+        assert result.shape == (vocab_size,)
+
+    def test_invalid_neg_inf(self) -> None:
+        from tgirl.transport import _apply_transport_plan
+
+        plan, valid_idx, logits, vocab_size = self._make_plan_and_indices()
+        result = _apply_transport_plan(plan, valid_idx, logits, vocab_size)
+        # Tokens 0 and 2 are invalid → -inf
+        assert result[0] == float("-inf")
+        assert result[2] == float("-inf")
+
+    def test_valid_finite(self) -> None:
+        from tgirl.transport import _apply_transport_plan
+
+        plan, valid_idx, logits, vocab_size = self._make_plan_and_indices()
+        result = _apply_transport_plan(plan, valid_idx, logits, vocab_size)
+        # Valid tokens 1, 3, 4 should be finite
+        assert torch.isfinite(result[1])
+        assert torch.isfinite(result[3])
+        assert torch.isfinite(result[4])
+
+    def test_softmax_sums_to_one(self) -> None:
+        from tgirl.transport import _apply_transport_plan
+
+        plan, valid_idx, logits, vocab_size = self._make_plan_and_indices()
+        result = _apply_transport_plan(plan, valid_idx, logits, vocab_size)
+        # Softmax of finite values should sum to ~1
+        finite_mask = torch.isfinite(result)
+        probs = torch.softmax(result[finite_mask], dim=-1)
+        assert abs(probs.sum().item() - 1.0) < 1e-5
+
+    def test_mass_conservation(self) -> None:
+        from tgirl.transport import _apply_transport_plan
+
+        plan, valid_idx, logits, vocab_size = self._make_plan_and_indices()
+        result = _apply_transport_plan(plan, valid_idx, logits, vocab_size)
+        # Total redistributed prob should equal original valid + transported
+        original_probs = torch.softmax(logits, dim=-1)
+        original_valid_mass = original_probs[valid_idx].sum().item()
+        transported_mass = plan.sum().item()
+        total_expected = original_valid_mass + transported_mass
+        # Result probs (from finite logits)
+        finite_mask = torch.isfinite(result)
+        result_probs = torch.exp(result[finite_mask])
+        assert abs(result_probs.sum().item() - total_expected) < 1e-4
+
+    def test_output_is_log_space(self) -> None:
+        from tgirl.transport import _apply_transport_plan
+
+        plan, valid_idx, logits, vocab_size = self._make_plan_and_indices()
+        result = _apply_transport_plan(plan, valid_idx, logits, vocab_size)
+        # Valid logits should be negative (log of probability < 1)
+        valid_logits = result[valid_idx]
+        assert (valid_logits < 0).all()
