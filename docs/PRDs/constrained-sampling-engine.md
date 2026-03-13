@@ -1,6 +1,6 @@
 # PRD: Constrained Sampling Engine
 
-## Status: DRAFT
+## Status: IMPLEMENTED
 ## Author: agent (proposer)
 ## Date: 2026-03-12
 ## Branch: feature/constrained-sampling-engine
