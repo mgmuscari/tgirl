@@ -259,3 +259,182 @@ class TestGrammarTemperatureHook:
         gs = self._make_grammar_state(100, 100)
         result = hook.pre_forward(0, gs, [], torch.zeros(100))
         assert result.temperature == pytest.approx(0.8)
+
+
+class TestApplyPenalties:
+    """Task 4: Pre-OT penalty application on raw logits."""
+
+    def test_repetition_penalty_penalizes_repeated_tokens(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_penalties
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([2.0, 3.0, 1.0, 4.0])
+        intervention = ModelIntervention(repetition_penalty=2.0)
+        result = apply_penalties(logits, intervention, token_history=[1, 3])
+        # token 1: 3.0 > 0, so 3.0 / 2.0 = 1.5
+        # token 3: 4.0 > 0, so 4.0 / 2.0 = 2.0
+        assert result[0].item() == pytest.approx(2.0)
+        assert result[1].item() == pytest.approx(1.5)
+        assert result[2].item() == pytest.approx(1.0)
+        assert result[3].item() == pytest.approx(2.0)
+
+    def test_repetition_penalty_negative_logits(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_penalties
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([2.0, -3.0])
+        intervention = ModelIntervention(repetition_penalty=2.0)
+        result = apply_penalties(logits, intervention, token_history=[1])
+        # token 1: -3.0 < 0, so -3.0 * 2.0 = -6.0
+        assert result[1].item() == pytest.approx(-6.0)
+
+    def test_presence_penalty_subtracts_from_seen(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_penalties
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([5.0, 3.0, 1.0])
+        intervention = ModelIntervention(presence_penalty=1.0)
+        result = apply_penalties(logits, intervention, token_history=[0, 2])
+        assert result[0].item() == pytest.approx(4.0)
+        assert result[1].item() == pytest.approx(3.0)
+        assert result[2].item() == pytest.approx(0.0)
+
+    def test_frequency_penalty_scales_with_count(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_penalties
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([5.0, 3.0])
+        intervention = ModelIntervention(frequency_penalty=0.5)
+        result = apply_penalties(logits, intervention, token_history=[0, 0, 0, 1])
+        # token 0: 5.0 - 0.5*3 = 3.5
+        # token 1: 3.0 - 0.5*1 = 2.5
+        assert result[0].item() == pytest.approx(3.5)
+        assert result[1].item() == pytest.approx(2.5)
+
+    def test_logit_bias_shifts_specific_tokens(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_penalties
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        intervention = ModelIntervention(logit_bias={0: 10.0, 2: -5.0})
+        result = apply_penalties(logits, intervention, token_history=[])
+        assert result[0].item() == pytest.approx(11.0)
+        assert result[1].item() == pytest.approx(2.0)
+        assert result[2].item() == pytest.approx(-2.0)
+
+    def test_all_none_intervention_returns_unchanged(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_penalties
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        intervention = ModelIntervention()
+        result = apply_penalties(logits, intervention, token_history=[0, 1, 2])
+        assert torch.allclose(result, logits)
+
+
+class TestApplyShaping:
+    """Task 4: Post-OT shaping of redistributed logits."""
+
+    def test_temperature_one_leaves_unchanged(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_shaping
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        intervention = ModelIntervention(temperature=1.0)
+        result = apply_shaping(logits, intervention)
+        assert torch.allclose(result, logits)
+
+    def test_temperature_half_doubles_logits(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_shaping
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        intervention = ModelIntervention(temperature=0.5)
+        result = apply_shaping(logits, intervention)
+        assert torch.allclose(result, logits / 0.5)
+
+    def test_temperature_zero_is_greedy(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_shaping
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([1.0, 3.0, 2.0])
+        intervention = ModelIntervention(temperature=0.0)
+        result = apply_shaping(logits, intervention)
+        # Only index 1 (max) survives
+        assert result[1].item() == 3.0
+        assert result[0].item() == float("-inf")
+        assert result[2].item() == float("-inf")
+
+    def test_temperature_zero_tied_maxima_lowest_index_wins(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_shaping
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([1.0, 5.0, 5.0, 2.0])
+        intervention = ModelIntervention(temperature=0.0)
+        result = apply_shaping(logits, intervention)
+        # torch.argmax returns first (lowest-index) maximum
+        assert result[1].item() == 5.0
+        assert result[2].item() == float("-inf")
+
+    def test_top_k_keeps_only_top_k(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_shaping
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([1.0, 5.0, 3.0, 4.0, 2.0])
+        intervention = ModelIntervention(top_k=3)
+        result = apply_shaping(logits, intervention)
+        # Top 3 values: 5.0, 4.0, 3.0 (at indices 1, 3, 2)
+        assert result[1].item() == 5.0
+        assert result[3].item() == 4.0
+        assert result[2].item() == 3.0
+        assert result[0].item() == float("-inf")
+        assert result[4].item() == float("-inf")
+
+    def test_top_p_filters_and_preserves_positions(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_shaping
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([5.0, 3.0, 1.0, 0.5, 0.1])
+        intervention = ModelIntervention(top_p=0.5)
+        result = apply_shaping(logits, intervention)
+        # After softmax, index 0 (5.0) dominates. Its prob alone may exceed 0.5.
+        # The key test: surviving tokens are at their original indices.
+        # Index 0 must survive (highest prob). Low-prob tokens should be -inf.
+        assert result[0].item() != float("-inf")
+        # At least one low-prob token is filtered out
+        assert result[4].item() == float("-inf")
+
+    def test_all_none_intervention_returns_unchanged(self) -> None:
+        import torch
+
+        from tgirl.sample import apply_shaping
+        from tgirl.types import ModelIntervention
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        intervention = ModelIntervention()
+        result = apply_shaping(logits, intervention)
+        assert torch.allclose(result, logits)
