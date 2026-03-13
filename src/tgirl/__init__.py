@@ -20,6 +20,11 @@ from tgirl.grammar import (
     generate as generate_grammar,
 )
 from tgirl.registry import ToolRegistry
+from tgirl.transport import (
+    TransportConfig,
+    TransportResult,
+    redistribute_logits,
+)
 from tgirl.types import (
     AnnotatedType,
     AnyType,
@@ -72,7 +77,10 @@ __all__ = [
     "TelemetryRecord",
     "ToolDefinition",
     "ToolRegistry",
+    "TransportConfig",
+    "TransportResult",
     "generate_grammar",
+    "redistribute_logits",
     "run_pipeline",
     "grammar_diff",
     "TypeRepr",
