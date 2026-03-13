@@ -336,3 +336,55 @@ class TestEnrichment:
         assert "JsonObject" in doc
         # 'key' should still appear with its default representation
         assert "key" in doc
+
+
+# --- Tests: generate_routing_prompt ---
+
+
+class TestGenerateRoutingPrompt:
+    """Tests for routing prompt generation."""
+
+    def test_routing_prompt_contains_all_tool_names(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_routing_prompt
+
+        prompt = generate_routing_prompt(simple_registry.snapshot())
+        assert "add" in prompt
+        assert "greet" in prompt
+
+    def test_routing_prompt_contains_descriptions(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_routing_prompt
+
+        prompt = generate_routing_prompt(simple_registry.snapshot())
+        assert "Add two integers" in prompt
+        assert "Greet someone by name" in prompt
+
+    def test_routing_prompt_contains_directive(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_routing_prompt
+
+        prompt = generate_routing_prompt(simple_registry.snapshot())
+        assert "Reply with ONLY the tool name" in prompt
+
+    def test_routing_prompt_deterministic(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_routing_prompt
+
+        snap = simple_registry.snapshot()
+        p1 = generate_routing_prompt(snap)
+        p2 = generate_routing_prompt(snap)
+        assert p1 == p2
+
+    def test_routing_prompt_contains_parameter_names(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_routing_prompt
+
+        prompt = generate_routing_prompt(simple_registry.snapshot())
+        assert "a, b" in prompt
+        assert "name" in prompt

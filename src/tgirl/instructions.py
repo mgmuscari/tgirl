@@ -133,3 +133,23 @@ def generate_system_prompt(snapshot: RegistrySnapshot) -> str:
         sections.append("")
 
     return "\n".join(sections).rstrip()
+
+
+def generate_routing_prompt(snapshot: RegistrySnapshot) -> str:
+    """Generate a routing prompt for tool selection.
+
+    Optimized for classification: lists tools with descriptions,
+    instructs the model to output ONLY the tool name.
+    """
+    lines = [
+        "You are a tool routing assistant. "
+        "Given a user request, pick the best tool.",
+        "",
+        "Available tools:",
+    ]
+    for tool in snapshot.tools:
+        params = ", ".join(p.name for p in tool.parameters)
+        lines.append(f"- {tool.name}({params}): {tool.description}")
+    lines.append("")
+    lines.append("Reply with ONLY the tool name, nothing else.")
+    return "\n".join(lines)
