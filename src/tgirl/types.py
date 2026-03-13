@@ -167,6 +167,8 @@ class ToolDefinition(BaseModel):
     timeout: float | None = None
     cacheable: bool = False
     description: str = ""
+    param_tags: tuple[tuple[str, str], ...] = ()
+    examples: tuple[str, ...] = ()
 
 
 # --- Registry Snapshot ---
@@ -184,6 +186,7 @@ class RegistrySnapshot(BaseModel):
     cost_remaining: float | None
     scopes: frozenset[str]
     timestamp: float
+    type_grammars: tuple[tuple[str, str], ...] = ()
 
     @model_validator(mode="after")
     def _wrap_quotas(self) -> RegistrySnapshot:

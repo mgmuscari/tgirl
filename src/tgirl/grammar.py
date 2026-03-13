@@ -254,6 +254,7 @@ def _type_to_rule(
 def _tool_to_rules(
     tool: ToolDefinition,
     config: GrammarConfig,
+    type_grammars: Mapping[str, str] | None = None,
 ) -> list[Production]:
     """Convert a ToolDefinition to grammar productions.
 
@@ -261,14 +262,20 @@ def _tool_to_rules(
     required params first in fixed order, then optional params
     as a nested optional chain.
 
+    When a parameter has a semantic type tag with a registered grammar
+    rule, the tagged rule is used instead of the default type rule.
+
     Args:
         tool: The tool definition.
         config: Grammar generation configuration.
+        type_grammars: Mapping of semantic type tags to Lark EBNF rules.
 
     Returns:
         List of Production objects for this tool.
     """
     prods: list[Production] = []
+    tag_map = dict(tool.param_tags)
+    tg = type_grammars or {}
 
     # Split required and optional parameters
     required = [p for p in tool.parameters if not p.has_default]
@@ -277,9 +284,17 @@ def _tool_to_rules(
     # Generate type productions for each parameter
     param_type_names: list[str] = []
     for param in tool.parameters:
-        type_name = f"param_{tool.name}_{param.name}"
-        param_type_names.append(type_name)
-        prods.extend(_type_to_rule(param.type_repr, type_name, config))
+        tag = tag_map.get(param.name)
+        if tag and tag in tg:
+            # Use the semantic type's shared rule name
+            rule_name = f"stype_{tag.lower()}"
+            param_type_names.append(rule_name)
+            # The actual rule definition is emitted once (deduped later)
+            prods.append(Production(name=rule_name, rule=tg[tag]))
+        else:
+            type_name = f"param_{tool.name}_{param.name}"
+            param_type_names.append(type_name)
+            prods.extend(_type_to_rule(param.type_repr, type_name, config))
 
     if not tool.parameters:
         # No parameters: (tool_name)
@@ -352,8 +367,10 @@ def _render_grammar(
     type_prods: list[Production] = []
     tool_call_names: list[str] = []
 
+    tg = dict(snapshot.type_grammars)
+
     for tool in snapshot.tools:
-        rules = _tool_to_rules(tool, config)
+        rules = _tool_to_rules(tool, config, type_grammars=tg)
         # First production is the call_<name> rule
         tool_call_names.append(rules[0].name)
         tool_prods.append(rules[0])
@@ -395,9 +412,10 @@ def generate(
     cfg = config or GrammarConfig()
 
     # Collect all productions
+    tg = dict(snapshot.type_grammars)
     all_prods: list[Production] = []
     for tool in snapshot.tools:
-        all_prods.extend(_tool_to_rules(tool, cfg))
+        all_prods.extend(_tool_to_rules(tool, cfg, type_grammars=tg))
 
     # Also collect type productions from return types
     for tool in snapshot.tools:
