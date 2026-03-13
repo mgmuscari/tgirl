@@ -112,3 +112,68 @@ def _compute_cost_submatrix(
     )
     similarity = invalid_emb @ valid_emb.T
     return 1.0 - similarity
+
+
+def _sinkhorn_log_domain(
+    cost_matrix: torch.Tensor,
+    source_mass: torch.Tensor,
+    target_capacity: torch.Tensor,
+    epsilon: float,
+    max_iterations: int,
+    convergence_threshold: float,
+) -> tuple[torch.Tensor, float, int]:
+    """Log-domain Sinkhorn algorithm for optimal transport.
+
+    Uses log-domain computation for numerical stability:
+    log_kernel = -cost / epsilon, with logsumexp for scaling updates.
+
+    Args:
+        cost_matrix: (n_source, n_target) cost matrix.
+        source_mass: (n_source,) source probability distribution.
+        target_capacity: (n_target,) target probability distribution.
+        epsilon: Entropic regularization parameter.
+        max_iterations: Maximum Sinkhorn iterations.
+        convergence_threshold: Convergence on marginal error.
+
+    Returns:
+        (transport_plan, wasserstein_distance, iterations)
+    """
+    n_source, n_target = cost_matrix.shape
+    log_kernel = -cost_matrix / epsilon
+
+    # Initialize log scaling vectors
+    log_u = torch.zeros(n_source, dtype=cost_matrix.dtype)
+    log_v = torch.zeros(n_target, dtype=cost_matrix.dtype)
+
+    log_source = torch.log(source_mass)
+    log_target = torch.log(target_capacity)
+
+    iterations = 0
+    for i in range(max_iterations):
+        iterations = i + 1
+
+        # Update log_u: row scaling
+        log_u = log_source - torch.logsumexp(log_kernel + log_v[None, :], dim=1)
+
+        # Update log_v: column scaling
+        log_v = log_target - torch.logsumexp(log_kernel + log_u[:, None], dim=0)
+
+        # Check convergence: marginal error
+        log_plan_row_sums = torch.logsumexp(
+            log_kernel + log_u[:, None] + log_v[None, :], dim=1
+        )
+        marginal_error = (
+            torch.exp(log_plan_row_sums) - source_mass
+        ).abs().max().item()
+
+        if marginal_error < convergence_threshold:
+            break
+
+    # Compute final plan
+    log_plan = log_u[:, None] + log_kernel + log_v[None, :]
+    plan = torch.exp(log_plan)
+
+    # Wasserstein distance = (plan * cost).sum()
+    wasserstein = (plan * cost_matrix).sum().item()
+
+    return plan, wasserstein, iterations

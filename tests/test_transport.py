@@ -318,3 +318,154 @@ class TestCostSubmatrix:
             valid_idx = torch.tensor([2, 3, 4])
             cost = _compute_cost_submatrix(embeddings, invalid_idx, valid_idx)
             assert cost.shape == (2, 3)
+
+
+class TestSinkhornLogDomain:
+    """Task 5: _sinkhorn_log_domain optimal transport solver."""
+
+    def test_uniform_cost_uniform_plan(self) -> None:
+        """Uniform cost matrix → plan should be approximately uniform."""
+        from tgirl.transport import _sinkhorn_log_domain
+
+        cost = torch.ones(3, 3)
+        source = torch.tensor([1.0 / 3, 1.0 / 3, 1.0 / 3])
+        target = torch.tensor([1.0 / 3, 1.0 / 3, 1.0 / 3])
+        plan, w_dist, iters = _sinkhorn_log_domain(
+            cost, source, target, epsilon=0.1, max_iterations=100,
+            convergence_threshold=1e-8,
+        )
+        # Plan should be uniform: each cell ≈ 1/9
+        expected = torch.full((3, 3), 1.0 / 9)
+        assert torch.allclose(plan, expected, atol=1e-4)
+
+    def test_zero_cost_concentrated(self) -> None:
+        """Zero cost on diagonal → mass concentrates on diagonal."""
+        from tgirl.transport import _sinkhorn_log_domain
+
+        cost = torch.ones(2, 2)
+        cost[0, 0] = 0.0
+        cost[1, 1] = 0.0
+        source = torch.tensor([0.5, 0.5])
+        target = torch.tensor([0.5, 0.5])
+        plan, w_dist, iters = _sinkhorn_log_domain(
+            cost, source, target, epsilon=0.01, max_iterations=100,
+            convergence_threshold=1e-8,
+        )
+        # Most mass should be on diagonal
+        assert plan[0, 0] > plan[0, 1]
+        assert plan[1, 1] > plan[1, 0]
+
+    def test_convergence_before_max_iter(self) -> None:
+        """Should converge in fewer than max iterations."""
+        from tgirl.transport import _sinkhorn_log_domain
+
+        cost = torch.rand(3, 4)
+        source = torch.tensor([0.3, 0.3, 0.4])
+        target = torch.tensor([0.2, 0.3, 0.2, 0.3])
+        _, _, iters = _sinkhorn_log_domain(
+            cost, source, target, epsilon=0.1, max_iterations=100,
+            convergence_threshold=1e-6,
+        )
+        assert iters < 100
+
+    def test_correct_iteration_count(self) -> None:
+        """Returned iteration count should be positive."""
+        from tgirl.transport import _sinkhorn_log_domain
+
+        cost = torch.rand(2, 3)
+        source = torch.tensor([0.5, 0.5])
+        target = torch.tensor([0.3, 0.3, 0.4])
+        _, _, iters = _sinkhorn_log_domain(
+            cost, source, target, epsilon=0.1, max_iterations=20,
+            convergence_threshold=1e-6,
+        )
+        assert iters >= 1
+
+    def test_non_negative_wasserstein(self) -> None:
+        from tgirl.transport import _sinkhorn_log_domain
+
+        cost = torch.rand(3, 4)
+        source = torch.tensor([0.3, 0.3, 0.4])
+        target = torch.tensor([0.2, 0.3, 0.2, 0.3])
+        _, w_dist, _ = _sinkhorn_log_domain(
+            cost, source, target, epsilon=0.1, max_iterations=50,
+            convergence_threshold=1e-6,
+        )
+        assert w_dist >= 0.0
+
+    def test_marginals_match(self) -> None:
+        """Row sums ≈ source, column sums ≈ target."""
+        from tgirl.transport import _sinkhorn_log_domain
+
+        cost = torch.rand(3, 4)
+        source = torch.tensor([0.3, 0.3, 0.4])
+        target = torch.tensor([0.2, 0.3, 0.2, 0.3])
+        plan, _, _ = _sinkhorn_log_domain(
+            cost, source, target, epsilon=0.1, max_iterations=100,
+            convergence_threshold=1e-8,
+        )
+        assert torch.allclose(plan.sum(dim=1), source, atol=1e-4)
+        assert torch.allclose(plan.sum(dim=0), target, atol=1e-4)
+
+    def test_small_epsilon_more_concentrated(self) -> None:
+        """Smaller epsilon → plan more concentrated on low-cost entries."""
+        from tgirl.transport import _sinkhorn_log_domain
+
+        cost = torch.tensor([[0.1, 1.0], [1.0, 0.1]])
+        source = torch.tensor([0.5, 0.5])
+        target = torch.tensor([0.5, 0.5])
+        plan_small, _, _ = _sinkhorn_log_domain(
+            cost, source, target, epsilon=0.01, max_iterations=100,
+            convergence_threshold=1e-8,
+        )
+        plan_large, _, _ = _sinkhorn_log_domain(
+            cost, source, target, epsilon=1.0, max_iterations=100,
+            convergence_threshold=1e-8,
+        )
+        # Small epsilon: more mass on diagonal (low cost)
+        assert plan_small[0, 0] > plan_large[0, 0]
+
+    def test_single_source_target(self) -> None:
+        """1x1 transport plan."""
+        from tgirl.transport import _sinkhorn_log_domain
+
+        cost = torch.tensor([[0.5]])
+        source = torch.tensor([1.0])
+        target = torch.tensor([1.0])
+        plan, w_dist, iters = _sinkhorn_log_domain(
+            cost, source, target, epsilon=0.1, max_iterations=20,
+            convergence_threshold=1e-6,
+        )
+        assert torch.allclose(plan, torch.tensor([[1.0]]), atol=1e-4)
+        assert abs(w_dist - 0.5) < 1e-4
+
+    def test_hypothesis_marginal_conservation(self) -> None:
+        """Property test: marginals are always conserved."""
+        from hypothesis import given, settings
+        from hypothesis import strategies as st
+
+        from tgirl.transport import _sinkhorn_log_domain
+
+        @given(
+            n_source=st.integers(min_value=1, max_value=5),
+            n_target=st.integers(min_value=1, max_value=5),
+            seed=st.integers(min_value=0, max_value=10000),
+        )
+        @settings(max_examples=20, deadline=5000)
+        def _check(n_source: int, n_target: int, seed: int) -> None:
+            torch.manual_seed(seed)
+            cost = torch.rand(n_source, n_target)
+            # Create valid probability distributions
+            source_raw = torch.rand(n_source) + 0.1
+            source = source_raw / source_raw.sum()
+            target_raw = torch.rand(n_target) + 0.1
+            target = target_raw / target_raw.sum()
+
+            plan, _, _ = _sinkhorn_log_domain(
+                cost, source, target, epsilon=0.1,
+                max_iterations=100, convergence_threshold=1e-6,
+            )
+            assert torch.allclose(plan.sum(dim=1), source, atol=1e-3)
+            assert torch.allclose(plan.sum(dim=0), target, atol=1e-3)
+
+        _check()
