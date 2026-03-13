@@ -113,6 +113,72 @@ def _parse_hy(source: str) -> list[Object] | PipelineError:
     return trees
 
 
+# --- Composition operator implementations ---
+
+
+def _pmap_impl(fns: list, arg: Any) -> list:
+    """Apply each function in fns to arg, return list of results.
+
+    v1.0: sequential execution (fail-fast on first error).
+    Per-tool timeouts are already applied via sandbox wrapping.
+    """
+    results = []
+    for fn in fns:
+        results.append(fn(arg))
+    return results
+
+
+def _insufficient_resources_impl(reason: str) -> InsufficientResources:
+    """Return an InsufficientResources signal.
+
+    This is the model's intentional signal that it cannot act,
+    not an error condition.
+    """
+    return InsufficientResources(
+        reason=reason, hy_source="(insufficient-resources ...)"
+    )
+
+
+def _expand_macros(tree: Object) -> Object:
+    """Expand tgirl-specific macros in the Hy AST.
+
+    Currently handles:
+    - ``->`` (thread-first): ``(-> x (f) (g a))`` becomes ``(g (f x) a)``
+
+    Hy 1.2 does not expand ``->`` as a macro during compilation,
+    so we do it manually before calling hy_compile.
+    """
+    if not isinstance(tree, Expression) or len(tree) < 2:
+        return tree
+
+    head = tree[0]
+
+    if isinstance(head, Symbol) and str(head) == "->":
+        # Thread-first expansion
+        result = _expand_macros(tree[1])
+        for form in tree[2:]:
+            form = _expand_macros(form)
+            if isinstance(form, Expression):
+                # (fn arg1 ...) -> (fn result arg1 ...)
+                result = Expression(
+                    [form[0], result, *list(form[1:])]
+                )
+            elif isinstance(form, Symbol):
+                # bare symbol -> (fn result)
+                result = Expression([form, result])
+            else:
+                result = Expression([form, result])
+        return result
+
+    # Recurse into sub-expressions
+    return Expression(
+        [
+            _expand_macros(x) if isinstance(x, Expression) else x
+            for x in tree
+        ]
+    )
+
+
 # Composition operators and special forms allowed in Hy AST
 _COMPOSITION_KEYWORDS = frozenset({
     "->", "let", "if", "try", "except", "catch", "pmap",

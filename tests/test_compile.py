@@ -375,3 +375,94 @@ class TestPythonAstAnalysis:
         tree = self._hy_to_ast('(let [x (greet "hi")] (shout x))')
         result = _analyze_python_ast(tree, {"greet", "shout"})
         assert result is None
+
+
+class TestCompositionOperators:
+    """Task 5: Composition operator runtime implementations."""
+
+    @pytest.fixture()
+    def registry(self) -> ToolRegistry:
+        reg = ToolRegistry()
+
+        @reg.tool()
+        def greet(name: str) -> str:
+            return f"Hello, {name}"
+
+        @reg.tool()
+        def shout(text: str) -> str:
+            return text.upper()
+
+        @reg.tool()
+        def failing_tool(text: str) -> str:
+            msg = "tool failed"
+            raise RuntimeError(msg)
+
+        @reg.tool()
+        def fallback(text: str) -> str:
+            return "fallback result"
+
+        @reg.tool()
+        def pred(text: str) -> bool:
+            return len(text) > 3
+
+        return reg
+
+    def test_pmap_returns_list_of_results(self) -> None:
+        from tgirl.compile import _pmap_impl
+
+        results = _pmap_impl(
+            [lambda x: x.upper(), lambda x: x + "!"],
+            "hello",
+        )
+        assert results == ["HELLO", "hello!"]
+
+    def test_pmap_fail_fast(self) -> None:
+        from tgirl.compile import _pmap_impl
+
+        def good(x: str) -> str:
+            return x
+
+        def bad(x: str) -> str:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _pmap_impl([good, bad], "test")
+
+    def test_insufficient_resources_returns_model(self) -> None:
+        from tgirl.compile import (
+            InsufficientResources,
+            _insufficient_resources_impl,
+        )
+
+        result = _insufficient_resources_impl("no tools available")
+        assert isinstance(result, InsufficientResources)
+        assert result.reason == "no tools available"
+
+    def test_expand_threading_macro(self) -> None:
+        import hy
+        from hy.models import Expression
+
+        from tgirl.compile import _expand_macros
+
+        trees = list(hy.read_many('(-> "hello" (greet) (shout))'))
+        expanded = _expand_macros(trees[0])
+        # Should expand to (shout (greet "hello"))
+        assert isinstance(expanded, Expression)
+        assert str(expanded[0]) == "shout"
+        inner = expanded[1]
+        assert isinstance(inner, Expression)
+        assert str(inner[0]) == "greet"
+
+    def test_expand_threading_with_extra_args(self) -> None:
+        import hy
+        from hy.models import Expression
+
+        from tgirl.compile import _expand_macros
+
+        trees = list(hy.read_many('(-> "x" (tool1 "extra"))'))
+        expanded = _expand_macros(trees[0])
+        # Should expand to (tool1 "x" "extra")
+        assert isinstance(expanded, Expression)
+        assert str(expanded[0]) == "tool1"
+        assert len(expanded) == 3  # tool1, "x", "extra"
