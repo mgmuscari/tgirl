@@ -16,10 +16,12 @@ import ast
 import concurrent.futures
 import functools
 import re
+import time
 from typing import Any
 
 import hy
 import structlog
+from hy.compiler import hy_compile
 from hy.models import Expression, List, Object, Symbol
 from pydantic import BaseModel, ConfigDict
 from RestrictedPython import RestrictingNodeTransformer
@@ -594,6 +596,34 @@ def _build_sandbox(registry: ToolRegistry) -> dict[str, Any]:
     return sandbox
 
 
+def _inject_result_capture(tree: ast.Module) -> ast.Module:
+    """Rewrite the last expression statement to capture its value.
+
+    Changes the last ``ast.Expr`` to
+    ``_tgirl_result_ = <expr>`` so the sandbox can retrieve the
+    pipeline result after execution.
+
+    This runs AFTER security analysis — the injected assignment
+    is trusted code from the engine, not model output.
+    """
+    if not tree.body:
+        return tree
+
+    last = tree.body[-1]
+    if isinstance(last, ast.Expr):
+        assign = ast.Assign(
+            targets=[
+                ast.Name(id="_tgirl_result_", ctx=ast.Store())
+            ],
+            value=last.value,
+        )
+        ast.copy_location(assign, last)
+        tree.body[-1] = assign
+        ast.fix_missing_locations(tree)
+
+    return tree
+
+
 def run_pipeline(
     source: str,
     registry: ToolRegistry,
@@ -601,11 +631,126 @@ def run_pipeline(
 ) -> PipelineResult | InsufficientResources | PipelineError:
     """Execute a Hy s-expression pipeline.
 
-    Stub implementation — returns PipelineError until fully implemented.
+    Pipeline stages:
+    1. Parse Hy source
+    2. Expand macros (-> threading)
+    3. Static analysis (Hy AST)
+    4. Compile to Python AST
+    5. Security analysis (RestrictedPython)
+    6. Inject result capture
+    7. Build sandbox
+    8. Execute with timeout
     """
-    return PipelineError(
-        stage=STAGE_EXECUTE,
-        error_type="NotImplementedError",
-        message="Pipeline not yet implemented",
+    cfg = config or CompileConfig()
+    start_time = time.monotonic()
+    tool_names = set(registry.names())
+
+    # Stage 1: Parse
+    logger.debug("pipeline_parse", source=source)
+    trees = _parse_hy(source)
+    if isinstance(trees, PipelineError):
+        return trees
+
+    # Stage 1.5: Expand macros (-> threading)
+    trees = [_expand_macros(t) for t in trees]
+
+    # Stage 2: Hy AST static analysis
+    logger.debug("pipeline_static_analysis")
+    hy_err = _analyze_hy_ast(trees, tool_names)
+    if hy_err is not None:
+        return hy_err
+
+    # Stage 3: Compile Hy AST to Python AST
+    logger.debug("pipeline_compile")
+    try:
+        hy_input = (
+            trees[0]
+            if len(trees) == 1
+            else Expression([Symbol("do"), *trees])
+        )
+        py_tree = hy_compile(hy_input, "__main__")
+    except Exception as exc:
+        return PipelineError(
+            stage=STAGE_COMPILE,
+            error_type=type(exc).__name__,
+            message=str(exc),
+            hy_source=source,
+        )
+
+    # Strip auto-injected 'import hy'
+    py_tree.body = [
+        n
+        for n in py_tree.body
+        if not isinstance(n, ast.Import)
+        or n.names[0].name != "hy"
+    ]
+
+    # Stage 4: Python AST security analysis
+    logger.debug("pipeline_ast_analysis")
+    py_err = _analyze_python_ast(py_tree, tool_names)
+    if py_err is not None:
+        return py_err
+
+    # Stage 5: Inject result capture
+    py_tree = _inject_result_capture(py_tree)
+
+    # Stage 6: Compile to bytecode
+    try:
+        bytecode = compile(py_tree, "<tgirl-pipeline>", "exec")
+    except Exception as exc:
+        return PipelineError(
+            stage=STAGE_COMPILE,
+            error_type=type(exc).__name__,
+            message=str(exc),
+            hy_source=source,
+        )
+
+    # Stage 7: Build sandbox
+    sandbox = _build_sandbox(registry)
+
+    # Apply per-tool timeouts
+    for name in registry.names():
+        tool_def = registry.get(name)
+        if tool_def.timeout is not None:
+            sandbox[name] = _wrap_with_timeout(
+                sandbox[name], tool_def.timeout
+            )
+
+    # Stage 8: Execute with pipeline timeout
+    logger.debug("pipeline_execute")
+
+    def _execute() -> Any:
+        try:
+            exec(bytecode, sandbox)  # noqa: S102
+        except Exception as exc:
+            return PipelineError(
+                stage=STAGE_EXECUTE,
+                error_type=type(exc).__name__,
+                message=str(exc),
+                hy_source=source,
+            )
+        return sandbox["_tgirl_result_"]
+
+    result = _run_with_timeout(_execute, cfg.pipeline_timeout)
+    elapsed = (time.monotonic() - start_time) * 1000
+
+    if isinstance(result, PipelineError):
+        return result
+
+    # Check for InsufficientResources
+    if isinstance(result, InsufficientResources):
+        return InsufficientResources(
+            reason=result.reason, hy_source=source
+        )
+
+    # Check for runtime exceptions wrapped as PipelineError
+    logger.info(
+        "pipeline_complete",
+        elapsed_ms=elapsed,
+        source=source,
+    )
+    return PipelineResult(
+        result=result,
         hy_source=source,
+        execution_time_ms=elapsed,
     )

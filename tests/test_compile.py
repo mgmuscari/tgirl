@@ -78,13 +78,14 @@ class TestCompileTypes:
 class TestCompileStubs:
     """Task 1: Verify stub entry point exists."""
 
-    def test_run_pipeline_stub_returns_pipeline_error(self) -> None:
+    def test_run_pipeline_exists_and_callable(self) -> None:
         from tgirl.compile import run_pipeline
 
         registry = ToolRegistry()
+        # With no tools registered, unregistered call fails at static analysis
         result = run_pipeline("(greet)", registry)
         assert isinstance(result, PipelineError)
-        assert "NotImplementedError" in result.error_type
+        assert result.stage == "static_analysis"
 
     def test_pipeline_stages_defined(self) -> None:
         from tgirl.compile import (
@@ -593,3 +594,150 @@ class TestTimeoutEnforcement:
         wrapped = _wrap_with_timeout(slow_fn, timeout=0.1)
         with pytest.raises(TimeoutError):
             wrapped("test")
+
+
+class TestResultCapture:
+    """Task 8: Result capture via AST rewriting."""
+
+    def test_inject_result_capture_rewrites_last_expr(self) -> None:
+        import ast
+
+        from tgirl.compile import _inject_result_capture
+
+        tree = ast.parse('greet("hello")')
+        rewritten = _inject_result_capture(tree)
+        # Last statement should be an Assign, not Expr
+        last = rewritten.body[-1]
+        assert isinstance(last, ast.Assign)
+        assert last.targets[0].id == "_tgirl_result_"  # type: ignore[attr-defined]
+
+    def test_single_expression_captures_value(self) -> None:
+        import ast
+
+        from tgirl.compile import _inject_result_capture
+
+        tree = ast.parse("42")
+        rewritten = _inject_result_capture(tree)
+        sandbox: dict = {"_tgirl_result_": None}
+        exec(  # noqa: S102
+            compile(rewritten, "<test>", "exec"), sandbox
+        )
+        assert sandbox["_tgirl_result_"] == 42
+
+    def test_multiple_statements_captures_last(self) -> None:
+        import ast
+
+        from tgirl.compile import _inject_result_capture
+
+        tree = ast.parse("x = 1\nx + 10")
+        rewritten = _inject_result_capture(tree)
+        sandbox: dict = {"_tgirl_result_": None}
+        exec(  # noqa: S102
+            compile(rewritten, "<test>", "exec"), sandbox
+        )
+        assert sandbox["_tgirl_result_"] == 11
+
+    def test_empty_module_handled(self) -> None:
+        import ast
+
+        from tgirl.compile import _inject_result_capture
+
+        tree = ast.Module(body=[], type_ignores=[])
+        rewritten = _inject_result_capture(tree)
+        assert rewritten.body == []
+
+
+class TestFullPipeline:
+    """Task 8: Full pipeline integration."""
+
+    @pytest.fixture()
+    def registry(self) -> ToolRegistry:
+        reg = ToolRegistry()
+
+        @reg.tool()
+        def greet(name: str) -> str:
+            return f"Hello, {name}"
+
+        @reg.tool()
+        def shout(text: str) -> str:
+            return text.upper()
+
+        @reg.tool()
+        def failing(text: str) -> str:
+            msg = "tool failure"
+            raise RuntimeError(msg)
+
+        return reg
+
+    def test_simple_tool_call(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import PipelineResult, run_pipeline
+
+        result = run_pipeline('(greet "world")', registry)
+        assert isinstance(result, PipelineResult)
+        assert result.result == "Hello, world"
+
+    def test_invalid_syntax_error(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import run_pipeline
+
+        result = run_pipeline("(greet", registry)
+        assert isinstance(result, PipelineError)
+        assert result.stage == "parse"
+
+    def test_unregistered_tool_error(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import run_pipeline
+
+        result = run_pipeline('(evil "payload")', registry)
+        assert isinstance(result, PipelineError)
+        assert result.stage == "static_analysis"
+
+    def test_execution_error(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import run_pipeline
+
+        result = run_pipeline('(failing "test")', registry)
+        assert isinstance(result, PipelineError)
+        assert result.stage == "execute"
+
+    def test_insufficient_resources(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import InsufficientResources, run_pipeline
+
+        result = run_pipeline(
+            '(insufficient-resources "no tools")', registry
+        )
+        assert isinstance(result, InsufficientResources)
+        assert result.reason == "no tools"
+
+    def test_each_stage_has_correct_field(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import run_pipeline
+
+        # Parse error
+        r1 = run_pipeline("(", registry)
+        assert isinstance(r1, PipelineError)
+        assert r1.stage == "parse"
+
+        # Static analysis error
+        r2 = run_pipeline('(evil "x")', registry)
+        assert isinstance(r2, PipelineError)
+        assert r2.stage == "static_analysis"
+
+    def test_threading_pipeline(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import PipelineResult, run_pipeline
+
+        result = run_pipeline(
+            '(-> "hello" (greet) (shout))', registry
+        )
+        assert isinstance(result, PipelineResult)
+        assert result.result == "HELLO, HELLO"
