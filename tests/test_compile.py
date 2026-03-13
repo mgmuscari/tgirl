@@ -466,3 +466,84 @@ class TestCompositionOperators:
         assert isinstance(expanded, Expression)
         assert str(expanded[0]) == "tool1"
         assert len(expanded) == 3  # tool1, "x", "extra"
+
+
+class TestSandbox:
+    """Task 6: Sandbox construction."""
+
+    @pytest.fixture()
+    def registry(self) -> ToolRegistry:
+        reg = ToolRegistry()
+
+        @reg.tool()
+        def greet(name: str) -> str:
+            return f"Hello, {name}"
+
+        @reg.tool()
+        def shout(text: str) -> str:
+            return text.upper()
+
+        return reg
+
+    def test_sandbox_contains_registered_tools(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import _build_sandbox
+
+        sandbox = _build_sandbox(registry)
+        assert "greet" in sandbox
+        assert "shout" in sandbox
+        assert sandbox["greet"]("world") == "Hello, world"
+        assert sandbox["shout"]("hi") == "HI"
+
+    def test_sandbox_contains_pmap(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import _build_sandbox
+
+        sandbox = _build_sandbox(registry)
+        assert "pmap" in sandbox
+
+    def test_sandbox_contains_insufficient_resources(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import _build_sandbox
+
+        sandbox = _build_sandbox(registry)
+        assert "insufficient_resources" in sandbox
+
+    def test_sandbox_result_sentinel(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import _build_sandbox
+
+        sandbox = _build_sandbox(registry)
+        assert "_tgirl_result_" in sandbox
+        assert sandbox["_tgirl_result_"] is None
+
+    def test_sandbox_builtins_empty(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import _build_sandbox
+
+        sandbox = _build_sandbox(registry)
+        assert sandbox["__builtins__"] == {}
+
+    def test_sandbox_tool_callables_are_originals(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import _build_sandbox
+
+        sandbox = _build_sandbox(registry)
+        assert sandbox["greet"] is registry.get_callable("greet")
+        assert sandbox["shout"] is registry.get_callable("shout")
+
+    def test_builtins_access_raises_in_sandbox(
+        self, registry: ToolRegistry
+    ) -> None:
+        from tgirl.compile import _build_sandbox
+
+        sandbox = _build_sandbox(registry)
+        code = compile("print('hello')", "<test>", "exec")
+        with pytest.raises(NameError):
+            exec(code, sandbox)  # noqa: S102

@@ -514,6 +514,34 @@ def _analyze_python_ast(
     return None
 
 
+def _build_sandbox(registry: ToolRegistry) -> dict[str, Any]:
+    """Build a restricted namespace for sandboxed execution.
+
+    Contains only:
+    - Registered tool callables
+    - pmap and insufficient_resources implementations
+    - _tgirl_result_ sentinel for result capture
+    - Empty __builtins__ to prevent builtins access
+    """
+    sandbox: dict[str, Any] = {}
+
+    # Add registered tool callables
+    for name in registry.names():
+        sandbox[name] = registry.get_callable(name)
+
+    # Add composition operator implementations
+    sandbox["pmap"] = _pmap_impl
+    sandbox["insufficient_resources"] = _insufficient_resources_impl
+
+    # Result capture sentinel
+    sandbox["_tgirl_result_"] = None
+
+    # Block builtins access
+    sandbox["__builtins__"] = {}
+
+    return sandbox
+
+
 def run_pipeline(
     source: str,
     registry: ToolRegistry,
