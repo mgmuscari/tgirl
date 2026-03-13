@@ -6,17 +6,18 @@ and Hy pipeline execution into a dual-mode sampling loop.
 
 from __future__ import annotations
 
+import re
 import time
 from collections import Counter
 from collections.abc import Callable
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import structlog
 import torch
 from pydantic import BaseModel, ConfigDict
 
 from tgirl.transport import TransportConfig, redistribute_logits
-from tgirl.types import ModelIntervention
+from tgirl.types import ModelIntervention, PipelineError, SessionConfig
 
 logger = structlog.get_logger()
 
@@ -341,3 +342,216 @@ def run_constrained_generation(
         ot_bypassed_count=ot_bypassed_count,
         grammar_generation_ms=elapsed_ms,
     )
+
+
+class ToolCallRecord(BaseModel):
+    """Record of a single tool call cycle."""
+
+    model_config = ConfigDict(frozen=True)
+    pipeline: str  # Hy source
+    result: Any = None
+    error: PipelineError | None = None
+    cycle_number: int
+    tool_invocations: dict[str, int]
+
+
+class SamplingResult(BaseModel):
+    """Result of a complete dual-mode sampling session."""
+
+    model_config = ConfigDict(frozen=True)
+    output_text: str
+    tool_calls: list[ToolCallRecord]
+    telemetry: list[dict[str, Any]]
+    total_tokens: int
+    total_cycles: int
+    wall_time_ms: float
+    quotas_consumed: dict[str, int]
+
+
+class SamplingSession:
+    """Orchestrates the dual-mode sampling loop.
+
+    Generates tokens in freeform mode, detects tool delimiters,
+    switches to constrained mode for Hy pipeline generation,
+    executes pipelines, and returns to freeform mode.
+    """
+
+    def __init__(
+        self,
+        registry: object,  # ToolRegistry
+        forward_fn: Callable[[list[int]], torch.Tensor],
+        tokenizer_decode: Callable[[list[int]], str],
+        tokenizer_encode: Callable[[str], list[int]],
+        embeddings: torch.Tensor,
+        grammar_guide_factory: Callable[[str], GrammarState],
+        config: SessionConfig | None = None,
+        hooks: list[InferenceHook] | None = None,
+        transport_config: TransportConfig | None = None,
+    ) -> None:
+        self._registry = registry
+        self._forward_fn = forward_fn
+        self._decode = tokenizer_decode
+        self._encode = tokenizer_encode
+        self._embeddings = embeddings
+        self._grammar_guide_factory = grammar_guide_factory
+        self._config = config or SessionConfig()
+        self._hooks = hooks or []
+        self._transport_config = transport_config or TransportConfig()
+        self._consumed_quotas: dict[str, int] = {}
+
+    def run(self, prompt_tokens: list[int]) -> SamplingResult:
+        """Run the full dual-mode sampling loop."""
+        start_time = time.monotonic()
+        token_history = list(prompt_tokens)
+        output_parts: list[str] = []
+        tool_calls: list[ToolCallRecord] = []
+        telemetry: list[dict[str, Any]] = []
+        total_tokens = 0
+        cycle_count = 0
+
+        # Set up delimiter detector
+        open_detector = DelimiterDetector(
+            self._config.tool_open_delimiter, self._decode
+        )
+
+        for _ in range(self._config.max_tool_cycles + 1):
+            # --- Freeform mode ---
+            freeform_tokens: list[int] = []
+            delimiter_found = False
+
+            for _ in range(self._config.freeform_max_tokens):
+                # Check timeout
+                elapsed = (time.monotonic() - start_time) * 1000
+                if elapsed > self._config.session_timeout * 1000:
+                    break
+
+                raw_logits = self._forward_fn(token_history)
+                # Simple freeform sampling with config temperature
+                logits = raw_logits / max(self._config.freeform_temperature, 1e-10)
+                probs = torch.softmax(logits, dim=-1)
+                probs = torch.clamp(probs, min=0.0)
+                prob_sum = probs.sum()
+                if prob_sum > 0:
+                    probs = probs / prob_sum
+
+                token_id = int(torch.multinomial(probs, 1).item())
+                freeform_tokens.append(token_id)
+                token_history.append(token_id)
+                total_tokens += 1
+
+                if open_detector.feed(token_id):
+                    delimiter_found = True
+                    break
+
+            if freeform_tokens:
+                output_parts.append(self._decode(freeform_tokens))
+
+            if not delimiter_found:
+                break  # No tool call, session ends
+
+            if cycle_count >= self._config.max_tool_cycles:
+                break
+
+            # --- Constrained mode ---
+            cycle_count += 1
+            open_detector.reset()
+
+            # Generate grammar from registry snapshot
+            from tgirl.grammar import generate as generate_grammar
+
+            snapshot = self._registry.snapshot(
+                cost_budget=self._config.session_cost_budget
+            )
+            grammar_output = generate_grammar(snapshot)
+            grammar_state = self._grammar_guide_factory(grammar_output.text)
+
+            # Run constrained generation
+            gen_result = run_constrained_generation(
+                grammar_state=grammar_state,
+                forward_fn=self._forward_fn,
+                tokenizer_decode=self._decode,
+                embeddings=self._embeddings,
+                hooks=self._hooks,
+                transport_config=self._transport_config,
+                max_tokens=self._config.constrained_max_tokens,
+                context_tokens=token_history,
+            )
+
+            token_history.extend(gen_result.tokens)
+            total_tokens += len(gen_result.tokens)
+
+            # Count tool invocations
+            tool_names = set(self._registry.names())
+            invocations = self._count_tool_invocations(
+                gen_result.hy_source, tool_names
+            )
+
+            # Update consumed quotas
+            for name, count in invocations.items():
+                self._consumed_quotas[name] = (
+                    self._consumed_quotas.get(name, 0) + count
+                )
+
+            # Execute the pipeline
+            from tgirl.compile import run_pipeline
+
+            pipeline_result = run_pipeline(
+                gen_result.hy_source, self._registry
+            )
+
+            error = None
+            result_val = None
+            if isinstance(pipeline_result, PipelineError):
+                error = pipeline_result
+            else:
+                result_val = getattr(pipeline_result, "result", pipeline_result)
+
+            record = ToolCallRecord(
+                pipeline=gen_result.hy_source,
+                result=result_val,
+                error=error,
+                cycle_number=cycle_count,
+                tool_invocations=invocations,
+            )
+            tool_calls.append(record)
+
+            # Inject result into context
+            result_text = (
+                f"{self._config.result_open_delimiter}"
+                f"{result_val}"
+                f"{self._config.result_close_delimiter}"
+            )
+            result_tokens = self._encode(result_text)
+            token_history.extend(result_tokens)
+            total_tokens += len(result_tokens)
+            output_parts.append(result_text)
+
+        wall_time_ms = (time.monotonic() - start_time) * 1000
+
+        return SamplingResult(
+            output_text="".join(output_parts),
+            tool_calls=tool_calls,
+            telemetry=telemetry,
+            total_tokens=total_tokens,
+            total_cycles=cycle_count,
+            wall_time_ms=wall_time_ms,
+            quotas_consumed=dict(self._consumed_quotas),
+        )
+
+    def _count_tool_invocations(
+        self, hy_source: str, tool_names: set[str]
+    ) -> dict[str, int]:
+        """Count tool invocations in Hy source via simple pattern matching.
+
+        Counts occurrences of registered tool names that appear as function
+        calls (after open paren or in threading position).
+        """
+        counts: dict[str, int] = {}
+        # Match tool names that appear after ( or as bare symbols
+        for name in tool_names:
+            # Count occurrences of the tool name as a symbol
+            pattern = rf"\(\s*{re.escape(name)}\b"
+            matches = re.findall(pattern, hy_source)
+            if matches:
+                counts[name] = len(matches)
+        return counts

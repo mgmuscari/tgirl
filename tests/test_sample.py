@@ -722,3 +722,192 @@ class TestDelimiterDetector:
             detector.feed(i % 26)
         # Window should be bounded to 2 * len(delimiter)
         assert len(detector._decoded_window) <= 2 * len(delimiter)
+
+
+class TestSamplingSession:
+    """Task 7: SamplingSession orchestrator for dual-mode loop."""
+
+    def _make_simple_session(
+        self,
+        tool_delimiter_tokens: list[int] | None = None,
+        tool_result: object = "ok",
+        freeform_tokens: int = 5,
+        max_cycles: int = 10,
+        tool_open: str = "<tool>",
+        tool_close: str = "</tool>",
+    ):
+        """Build a SamplingSession with mocked dependencies.
+
+        If tool_delimiter_tokens is None, freeform generation never hits
+        the tool delimiter. Otherwise, those token IDs (when decoded)
+        form the tool_open delimiter, triggering constrained mode.
+        """
+        import torch
+
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        # Simple char-based tokenizer
+        vocab = [chr(i) for i in range(256)]
+
+        def decode(ids: list[int]) -> str:
+            return "".join(vocab[i] for i in ids)
+
+        def encode(text: str) -> list[int]:
+            return [ord(c) for c in text]
+
+        # Build a simple registry with one tool
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5, cost=1.0)
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"Hello, {name}!"
+
+        # Token sequence for freeform generation
+        # Then tool_open tokens, then constrained tokens, then tool_close
+        freeform_tok = list(range(freeform_tokens))
+        if tool_delimiter_tokens is not None:
+            # After freeform, emit the tool delimiter tokens
+            all_tokens = freeform_tok + tool_delimiter_tokens
+        else:
+            all_tokens = freeform_tok
+
+        token_idx = [0]
+
+        def forward_fn(ctx: list[int]) -> torch.Tensor:
+            idx = token_idx[0]
+            token_idx[0] += 1
+            # Strong bias toward the next planned token
+            logits = torch.zeros(256)
+            if idx < len(all_tokens):
+                logits[all_tokens[idx]] = 100.0
+            else:
+                # After planned tokens, bias toward freeform content
+                logits[ord("x")] = 100.0
+            return logits
+
+        embeddings = torch.eye(256)
+
+        # Grammar guide factory: returns a mock grammar state that accepts
+        # after producing a valid Hy expression
+        def grammar_guide_factory(grammar_text: str):
+            # Simple mock: accepts after 1 token
+            class MockGS:
+                def __init__(self):
+                    self._done = False
+
+                def get_valid_mask(self, vocab_size: int) -> torch.Tensor:
+                    mask = torch.zeros(vocab_size, dtype=torch.bool)
+                    # Allow ( and ) and some letters for hy source
+                    for c in "(greet \"hi\")":
+                        mask[ord(c)] = True
+                    return mask
+
+                def is_accepting(self) -> bool:
+                    return self._done
+
+                def advance(self, token_id: int) -> None:
+                    self._done = True  # Accept after first token
+
+            return MockGS()
+
+        config = SessionConfig(
+            max_tool_cycles=max_cycles,
+            freeform_max_tokens=20,
+            constrained_max_tokens=10,
+            tool_open_delimiter=tool_open,
+            tool_close_delimiter=tool_close,
+            session_timeout=30.0,
+        )
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            tokenizer_encode=encode,
+            embeddings=embeddings,
+            grammar_guide_factory=grammar_guide_factory,
+            config=config,
+            transport_config=TransportConfig(),
+        )
+
+        return session
+
+    def test_no_tool_call_returns_freeform_only(self) -> None:
+        from tgirl.sample import SamplingResult
+
+        session = self._make_simple_session(tool_delimiter_tokens=None)
+        result = session.run(prompt_tokens=[])
+        assert isinstance(result, SamplingResult)
+        assert result.total_cycles == 0
+        assert len(result.tool_calls) == 0
+        assert result.total_tokens > 0
+
+    def test_max_tool_cycles_enforced(self) -> None:
+        session = self._make_simple_session(
+            tool_delimiter_tokens=None,
+            max_cycles=3,
+        )
+        result = session.run(prompt_tokens=[])
+        assert result.total_cycles <= 3
+
+    def test_sampling_result_has_wall_time(self) -> None:
+        session = self._make_simple_session(tool_delimiter_tokens=None)
+        result = session.run(prompt_tokens=[])
+        assert result.wall_time_ms > 0
+
+    def test_count_tool_invocations_simple(self) -> None:
+        from tgirl.sample import SamplingSession
+
+        # Direct test of _count_tool_invocations
+        session = self._make_simple_session()
+        counts = session._count_tool_invocations(
+            '(greet "Alice")', {"greet"}
+        )
+        assert counts == {"greet": 1}
+
+    def test_count_tool_invocations_nested(self) -> None:
+        from tgirl.sample import SamplingSession
+
+        session = self._make_simple_session()
+
+        @session._registry.tool(quota=5, cost=1.0)
+        def shout(text: str) -> str:
+            """Shout text."""
+            return text.upper()
+
+        counts = session._count_tool_invocations(
+            '(-> (greet "Alice") (shout))',
+            {"greet", "shout"},
+        )
+        assert counts == {"greet": 1, "shout": 1}
+
+    def test_quotas_consumed_in_result(self) -> None:
+        session = self._make_simple_session(tool_delimiter_tokens=None)
+        result = session.run(prompt_tokens=[])
+        assert isinstance(result.quotas_consumed, dict)
+
+    def test_sampling_result_is_frozen(self) -> None:
+        from pydantic import ValidationError
+
+        session = self._make_simple_session(tool_delimiter_tokens=None)
+        result = session.run(prompt_tokens=[])
+        with pytest.raises(ValidationError):
+            result.total_cycles = 999  # type: ignore[misc]
+
+    def test_tool_call_record_is_frozen(self) -> None:
+        from pydantic import ValidationError
+
+        from tgirl.sample import ToolCallRecord
+
+        record = ToolCallRecord(
+            pipeline="(greet \"hi\")",
+            result="Hello!",
+            cycle_number=0,
+            tool_invocations={"greet": 1},
+        )
+        with pytest.raises(ValidationError):
+            record.cycle_number = 5  # type: ignore[misc]
