@@ -34,8 +34,8 @@ class TransportConfig(BaseModel):
 class TransportResult(NamedTuple):
     """Result of logit redistribution.
 
-    Unpacks as 2-tuple (logits, wasserstein_distance) for spec compatibility.
-    Named access available for all fields.
+    First two positional fields are logits and wasserstein_distance
+    for spec compatibility. Named access available for all fields.
     """
 
     logits: torch.Tensor
