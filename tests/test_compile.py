@@ -98,3 +98,62 @@ class TestCompileStubs:
         assert STAGE_COMPILE == "compile"
         assert STAGE_AST_ANALYSIS == "ast_analysis"
         assert STAGE_EXECUTE == "execute"
+
+
+class TestHyParsing:
+    """Task 2: Hy parsing wrapper."""
+
+    def test_valid_single_call_parses(self) -> None:
+        from tgirl.compile import _parse_hy
+
+        result = _parse_hy('(greet "hello")')
+        assert not isinstance(result, PipelineError)
+        assert isinstance(result, list)
+        assert len(result) == 1
+
+    def test_valid_pipeline_parses(self) -> None:
+        from tgirl.compile import _parse_hy
+
+        result = _parse_hy('(-> "hello" (greet) (shout))')
+        assert not isinstance(result, PipelineError)
+        assert isinstance(result, list)
+        assert len(result) == 1
+
+    def test_invalid_syntax_returns_pipeline_error(self) -> None:
+        from tgirl.compile import _parse_hy
+
+        result = _parse_hy("(greet")
+        assert isinstance(result, PipelineError)
+        assert result.stage == "parse"
+
+    def test_empty_input_returns_pipeline_error(self) -> None:
+        from tgirl.compile import _parse_hy
+
+        result = _parse_hy("")
+        assert isinstance(result, PipelineError)
+        assert result.stage == "parse"
+
+    def test_unclosed_paren_returns_pipeline_error(self) -> None:
+        from tgirl.compile import _parse_hy
+
+        result = _parse_hy("(greet (nested)")
+        assert isinstance(result, PipelineError)
+        assert result.stage == "parse"
+
+    def test_catch_normalizes_to_except(self) -> None:
+        """catch in TGIRL spec normalizes to except for Hy parsing."""
+        from tgirl.compile import _normalize_hy_source, _parse_hy
+
+        source = '(try (tool1) (catch [e Exception] (tool2)))'
+        normalized = _normalize_hy_source(source)
+        assert "(except" in normalized
+        assert "(catch" not in normalized
+        result = _parse_hy(source)
+        assert not isinstance(result, PipelineError)
+
+    def test_multiple_expressions_parse(self) -> None:
+        from tgirl.compile import _parse_hy
+
+        result = _parse_hy('(tool1 "a") (tool2 "b")')
+        assert not isinstance(result, PipelineError)
+        assert len(result) == 2

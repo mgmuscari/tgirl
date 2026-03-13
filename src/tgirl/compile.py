@@ -12,9 +12,12 @@ Three-layer defense-in-depth:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
+import hy
 import structlog
+from hy.models import Object
 from pydantic import BaseModel, ConfigDict
 
 from tgirl.registry import ToolRegistry
@@ -57,6 +60,55 @@ class CompileConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
     pipeline_timeout: float = 60.0
     max_depth: int = 50
+
+
+
+def _normalize_hy_source(source: str) -> str:
+    """Normalize TGIRL spec forms to Hy-native forms.
+
+    The TGIRL spec uses ``catch`` for error handling, but Hy 1.x
+    uses ``except``.  Replaces the ``(catch`` form with ``(except``
+    before Hy parsing.
+    """
+    return re.sub(r"\(catch\b", "(except", source)
+
+
+def _parse_hy(source: str) -> list[Object] | PipelineError:
+    """Parse a Hy source string into a list of Hy model objects.
+
+    Normalizes spec-grammar forms (catch -> except) before parsing.
+    Returns a list of Hy AST nodes on success, or PipelineError on failure.
+    """
+    if not source or not source.strip():
+        return PipelineError(
+            stage=STAGE_PARSE,
+            error_type="EmptyInput",
+            message="Empty source string",
+            hy_source=source,
+        )
+
+    normalized = _normalize_hy_source(source)
+
+    try:
+        trees = list(hy.read_many(normalized))
+    except Exception as exc:
+        logger.warning("hy_parse_failed", source=source, error=str(exc))
+        return PipelineError(
+            stage=STAGE_PARSE,
+            error_type=type(exc).__name__,
+            message=str(exc),
+            hy_source=source,
+        )
+
+    if not trees:
+        return PipelineError(
+            stage=STAGE_PARSE,
+            error_type="EmptyInput",
+            message="No expressions found in source",
+            hy_source=source,
+        )
+
+    return trees
 
 
 def run_pipeline(
