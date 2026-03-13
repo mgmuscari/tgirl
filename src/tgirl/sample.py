@@ -24,6 +24,7 @@ from tgirl.types import (
     ModelIntervention,
     PipelineError,
     RegistrySnapshot,
+    RerankConfig,
     SessionConfig,
     TelemetryRecord,
 )
@@ -302,9 +303,7 @@ def run_constrained_generation(
         temperatures_applied.append(
             merged.temperature if merged.temperature is not None else -1.0
         )
-        top_p_applied.append(
-            merged.top_p if merged.top_p is not None else -1.0
-        )
+        top_p_applied.append(merged.top_p if merged.top_p is not None else -1.0)
 
         # 7. Sample token
         probs = torch.softmax(shaped, dim=-1)
@@ -323,9 +322,7 @@ def run_constrained_generation(
 
         # Record log prob
         log_prob = (
-            torch.log(probs[token_id]).item()
-            if probs[token_id] > 0
-            else float("-inf")
+            torch.log(probs[token_id]).item() if probs[token_id] > 0 else float("-inf")
         )
         token_log_probs.append(log_prob)
 
@@ -396,7 +393,10 @@ class SamplingSession:
         config: SessionConfig | None = None,
         hooks: list[InferenceHook] | None = None,
         transport_config: TransportConfig | None = None,
+        rerank_config: RerankConfig | None = None,
     ) -> None:
+        from tgirl.rerank import ToolRouter
+
         self._registry = registry
         self._forward_fn = forward_fn
         self._decode = tokenizer_decode
@@ -407,6 +407,19 @@ class SamplingSession:
         self._hooks = hooks or []
         self._transport_config = transport_config or TransportConfig()
         self._consumed_quotas: dict[str, int] = {}
+        self._rerank_config = rerank_config
+        self._router = (
+            ToolRouter(
+                grammar_guide_factory=grammar_guide_factory,
+                forward_fn=forward_fn,
+                tokenizer_encode=tokenizer_encode,
+                tokenizer_decode=tokenizer_decode,
+                embeddings=embeddings,
+                config=rerank_config,
+            )
+            if rerank_config is not None
+            else None
+        )
 
     def run(self, prompt_tokens: list[int]) -> SamplingResult:
         """Run the full dual-mode sampling loop."""
@@ -474,6 +487,31 @@ class SamplingSession:
 
             # Generate grammar from snapshot with reduced quotas
             snapshot = self._snapshot_with_remaining_quotas()
+
+            # Optional re-ranking pass
+            rerank_active = (
+                self._router is not None
+                and self._rerank_config
+                and self._rerank_config.enabled
+            )
+            if rerank_active:
+                rerank_result = self._router.route(
+                    snapshot=snapshot,
+                    context_tokens=token_history,
+                    transport_config=self._transport_config,
+                )
+                total_tokens += rerank_result.routing_tokens
+                # Restrict the EXISTING quota-adjusted snapshot
+                selected = frozenset(rerank_result.selected_tools)
+                snapshot = RegistrySnapshot(
+                    tools=tuple(t for t in snapshot.tools if t.name in selected),
+                    quotas={k: v for k, v in snapshot.quotas.items() if k in selected},
+                    cost_remaining=snapshot.cost_remaining,
+                    scopes=snapshot.scopes,
+                    timestamp=snapshot.timestamp,
+                    type_grammars=snapshot.type_grammars,
+                )
+
             grammar_output = generate_grammar(snapshot)
             grammar_state = self._grammar_guide_factory(grammar_output.text)
 
@@ -494,20 +532,14 @@ class SamplingSession:
 
             # Count tool invocations
             tool_names = set(self._registry.names())
-            invocations = self._count_tool_invocations(
-                gen_result.hy_source, tool_names
-            )
+            invocations = self._count_tool_invocations(gen_result.hy_source, tool_names)
 
             # Update consumed quotas
             for name, count in invocations.items():
-                self._consumed_quotas[name] = (
-                    self._consumed_quotas.get(name, 0) + count
-                )
+                self._consumed_quotas[name] = self._consumed_quotas.get(name, 0) + count
 
             # Execute the pipeline
-            pipeline_result = run_pipeline(
-                gen_result.hy_source, self._registry
-            )
+            pipeline_result = run_pipeline(gen_result.hy_source, self._registry)
 
             error = None
             result_val = None
@@ -528,9 +560,10 @@ class SamplingSession:
             # Build TelemetryRecord for this cycle (B2 fix)
             cycle_wall_ms = (time.monotonic() - start_time) * 1000
             import hashlib
-            snap_hash = hashlib.sha256(
-                snapshot.model_dump_json().encode()
-            ).hexdigest()[:16]
+
+            snap_hash = hashlib.sha256(snapshot.model_dump_json().encode()).hexdigest()[
+                :16
+            ]
             telemetry_records.append(
                 TelemetryRecord(
                     pipeline_id=f"cycle-{cycle_count}",
@@ -585,9 +618,7 @@ class SamplingSession:
         snapshot, making them inexpressible in the grammar for subsequent
         cycles (TGIRL.md 3.3 safety by construction).
         """
-        base = self._registry.snapshot(
-            cost_budget=self._config.session_cost_budget
-        )
+        base = self._registry.snapshot(cost_budget=self._config.session_cost_budget)
         remaining_quotas = {
             name: max(0, limit - self._consumed_quotas.get(name, 0))
             for name, limit in base.quotas.items()
