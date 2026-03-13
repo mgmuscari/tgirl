@@ -332,20 +332,32 @@ def _analyze_hy_ast(
 
                 # pmap: [fn1 fn2] arg — validate fn list contents
                 if name == "pmap":
-                    if len(node) >= 2 and isinstance(node[1], List):
-                        for fn_sym in node[1]:
-                            if isinstance(fn_sym, Symbol):
-                                fn_name = str(fn_sym)
-                                if fn_name not in tool_names:
-                                    return PipelineError(
-                                        stage=STAGE_STATIC_ANALYSIS,
-                                        error_type="UnregisteredTool",
-                                        message=(
-                                        f"Function '{fn_name}' in pmap"
-                                        " is not a registered tool"
+                    if len(node) < 2 or not isinstance(
+                        node[1], List
+                    ):
+                        return PipelineError(
+                            stage=STAGE_STATIC_ANALYSIS,
+                            error_type="MalformedPmap",
+                            message=(
+                                "pmap requires a list of"
+                                " functions as first argument"
+                            ),
+                            hy_source=str(node),
+                        )
+                    for fn_sym in node[1]:
+                        if isinstance(fn_sym, Symbol):
+                            fn_name = str(fn_sym)
+                            if fn_name not in tool_names:
+                                return PipelineError(
+                                    stage=STAGE_STATIC_ANALYSIS,
+                                    error_type="UnregisteredTool",
+                                    message=(
+                                        f"Function '{fn_name}'"
+                                        " in pmap is not a"
+                                        " registered tool"
                                     ),
-                                        hy_source=str(node),
-                                    )
+                                    hy_source=str(node),
+                                )
                     # Check remaining args
                     for child in node[2:]:
                         err = _check_node(child)

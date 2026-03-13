@@ -266,13 +266,10 @@ class TestHyAstAnalysis:
     def test_pmap_operator_accepted(self) -> None:
         from tgirl.compile import _analyze_hy_ast
 
-        trees = self._parse("(pmap [greet shout] x)")
-        # x would need to be let-bound or a literal in real usage,
-        # but here we test pmap itself is accepted
+        # Use a string literal to avoid unresolved symbol issues
+        trees = self._parse('(pmap [greet shout] "test")')
         result = _analyze_hy_ast(trees, {"greet", "shout"})
-        # x is unresolved, but pmap itself should be accepted
-        # The test specifically checks pmap acceptance
-        assert result is None or result.stage == "static_analysis"
+        assert result is None
 
     def test_if_operator_accepted(self) -> None:
         from tgirl.compile import _analyze_hy_ast
