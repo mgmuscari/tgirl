@@ -651,3 +651,74 @@ class TestConstrainedGeneration:
         )
 
         assert result.tokens[0] == 0
+
+
+class TestDelimiterDetector:
+    """Task 6: Delimiter detection for mode switching."""
+
+    def test_single_token_delimiter_detected(self) -> None:
+        from tgirl.sample import DelimiterDetector
+
+        # Each token decodes to a single character
+        decode = lambda ids: "".join(chr(65 + i) for i in ids)
+        # Delimiter is "C" which maps to token 2
+        detector = DelimiterDetector("C", decode)
+        assert not detector.feed(0)  # "A"
+        assert not detector.feed(1)  # "B"
+        assert detector.feed(2)  # "C" -> detected
+
+    def test_multi_token_delimiter_detected(self) -> None:
+        from tgirl.sample import DelimiterDetector
+
+        # Tokens map to characters: 0->"<", 1->"/", 2->"t", 3->"o", 4->"o", 5->"l", 6->">"
+        char_map = {0: "<", 1: "/", 2: "t", 3: "o", 4: "l", 5: ">"}
+        decode = lambda ids: "".join(char_map[i] for i in ids)
+        detector = DelimiterDetector("</tool>", decode)
+        assert not detector.feed(0)  # "<"
+        assert not detector.feed(1)  # "/"
+        assert not detector.feed(2)  # "t"
+        assert not detector.feed(3)  # "o"
+        assert not detector.feed(3)  # "o"
+        assert not detector.feed(4)  # "l"
+        assert detector.feed(5)  # ">" -> "</tool>" detected
+
+    def test_no_delimiter_never_triggers(self) -> None:
+        from tgirl.sample import DelimiterDetector
+
+        decode = lambda ids: "".join(chr(65 + i) for i in ids)
+        detector = DelimiterDetector("<tool>", decode)
+        for i in range(100):
+            assert not detector.feed(i % 26)  # Only A-Z, never "<tool>"
+
+    def test_reset_clears_state(self) -> None:
+        from tgirl.sample import DelimiterDetector
+
+        decode = lambda ids: "".join(chr(65 + i) for i in ids)
+        detector = DelimiterDetector("AB", decode)
+        detector.feed(0)  # "A"
+        detector.reset()
+        # After reset, feeding "B" alone should not detect "AB"
+        assert not detector.feed(1)  # "B" alone is not "AB"
+
+    def test_partial_match_then_non_match_no_false_positive(self) -> None:
+        from tgirl.sample import DelimiterDetector
+
+        decode = lambda ids: "".join(chr(65 + i) for i in ids)
+        detector = DelimiterDetector("ABC", decode)
+        assert not detector.feed(0)  # "A"
+        assert not detector.feed(1)  # "B"
+        assert not detector.feed(3)  # "D" -- breaks the pattern
+        assert not detector.feed(0)  # "A" -- restart
+        assert not detector.feed(1)  # "B"
+        assert detector.feed(2)  # "C" -> "ABC" now detected
+
+    def test_buffer_stays_bounded(self) -> None:
+        from tgirl.sample import DelimiterDetector
+
+        decode = lambda ids: "".join(chr(65 + (i % 26)) for i in ids)
+        delimiter = "<tool>"
+        detector = DelimiterDetector(delimiter, decode)
+        for i in range(10_000):
+            detector.feed(i % 26)
+        # Window should be bounded to 2 * len(delimiter)
+        assert len(detector._decoded_window) <= 2 * len(delimiter)

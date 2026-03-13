@@ -171,6 +171,38 @@ def apply_shaping(
     return result
 
 
+class DelimiterDetector:
+    """Detects tool call delimiters in generated token stream.
+
+    Maintains a sliding window of decoded text rather than accumulating
+    all token IDs. The window is bounded to 2x the delimiter's character
+    length, which is sufficient to detect any delimiter that spans a
+    token boundary.
+    """
+
+    def __init__(
+        self,
+        delimiter: str,
+        tokenizer_decode: Callable[[list[int]], str],
+    ) -> None:
+        self.delimiter = delimiter
+        self.decode = tokenizer_decode
+        self._decoded_window: str = ""
+        self._max_window = len(delimiter) * 2
+
+    def feed(self, token_id: int) -> bool:
+        """Feed a token. Returns True if delimiter is detected."""
+        new_text = self.decode([token_id])
+        self._decoded_window += new_text
+        if len(self._decoded_window) > self._max_window:
+            self._decoded_window = self._decoded_window[-self._max_window :]
+        return self.delimiter in self._decoded_window
+
+    def reset(self) -> None:
+        """Clear the detection window."""
+        self._decoded_window = ""
+
+
 class ConstrainedGenerationResult(BaseModel):
     """Result of a constrained generation pass."""
 
