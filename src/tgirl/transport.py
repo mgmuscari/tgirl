@@ -43,3 +43,37 @@ class TransportResult(NamedTuple):
     bypassed: bool
     bypass_reason: str | None
     iterations: int
+
+
+def _check_bypass(
+    logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+    config: TransportConfig,
+) -> tuple[bool, str | None]:
+    """Check whether optimal transport should be bypassed.
+
+    Three conditions checked in priority order:
+    1. valid_mask.sum() <= 1 -> "forced_decode"
+    2. valid ratio > threshold -> "valid_ratio_high"
+    3. invalid probability mass < threshold -> "invalid_mass_low"
+
+    Returns (should_bypass, reason) where reason is None if no bypass.
+    """
+    n_valid = valid_mask.sum().item()
+
+    # Condition 1: forced decode (0 or 1 valid token)
+    if n_valid <= 1:
+        return True, "forced_decode"
+
+    # Condition 2: high valid ratio
+    valid_ratio = valid_mask.float().mean().item()
+    if valid_ratio > config.valid_ratio_threshold:
+        return True, "valid_ratio_high"
+
+    # Condition 3: low invalid mass
+    probs = torch.softmax(logits, dim=-1)
+    invalid_mass = probs[~valid_mask].sum().item()
+    if invalid_mass < config.invalid_mass_threshold:
+        return True, "invalid_mass_low"
+
+    return False, None

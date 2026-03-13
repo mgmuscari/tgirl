@@ -108,3 +108,93 @@ class TestZeroCoupling:
         assert tgirl_imports == [], (
             f"transport.py has tgirl imports: {tgirl_imports}"
         )
+
+
+class TestCheckBypass:
+    """Task 2: _check_bypass detects when OT should be skipped."""
+
+    def test_forced_decode_zero_valid(self) -> None:
+        """No valid tokens → forced_decode."""
+        from tgirl.transport import TransportConfig, _check_bypass
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        mask = torch.tensor([False, False, False])
+        should, reason = _check_bypass(logits, mask, TransportConfig())
+        assert should is True
+        assert reason == "forced_decode"
+
+    def test_forced_decode_one_valid(self) -> None:
+        """Single valid token → forced_decode."""
+        from tgirl.transport import TransportConfig, _check_bypass
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        mask = torch.tensor([False, True, False])
+        should, reason = _check_bypass(logits, mask, TransportConfig())
+        assert should is True
+        assert reason == "forced_decode"
+
+    def test_valid_ratio_high(self) -> None:
+        """Most tokens valid → valid_ratio_high."""
+        from tgirl.transport import TransportConfig, _check_bypass
+
+        logits = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        # 3 out of 4 valid = 0.75 > default 0.5
+        mask = torch.tensor([True, True, True, False])
+        should, reason = _check_bypass(logits, mask, TransportConfig())
+        assert should is True
+        assert reason == "valid_ratio_high"
+
+    def test_invalid_mass_low(self) -> None:
+        """Very little probability on invalid tokens → invalid_mass_low."""
+        from tgirl.transport import TransportConfig, _check_bypass
+
+        # 2 valid out of 5 = 0.4 (below ratio threshold 0.5)
+        # But most mass on valid tokens, negligible on invalid
+        logits = torch.tensor([10.0, 10.0, -100.0, -100.0, -100.0])
+        mask = torch.tensor([True, True, False, False, False])
+        should, reason = _check_bypass(logits, mask, TransportConfig())
+        assert should is True
+        assert reason == "invalid_mass_low"
+
+    def test_no_bypass(self) -> None:
+        """Significant invalid mass, low valid ratio → no bypass."""
+        from tgirl.transport import TransportConfig, _check_bypass
+
+        # 2 valid out of 5 = 0.4 < 0.5, and significant invalid mass
+        logits = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0])
+        mask = torch.tensor([True, True, False, False, False])
+        should, reason = _check_bypass(logits, mask, TransportConfig())
+        assert should is False
+        assert reason is None
+
+    def test_priority_forced_decode_before_ratio(self) -> None:
+        """forced_decode takes priority even when ratio is high."""
+        from tgirl.transport import TransportConfig, _check_bypass
+
+        logits = torch.tensor([1.0])
+        mask = torch.tensor([True])  # 1 valid, but <= 1
+        should, reason = _check_bypass(logits, mask, TransportConfig())
+        assert should is True
+        assert reason == "forced_decode"
+
+    def test_custom_thresholds(self) -> None:
+        """Custom thresholds change bypass behavior."""
+        from tgirl.transport import TransportConfig, _check_bypass
+
+        # 2 out of 4 valid = 0.5, with threshold at 0.3 → triggers
+        logits = torch.tensor([1.0, 1.0, 1.0, 1.0])
+        mask = torch.tensor([True, True, False, False])
+        config = TransportConfig(valid_ratio_threshold=0.3)
+        should, reason = _check_bypass(logits, mask, config)
+        assert should is True
+        assert reason == "valid_ratio_high"
+
+    def test_all_valid_triggers_ratio(self) -> None:
+        """All tokens valid → valid_ratio_high (after forced_decode check)."""
+        from tgirl.transport import TransportConfig, _check_bypass
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        mask = torch.tensor([True, True, True])
+        should, reason = _check_bypass(logits, mask, TransportConfig())
+        assert should is True
+        assert reason == "valid_ratio_high"
