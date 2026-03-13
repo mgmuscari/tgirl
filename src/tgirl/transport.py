@@ -280,10 +280,12 @@ def redistribute_logits(
     probs = torch.softmax(logits, dim=-1)
     source_mass = probs[invalid_indices]
     source_mass = source_mass / source_mass.sum()  # normalize to valid dist
+    source_mass = torch.clamp(source_mass, min=1e-30)
 
     # Target capacity: proportional to valid token probabilities
     target_capacity = probs[valid_indices]
     target_capacity = target_capacity / target_capacity.sum()
+    target_capacity = torch.clamp(target_capacity, min=1e-30)
 
     # Compute cost submatrix
     cost = _compute_cost_submatrix(embeddings, invalid_indices, valid_indices)

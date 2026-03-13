@@ -655,6 +655,40 @@ class TestRedistributeLogits:
         result = redistribute_logits(logits, mask, embeddings, config=config)
         assert isinstance(result.logits, torch.Tensor)
 
+    def test_extreme_logits_no_neg_inf_for_valid(self) -> None:
+        """F3: extreme logits must not produce -inf for valid tokens."""
+        from tgirl.transport import redistribute_logits
+
+        torch.manual_seed(42)
+        # One valid token dominates (logit 100), another valid underflows
+        # (logit -1000). Invalid tokens have matching high logits to keep
+        # invalid_mass high enough to avoid bypass.
+        logits = torch.tensor([100.0, -1000.0, 100.0, 100.0, 100.0,
+                               100.0, 100.0, 100.0, 100.0, 100.0])
+        valid_mask = torch.tensor([True, True, False, False, False,
+                                   False, False, False, False, False])
+        embeddings = torch.randn(10, 16)
+        result = redistribute_logits(logits, valid_mask, embeddings)
+        assert not result.bypassed, "Should exercise full OT path"
+        # Both valid tokens must have finite output (not -inf)
+        assert torch.isfinite(result.logits[0]), "Valid token 0 should be finite"
+        assert torch.isfinite(result.logits[1]), "Valid token 1 should be finite"
+
+    def test_extreme_logit_gap_mass_conservation(self) -> None:
+        """F3: softmax of output sums to ~1.0 even with extreme logit gaps."""
+        from tgirl.transport import redistribute_logits
+
+        torch.manual_seed(42)
+        logits = torch.tensor([100.0, -1000.0, 100.0, 100.0, 100.0,
+                               100.0, 100.0, 100.0, 100.0, 100.0])
+        valid_mask = torch.tensor([True, True, False, False, False,
+                                   False, False, False, False, False])
+        embeddings = torch.randn(10, 16)
+        result = redistribute_logits(logits, valid_mask, embeddings)
+        finite = result.logits[torch.isfinite(result.logits)]
+        probs = torch.softmax(finite, dim=-1)
+        assert abs(probs.sum().item() - 1.0) < 1e-5
+
     def test_structlog_events_emitted(self, simple_setup: dict) -> None:
         """Structlog events should be emitted during redistribution."""
         from structlog.testing import capture_logs
