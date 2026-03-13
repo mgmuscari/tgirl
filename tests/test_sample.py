@@ -173,3 +173,89 @@ class TestInferenceHook:
                 return ModelIntervention()
 
         assert isinstance(MyHook(), InferenceHook)
+
+
+class TestGrammarTemperatureHook:
+    """Task 3: Grammar-implied temperature scheduling hook."""
+
+    def _make_grammar_state(self, valid_count: int, vocab_size: int):
+        """Helper: create a mock grammar state with given valid count."""
+        import torch
+
+        class MockGS:
+            def get_valid_mask(self, tokenizer_vocab_size: int) -> torch.Tensor:
+                mask = torch.zeros(tokenizer_vocab_size, dtype=torch.bool)
+                mask[:valid_count] = True
+                return mask
+
+            def is_accepting(self) -> bool:
+                return False
+
+            def advance(self, token_id: int) -> None:
+                pass
+
+        return MockGS()
+
+    def test_valid_count_one_returns_zero_temperature(self) -> None:
+        import torch
+
+        from tgirl.sample import GrammarTemperatureHook
+
+        hook = GrammarTemperatureHook()
+        gs = self._make_grammar_state(1, 100)
+        result = hook.pre_forward(0, gs, [], torch.zeros(100))
+        assert result.temperature == 0.0
+
+    def test_valid_count_zero_returns_zero_temperature(self) -> None:
+        import torch
+
+        from tgirl.sample import GrammarTemperatureHook
+
+        hook = GrammarTemperatureHook()
+        gs = self._make_grammar_state(0, 100)
+        result = hook.pre_forward(0, gs, [], torch.zeros(100))
+        assert result.temperature == 0.0
+
+    def test_all_valid_returns_base_temperature(self) -> None:
+        import torch
+
+        from tgirl.sample import GrammarTemperatureHook
+
+        hook = GrammarTemperatureHook(base_temperature=0.3)
+        gs = self._make_grammar_state(100, 100)
+        result = hook.pre_forward(0, gs, [], torch.zeros(100))
+        assert result.temperature == pytest.approx(0.3)
+
+    def test_quarter_valid_returns_sqrt_quarter_times_base(self) -> None:
+        import math
+
+        import torch
+
+        from tgirl.sample import GrammarTemperatureHook
+
+        hook = GrammarTemperatureHook(base_temperature=0.3)
+        gs = self._make_grammar_state(25, 100)
+        result = hook.pre_forward(0, gs, [], torch.zeros(100))
+        expected = 0.3 * math.sqrt(0.25)
+        assert result.temperature == pytest.approx(expected)
+
+    def test_custom_scaling_exponent_linear(self) -> None:
+        import torch
+
+        from tgirl.sample import GrammarTemperatureHook
+
+        hook = GrammarTemperatureHook(base_temperature=0.3, scaling_exponent=1.0)
+        gs = self._make_grammar_state(25, 100)
+        result = hook.pre_forward(0, gs, [], torch.zeros(100))
+        expected = 0.3 * 0.25  # linear: freedom^1.0
+        assert result.temperature == pytest.approx(expected)
+
+    def test_custom_base_temperature_is_respected(self) -> None:
+        import torch
+
+        from tgirl.sample import GrammarTemperatureHook
+
+        hook = GrammarTemperatureHook(base_temperature=0.8)
+        gs = self._make_grammar_state(100, 100)
+        result = hook.pre_forward(0, gs, [], torch.zeros(100))
+        assert result.temperature == pytest.approx(0.8)
