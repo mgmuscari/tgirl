@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+
 import pytest
 from pydantic import ValidationError
 
@@ -287,4 +289,89 @@ class TestHyAstAnalysis:
             '(try (greet "hi") (except [e Exception] (greet "fallback")))'
         )
         result = _analyze_hy_ast(trees, {"greet"})
+        assert result is None
+
+
+class TestPythonAstAnalysis:
+    """Task 4: Python AST analyzer via RestrictedPython."""
+
+    def _make_ast(self, python_source: str) -> ast.Module:
+        import ast
+
+        return ast.parse(python_source)
+
+    def _hy_to_ast(self, hy_source: str) -> ast.Module:
+        import ast
+
+        import hy
+        from hy.compiler import hy_compile
+
+        tree = hy_compile(hy.read_many(hy_source), "__main__")
+        # Strip auto-injected 'import hy'
+        tree.body = [
+            n
+            for n in tree.body
+            if not isinstance(n, ast.Import)
+            or n.names[0].name != "hy"
+        ]
+        return tree
+
+    def test_clean_ast_passes(self) -> None:
+        from tgirl.compile import _analyze_python_ast
+
+        tree = self._make_ast('greet("hello")')
+        result = _analyze_python_ast(tree, {"greet"})
+        assert result is None
+
+    def test_import_rejected(self) -> None:
+        from tgirl.compile import _analyze_python_ast
+
+        tree = self._make_ast("import os")
+        result = _analyze_python_ast(tree, {"greet"})
+        assert isinstance(result, PipelineError)
+        assert result.stage == "ast_analysis"
+
+    def test_dunder_attribute_rejected(self) -> None:
+        from tgirl.compile import _analyze_python_ast
+
+        tree = self._make_ast("x.__class__")
+        result = _analyze_python_ast(tree, {"greet"})
+        assert isinstance(result, PipelineError)
+        assert result.stage == "ast_analysis"
+
+    def test_non_dunder_attribute_accepted(self) -> None:
+        from tgirl.compile import _analyze_python_ast
+
+        tree = self._make_ast("x.name")
+        result = _analyze_python_ast(tree, {"greet"})
+        assert result is None
+
+    def test_global_rejected(self) -> None:
+        from tgirl.compile import _analyze_python_ast
+
+        tree = self._make_ast("global x")
+        result = _analyze_python_ast(tree, set())
+        assert isinstance(result, PipelineError)
+
+    def test_nonlocal_rejected(self) -> None:
+        from tgirl.compile import _analyze_python_ast
+
+        tree = self._make_ast(
+            "def f():\n  x = 1\n  def g():\n    nonlocal x"
+        )
+        result = _analyze_python_ast(tree, set())
+        assert isinstance(result, PipelineError)
+
+    def test_hy_compiled_valid_pipeline_accepted(self) -> None:
+        from tgirl.compile import _analyze_python_ast
+
+        tree = self._hy_to_ast('(greet "hello")')
+        result = _analyze_python_ast(tree, {"greet"})
+        assert result is None
+
+    def test_hy_compiled_let_accepted(self) -> None:
+        from tgirl.compile import _analyze_python_ast
+
+        tree = self._hy_to_ast('(let [x (greet "hi")] (shout x))')
+        result = _analyze_python_ast(tree, {"greet", "shout"})
         assert result is None

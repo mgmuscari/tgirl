@@ -12,6 +12,7 @@ Three-layer defense-in-depth:
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import Any
 
@@ -19,6 +20,7 @@ import hy
 import structlog
 from hy.models import Expression, List, Object, Symbol
 from pydantic import BaseModel, ConfigDict
+from RestrictedPython import RestrictingNodeTransformer
 
 from tgirl.registry import ToolRegistry
 from tgirl.types import PipelineError
@@ -334,6 +336,114 @@ def _analyze_hy_ast(
         err = _check_node(tree)
         if err:
             return err
+
+    return None
+
+
+class _TgirlNodeTransformer(RestrictingNodeTransformer):
+    """Subclass of RestrictingNodeTransformer for tgirl.
+
+    Overrides:
+    - Rejects Import/ImportFrom nodes
+    - Rejects Global/Nonlocal nodes
+    - Allows non-dunder attribute access without _getattr_ wrapping
+    - Keeps dunder attribute rejection from parent
+    """
+
+    def visit_Import(  # noqa: N802
+        self, node: ast.Import
+    ) -> ast.Import:
+        self.errors.append(
+            f"Line {node.lineno}: Import statements are not allowed"
+        )
+        return node
+
+    def visit_ImportFrom(  # noqa: N802
+        self, node: ast.ImportFrom
+    ) -> ast.ImportFrom:
+        self.errors.append(
+            f"Line {node.lineno}: Import statements are not allowed"
+        )
+        return node
+
+    def visit_Global(  # noqa: N802
+        self, node: ast.Global
+    ) -> ast.Global:
+        self.errors.append(
+            f"Line {node.lineno}: Global statements are not allowed"
+        )
+        return node
+
+    def visit_Nonlocal(  # noqa: N802
+        self, node: ast.Nonlocal
+    ) -> ast.Nonlocal:
+        self.errors.append(
+            f"Line {node.lineno}: Nonlocal statements are not"
+            " allowed"
+        )
+        return node
+
+    def check_name(
+        self,
+        node: ast.AST,
+        name: str,
+        allow_magic_methods: bool = False,
+    ) -> None:
+        """Allow Hy-internal variable names (_hy_*)."""
+        if name is not None and name.startswith("_hy_"):
+            return
+        super().check_name(
+            node, name, allow_magic_methods=allow_magic_methods
+        )
+
+    def visit_Attribute(  # noqa: N802
+        self, node: ast.Attribute
+    ) -> ast.AST:
+        """Allow non-dunder attribute access, reject dunders."""
+        attr_name = node.attr
+        if attr_name.startswith("_"):
+            self.errors.append(
+                f"Line {node.lineno}: "
+                f'"{attr_name}" is an invalid attribute name'
+                ' because it starts with "_".'
+            )
+            return node
+        # Allow non-dunder access without _getattr_ wrapping
+        self.node_contents_visit(node)
+        return node
+
+
+def _analyze_python_ast(
+    tree: ast.Module, tool_names: set[str]
+) -> PipelineError | None:
+    """Run RestrictedPython analysis on a Python AST.
+
+    Uses a tgirl-specific subclass of RestrictingNodeTransformer
+    that rejects imports, global/nonlocal, and dunder attributes
+    while allowing non-dunder attribute access.
+    """
+    errors: list[str] = []
+    transformer = _TgirlNodeTransformer(
+        errors=errors, warnings=[], used_names={}
+    )
+
+    try:
+        transformer.visit(tree)
+    except Exception as exc:
+        return PipelineError(
+            stage=STAGE_AST_ANALYSIS,
+            error_type=type(exc).__name__,
+            message=str(exc),
+            hy_source="<compiled AST>",
+        )
+
+    if errors:
+        return PipelineError(
+            stage=STAGE_AST_ANALYSIS,
+            error_type="RestrictedPythonError",
+            message="; ".join(errors),
+            hy_source="<compiled AST>",
+        )
 
     return None
 
