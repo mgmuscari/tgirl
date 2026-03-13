@@ -545,22 +545,24 @@ def _run_with_timeout(
     """Run a callable with a timeout using ThreadPoolExecutor.
 
     Returns the result on success, or PipelineError on timeout.
+    Uses manual executor management to avoid shutdown(wait=True)
+    blocking the caller when the submitted task outlives the timeout.
     """
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=1
-    ) as executor:
-        future = executor.submit(fn)
-        try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            return PipelineError(
-                stage=STAGE_EXECUTE,
-                error_type="TimeoutError",
-                message=(
-                    f"Execution timed out after {timeout}s"
-                ),
-                hy_source="<timeout>",
-            )
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        return PipelineError(
+            stage=STAGE_EXECUTE,
+            error_type="TimeoutError",
+            message=(
+                f"Execution timed out after {timeout}s"
+            ),
+            hy_source="<timeout>",
+        )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _wrap_with_timeout(
@@ -569,22 +571,26 @@ def _wrap_with_timeout(
     """Wrap a callable with per-tool timeout enforcement.
 
     The wrapper raises TimeoutError if the call exceeds the timeout.
+    Uses manual executor management to avoid shutdown(wait=True)
+    blocking the caller.
     """
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        with concurrent.futures.ThreadPoolExecutor(
+        executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1
-        ) as executor:
-            future = executor.submit(fn, *args, **kwargs)
-            try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                msg = (
-                    f"Tool '{fn.__name__}' timed out"
-                    f" after {timeout}s"
-                )
-                raise TimeoutError(msg) from None
+        )
+        future = executor.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            msg = (
+                f"Tool '{fn.__name__}' timed out"
+                f" after {timeout}s"
+            )
+            raise TimeoutError(msg) from None
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     return wrapper
 

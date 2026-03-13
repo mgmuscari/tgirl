@@ -680,6 +680,48 @@ class TestTimeoutEnforcement:
         with pytest.raises(TimeoutError):
             wrapped("test")
 
+    def test_run_with_timeout_returns_within_bound(self) -> None:
+        """Timeout must not block caller for duration of slow task.
+
+        Bug: ThreadPoolExecutor.__exit__ calls shutdown(wait=True),
+        blocking until the submitted task completes. A 5s sleep with
+        0.5s timeout should return in < 1s, not 5s.
+        """
+        import time
+
+        from tgirl.compile import _run_with_timeout
+
+        def slow_fn() -> str:
+            time.sleep(5)
+            return "done"
+
+        start = time.monotonic()
+        result = _run_with_timeout(slow_fn, timeout=0.5)
+        elapsed = time.monotonic() - start
+        assert isinstance(result, PipelineError)
+        assert elapsed < 1.5, (
+            f"Timeout took {elapsed:.1f}s — caller was blocked"
+        )
+
+    def test_wrap_with_timeout_returns_within_bound(self) -> None:
+        """Per-tool timeout wrapper must not block caller."""
+        import time
+
+        from tgirl.compile import _wrap_with_timeout
+
+        def slow_fn(x: str) -> str:
+            time.sleep(5)
+            return x
+
+        wrapped = _wrap_with_timeout(slow_fn, timeout=0.5)
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            wrapped("test")
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.5, (
+            f"Timeout took {elapsed:.1f}s — caller was blocked"
+        )
+
 
 class TestResultCapture:
     """Task 8: Result capture via AST rewriting."""
