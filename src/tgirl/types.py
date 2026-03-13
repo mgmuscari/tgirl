@@ -191,16 +191,12 @@ class RegistrySnapshot(BaseModel):
     @model_validator(mode="after")
     def _wrap_quotas(self) -> RegistrySnapshot:
         if not isinstance(self.quotas, MappingProxyType):
-            object.__setattr__(
-                self, "quotas", MappingProxyType(dict(self.quotas))
-            )
+            object.__setattr__(self, "quotas", MappingProxyType(dict(self.quotas)))
         return self
 
     @field_serializer("quotas")
     @classmethod
-    def _serialize_quotas(
-        cls, v: Mapping[str, int]
-    ) -> dict[str, int]:
+    def _serialize_quotas(cls, v: Mapping[str, int]) -> dict[str, int]:
         return dict(v)
 
 
@@ -245,6 +241,29 @@ class TelemetryRecord(BaseModel):
     total_tokens: int
     model_id: str
     registry_snapshot_hash: str
+
+
+# --- Reranking ---
+
+
+class RerankConfig(BaseModel):
+    """Configuration for grammar-constrained tool re-ranking."""
+
+    model_config = ConfigDict(frozen=True)
+    max_tokens: int = 16
+    temperature: float = 0.3
+    top_k: int = 1
+    enabled: bool = True
+
+
+class RerankResult(BaseModel):
+    """Result of a re-ranking pass."""
+
+    model_config = ConfigDict(frozen=True)
+    selected_tools: tuple[str, ...]
+    routing_tokens: int
+    routing_latency_ms: float
+    routing_grammar_text: str
 
 
 # --- Model Intervention ---

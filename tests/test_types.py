@@ -288,3 +288,57 @@ class TestRegistrySnapshot:
             snap.quotas["tool_a"] = 999  # type: ignore[index]
         with pytest.raises(TypeError):
             snap.quotas["new_tool"] = 1  # type: ignore[index]
+
+
+class TestRerankConfig:
+    def test_rerank_config_defaults(self) -> None:
+        from tgirl.types import RerankConfig
+
+        cfg = RerankConfig()
+        assert cfg.max_tokens == 16
+        assert cfg.temperature == 0.3
+        assert cfg.top_k == 1
+        assert cfg.enabled is True
+
+    def test_rerank_config_is_frozen(self) -> None:
+        from tgirl.types import RerankConfig
+
+        cfg = RerankConfig()
+        with pytest.raises(ValidationError):
+            cfg.max_tokens = 32  # type: ignore[misc]
+
+    def test_rerank_config_custom_values(self) -> None:
+        from tgirl.types import RerankConfig
+
+        cfg = RerankConfig(max_tokens=8, temperature=0.5, top_k=2, enabled=False)
+        assert cfg.max_tokens == 8
+        assert cfg.temperature == 0.5
+        assert cfg.top_k == 2
+        assert cfg.enabled is False
+
+
+class TestRerankResult:
+    def test_rerank_result_constructs(self) -> None:
+        from tgirl.types import RerankResult
+
+        result = RerankResult(
+            selected_tools=("get_field",),
+            routing_tokens=3,
+            routing_latency_ms=12.5,
+            routing_grammar_text='start: tool_choice\ntool_choice: "get_field"\n',
+        )
+        assert result.selected_tools == ("get_field",)
+        assert result.routing_tokens == 3
+        assert result.routing_latency_ms == 12.5
+
+    def test_rerank_result_is_frozen(self) -> None:
+        from tgirl.types import RerankResult
+
+        result = RerankResult(
+            selected_tools=("get_field",),
+            routing_tokens=3,
+            routing_latency_ms=12.5,
+            routing_grammar_text='start: tool_choice\ntool_choice: "get_field"\n',
+        )
+        with pytest.raises(ValidationError):
+            result.routing_tokens = 10  # type: ignore[misc]
