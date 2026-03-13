@@ -585,6 +585,15 @@ class SamplingSession:
                     total_tokens=total_tokens,
                     model_id="unknown",
                     registry_snapshot_hash=snap_hash,
+                    rerank_selected_tool=(
+                        rerank_result.selected_tools[0] if rerank_active else None
+                    ),
+                    rerank_routing_tokens=(
+                        rerank_result.routing_tokens if rerank_active else None
+                    ),
+                    rerank_latency_ms=(
+                        rerank_result.routing_latency_ms if rerank_active else None
+                    ),
                 )
             )
 

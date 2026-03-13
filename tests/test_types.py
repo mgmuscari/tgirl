@@ -342,3 +342,60 @@ class TestRerankResult:
         )
         with pytest.raises(ValidationError):
             result.routing_tokens = 10  # type: ignore[misc]
+
+
+class TestTelemetryRecordRerank:
+    def test_telemetry_record_rerank_fields_default_none(self) -> None:
+        from tgirl.types import TelemetryRecord
+
+        record = TelemetryRecord(
+            pipeline_id="test",
+            tokens=[1, 2],
+            grammar_valid_counts=[10, 5],
+            temperatures_applied=[0.3, 0.3],
+            wasserstein_distances=[0.1, 0.2],
+            top_p_applied=[-1.0, -1.0],
+            token_log_probs=[-0.5, -0.3],
+            grammar_generation_ms=5.0,
+            ot_computation_total_ms=2.0,
+            ot_bypassed_count=0,
+            hy_source="(tool 1)",
+            cycle_number=1,
+            freeform_tokens_before=10,
+            wall_time_ms=100.0,
+            total_tokens=12,
+            model_id="test-model",
+            registry_snapshot_hash="abc123",
+        )
+        assert record.rerank_selected_tool is None
+        assert record.rerank_routing_tokens is None
+        assert record.rerank_latency_ms is None
+
+    def test_telemetry_record_rerank_fields_populated(self) -> None:
+        from tgirl.types import TelemetryRecord
+
+        record = TelemetryRecord(
+            pipeline_id="test",
+            tokens=[1, 2],
+            grammar_valid_counts=[10, 5],
+            temperatures_applied=[0.3, 0.3],
+            wasserstein_distances=[0.1, 0.2],
+            top_p_applied=[-1.0, -1.0],
+            token_log_probs=[-0.5, -0.3],
+            grammar_generation_ms=5.0,
+            ot_computation_total_ms=2.0,
+            ot_bypassed_count=0,
+            hy_source="(tool 1)",
+            cycle_number=1,
+            freeform_tokens_before=10,
+            wall_time_ms=100.0,
+            total_tokens=12,
+            model_id="test-model",
+            registry_snapshot_hash="abc123",
+            rerank_selected_tool="get_field",
+            rerank_routing_tokens=3,
+            rerank_latency_ms=12.5,
+        )
+        assert record.rerank_selected_tool == "get_field"
+        assert record.rerank_routing_tokens == 3
+        assert record.rerank_latency_ms == 12.5

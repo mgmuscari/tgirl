@@ -241,6 +241,9 @@ class TelemetryRecord(BaseModel):
     total_tokens: int
     model_id: str
     registry_snapshot_hash: str
+    rerank_selected_tool: str | None = None
+    rerank_routing_tokens: int | None = None
+    rerank_latency_ms: float | None = None
 
 
 # --- Reranking ---
