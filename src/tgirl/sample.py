@@ -17,7 +17,13 @@ import torch
 from pydantic import BaseModel, ConfigDict
 
 from tgirl.transport import TransportConfig, redistribute_logits
-from tgirl.types import ModelIntervention, PipelineError, SessionConfig
+from tgirl.types import (
+    ModelIntervention,
+    PipelineError,
+    RegistrySnapshot,
+    SessionConfig,
+    TelemetryRecord,
+)
 
 logger = structlog.get_logger()
 
@@ -361,7 +367,7 @@ class SamplingResult(BaseModel):
     model_config = ConfigDict(frozen=True)
     output_text: str
     tool_calls: list[ToolCallRecord]
-    telemetry: list[dict[str, Any]]
+    telemetry: list[TelemetryRecord]
     total_tokens: int
     total_cycles: int
     wall_time_ms: float
@@ -405,7 +411,7 @@ class SamplingSession:
         token_history = list(prompt_tokens)
         output_parts: list[str] = []
         tool_calls: list[ToolCallRecord] = []
-        telemetry: list[dict[str, Any]] = []
+        telemetry_records: list[TelemetryRecord] = []
         total_tokens = 0
         cycle_count = 0
 
@@ -418,11 +424,13 @@ class SamplingSession:
             # --- Freeform mode ---
             freeform_tokens: list[int] = []
             delimiter_found = False
+            timed_out = False
 
             for _ in range(self._config.freeform_max_tokens):
                 # Check timeout
                 elapsed = (time.monotonic() - start_time) * 1000
                 if elapsed > self._config.session_timeout * 1000:
+                    timed_out = True
                     break
 
                 raw_logits = self._forward_fn(token_history)
@@ -446,22 +454,21 @@ class SamplingSession:
             if freeform_tokens:
                 output_parts.append(self._decode(freeform_tokens))
 
-            if not delimiter_found:
-                break  # No tool call, session ends
+            if timed_out or not delimiter_found:
+                break  # No tool call or timeout, session ends
 
             if cycle_count >= self._config.max_tool_cycles:
                 break
 
             # --- Constrained mode ---
             cycle_count += 1
+            freeform_count_before = len(freeform_tokens)
             open_detector.reset()
 
-            # Generate grammar from registry snapshot
+            # Generate grammar from snapshot with reduced quotas (B1 fix)
             from tgirl.grammar import generate as generate_grammar
 
-            snapshot = self._registry.snapshot(
-                cost_budget=self._config.session_cost_budget
-            )
+            snapshot = self._snapshot_with_remaining_quotas()
             grammar_output = generate_grammar(snapshot)
             grammar_state = self._grammar_guide_factory(grammar_output.text)
 
@@ -515,6 +522,36 @@ class SamplingSession:
             )
             tool_calls.append(record)
 
+            # Build TelemetryRecord for this cycle (B2 fix)
+            cycle_wall_ms = (time.monotonic() - start_time) * 1000
+            import hashlib
+            snap_hash = hashlib.sha256(
+                snapshot.model_dump_json().encode()
+            ).hexdigest()[:16]
+            telemetry_records.append(
+                TelemetryRecord(
+                    pipeline_id=f"cycle-{cycle_count}",
+                    tokens=gen_result.tokens,
+                    grammar_valid_counts=gen_result.grammar_valid_counts,
+                    temperatures_applied=gen_result.temperatures_applied,
+                    wasserstein_distances=gen_result.wasserstein_distances,
+                    top_p_applied=gen_result.top_p_applied,
+                    token_log_probs=gen_result.token_log_probs,
+                    grammar_generation_ms=gen_result.grammar_generation_ms,
+                    ot_computation_total_ms=gen_result.ot_computation_total_ms,
+                    ot_bypassed_count=gen_result.ot_bypassed_count,
+                    hy_source=gen_result.hy_source,
+                    execution_result=result_val,
+                    execution_error=error,
+                    cycle_number=cycle_count,
+                    freeform_tokens_before=freeform_count_before,
+                    wall_time_ms=cycle_wall_ms,
+                    total_tokens=total_tokens,
+                    model_id="unknown",
+                    registry_snapshot_hash=snap_hash,
+                )
+            )
+
             # Inject result into context
             result_text = (
                 f"{self._config.result_open_delimiter}"
@@ -531,26 +568,53 @@ class SamplingSession:
         return SamplingResult(
             output_text="".join(output_parts),
             tool_calls=tool_calls,
-            telemetry=telemetry,
+            telemetry=telemetry_records,
             total_tokens=total_tokens,
             total_cycles=cycle_count,
             wall_time_ms=wall_time_ms,
             quotas_consumed=dict(self._consumed_quotas),
         )
 
+    def _snapshot_with_remaining_quotas(self) -> RegistrySnapshot:
+        """Produce a snapshot with quotas reduced by consumed counts.
+
+        Tools that have exhausted their quota will have quota=0 in the
+        snapshot, making them inexpressible in the grammar for subsequent
+        cycles (TGIRL.md 3.3 safety by construction).
+        """
+        base = self._registry.snapshot(
+            cost_budget=self._config.session_cost_budget
+        )
+        remaining_quotas = {
+            name: max(0, limit - self._consumed_quotas.get(name, 0))
+            for name, limit in base.quotas.items()
+        }
+        return RegistrySnapshot(
+            tools=base.tools,
+            quotas=remaining_quotas,
+            cost_remaining=base.cost_remaining,
+            scopes=base.scopes,
+            timestamp=base.timestamp,
+        )
+
     def _count_tool_invocations(
         self, hy_source: str, tool_names: set[str]
     ) -> dict[str, int]:
-        """Count tool invocations in Hy source via simple pattern matching.
+        """Count tool invocations in Hy source.
 
-        Counts occurrences of registered tool names that appear as function
-        calls (after open paren or in threading position).
+        Matches tool names appearing as:
+        - Direct calls: (tool_name ...)
+        - Bare symbols in threading: (-> ... (tool_name) ...)
+        - Bare symbols in threading position: (-> ... tool_name)
+
+        Uses word-boundary matching to avoid false positives on
+        tool names that are substrings of other identifiers.
         """
         counts: dict[str, int] = {}
-        # Match tool names that appear after ( or as bare symbols
         for name in tool_names:
-            # Count occurrences of the tool name as a symbol
-            pattern = rf"\(\s*{re.escape(name)}\b"
+            # Match after ( with optional whitespace, OR as bare symbol
+            # preceded by whitespace (threading position)
+            pattern = rf"(?:\(\s*{re.escape(name)}\b|(?<=\s){re.escape(name)}\b)"
             matches = re.findall(pattern, hy_source)
             if matches:
                 counts[name] = len(matches)

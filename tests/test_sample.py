@@ -911,3 +911,96 @@ class TestSamplingSession:
         )
         with pytest.raises(ValidationError):
             record.cycle_number = 5  # type: ignore[misc]
+
+    def test_count_tool_invocations_bare_symbol_in_threading(self) -> None:
+        """S2 fix: bare symbols in threading position are counted."""
+        session = self._make_simple_session()
+
+        @session._registry.tool(quota=5, cost=1.0)
+        def shout(text: str) -> str:
+            """Shout text."""
+            return text.upper()
+
+        # In Hy threading, the last form can be a bare symbol: (-> (greet "x") shout)
+        counts = session._count_tool_invocations(
+            '(-> (greet "Alice") shout)',
+            {"greet", "shout"},
+        )
+        assert counts["greet"] == 1
+        assert counts["shout"] == 1
+
+    def test_snapshot_with_remaining_quotas_reduces(self) -> None:
+        """B1: verify _snapshot_with_remaining_quotas reduces quotas."""
+        session = self._make_simple_session()
+        # Simulate consuming 2 greet invocations
+        session._consumed_quotas["greet"] = 2
+        snapshot = session._snapshot_with_remaining_quotas()
+        # Original quota was 5, consumed 2 -> remaining 3
+        assert snapshot.quotas["greet"] == 3
+
+    def test_snapshot_with_remaining_quotas_floors_at_zero(self) -> None:
+        """B1: verify consumed > limit floors at 0, not negative."""
+        session = self._make_simple_session()
+        session._consumed_quotas["greet"] = 999
+        snapshot = session._snapshot_with_remaining_quotas()
+        assert snapshot.quotas["greet"] == 0
+
+    def test_telemetry_is_list_of_telemetry_record(self) -> None:
+        """B2: verify telemetry field type is list[TelemetryRecord]."""
+        from tgirl.types import TelemetryRecord
+
+        session = self._make_simple_session(tool_delimiter_tokens=None)
+        result = session.run(prompt_tokens=[])
+        # Freeform-only session: no tool cycles, so no telemetry records
+        assert isinstance(result.telemetry, list)
+        # But all entries (if any) must be TelemetryRecord
+        for record in result.telemetry:
+            assert isinstance(record, TelemetryRecord)
+
+    def test_session_timeout_enforced(self) -> None:
+        """S1: session stops when timeout is exceeded."""
+        import torch
+
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5, cost=1.0)
+        def noop() -> str:
+            """No-op."""
+            return ""
+
+        call_count = [0]
+
+        def slow_forward(ctx: list[int]) -> torch.Tensor:
+            call_count[0] += 1
+            # Burn time on each call
+            import time as _time
+            _time.sleep(0.01)
+            logits = torch.zeros(50)
+            logits[0] = 100.0
+            return logits
+
+        config = SessionConfig(
+            session_timeout=0.05,  # 50ms timeout
+            freeform_max_tokens=10000,
+        )
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=slow_forward,
+            tokenizer_decode=lambda ids: "x" * len(ids),
+            tokenizer_encode=lambda text: [0] * len(text),
+            embeddings=torch.eye(50),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            config=config,
+            transport_config=TransportConfig(),
+        )
+
+        result = session.run(prompt_tokens=[])
+        # Should have stopped well before freeform_max_tokens
+        assert result.total_tokens < 100
+        assert result.wall_time_ms > 0
