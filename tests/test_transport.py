@@ -254,3 +254,67 @@ class TestStandardMasking:
         mask = torch.tensor([True, False, True])
         _standard_masking(logits, mask)
         assert torch.equal(logits, original)
+
+
+class TestCostSubmatrix:
+    """Task 4: _compute_cost_submatrix computes cosine distance submatrix."""
+
+    def test_identical_embeddings_cost_zero(self) -> None:
+        from tgirl.transport import _compute_cost_submatrix
+
+        # All embeddings identical → cost = 0
+        embeddings = torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]])
+        invalid_idx = torch.tensor([0])
+        valid_idx = torch.tensor([1, 2])
+        cost = _compute_cost_submatrix(embeddings, invalid_idx, valid_idx)
+        assert torch.allclose(cost, torch.zeros(1, 2), atol=1e-6)
+
+    def test_orthogonal_embeddings_cost_one(self) -> None:
+        from tgirl.transport import _compute_cost_submatrix
+
+        # Orthogonal → cost = 1
+        embeddings = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        invalid_idx = torch.tensor([0])
+        valid_idx = torch.tensor([1])
+        cost = _compute_cost_submatrix(embeddings, invalid_idx, valid_idx)
+        assert torch.allclose(cost, torch.ones(1, 1), atol=1e-6)
+
+    def test_opposite_embeddings_cost_two(self) -> None:
+        from tgirl.transport import _compute_cost_submatrix
+
+        # Opposite → cost = 2
+        embeddings = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
+        invalid_idx = torch.tensor([0])
+        valid_idx = torch.tensor([1])
+        cost = _compute_cost_submatrix(embeddings, invalid_idx, valid_idx)
+        assert torch.allclose(cost, torch.tensor([[2.0]]), atol=1e-6)
+
+    def test_output_shape(self) -> None:
+        from tgirl.transport import _compute_cost_submatrix
+
+        embeddings = torch.randn(10, 64)
+        invalid_idx = torch.tensor([0, 2, 5])
+        valid_idx = torch.tensor([1, 3, 4, 6, 7, 8, 9])
+        cost = _compute_cost_submatrix(embeddings, invalid_idx, valid_idx)
+        assert cost.shape == (3, 7)
+
+    def test_values_in_range(self) -> None:
+        from tgirl.transport import _compute_cost_submatrix
+
+        torch.manual_seed(42)
+        embeddings = torch.randn(20, 32)
+        invalid_idx = torch.tensor([0, 1, 2, 3, 4])
+        valid_idx = torch.tensor([5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
+        cost = _compute_cost_submatrix(embeddings, invalid_idx, valid_idx)
+        assert (cost >= -1e-6).all(), "Cost should be non-negative"
+        assert (cost <= 2.0 + 1e-6).all(), "Cost should be at most 2"
+
+    def test_various_embed_dim(self) -> None:
+        from tgirl.transport import _compute_cost_submatrix
+
+        for dim in [1, 8, 128, 512]:
+            embeddings = torch.randn(5, dim)
+            invalid_idx = torch.tensor([0, 1])
+            valid_idx = torch.tensor([2, 3, 4])
+            cost = _compute_cost_submatrix(embeddings, invalid_idx, valid_idx)
+            assert cost.shape == (2, 3)

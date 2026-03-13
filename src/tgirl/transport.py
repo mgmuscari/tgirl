@@ -90,3 +90,25 @@ def _standard_masking(
     result = logits.clone()
     result[~valid_mask] = float("-inf")
     return result
+
+
+def _compute_cost_submatrix(
+    embeddings: torch.Tensor,
+    invalid_indices: torch.Tensor,
+    valid_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Compute cosine distance submatrix between invalid and valid tokens.
+
+    Cost = 1 - cosine_similarity. Only allocates the (n_invalid, n_valid)
+    submatrix, never the full V x V matrix.
+
+    Returns tensor of shape (n_invalid, n_valid) with values in [0, 2].
+    """
+    invalid_emb = torch.nn.functional.normalize(
+        embeddings[invalid_indices], dim=-1
+    )
+    valid_emb = torch.nn.functional.normalize(
+        embeddings[valid_indices], dim=-1
+    )
+    similarity = invalid_emb @ valid_emb.T
+    return 1.0 - similarity
