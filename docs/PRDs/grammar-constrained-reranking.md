@@ -1,6 +1,6 @@
 # PRD: Grammar-Constrained Tool Re-Ranking
 
-## Status: DRAFT
+## Status: IMPLEMENTED
 ## Author: agent (proposer)
 ## Date: 2026-03-13
 ## Branch: feature/grammar-constrained-reranking
