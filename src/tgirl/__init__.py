@@ -2,6 +2,12 @@
 
 from annotated_types import Ge, Gt, Le, Lt, MultipleOf
 
+from tgirl.compile import (
+    CompileConfig,
+    InsufficientResources,
+    PipelineResult,
+    run_pipeline,
+)
 from tgirl.grammar import (
     GrammarConfig,
     GrammarDiff,
@@ -39,6 +45,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AnnotatedType",
+    "CompileConfig",
     "AnyType",
     "ConstraintRepr",
     "DictType",
@@ -46,6 +53,7 @@ __all__ = [
     "FieldDef",
     "Ge",
     "GrammarConfig",
+    "InsufficientResources",
     "GrammarDiff",
     "GrammarOutput",
     "Gt",
@@ -58,12 +66,14 @@ __all__ = [
     "OptionalType",
     "ParameterDef",
     "PipelineError",
+    "PipelineResult",
     "PrimitiveType",
     "RegistrySnapshot",
     "TelemetryRecord",
     "ToolDefinition",
     "ToolRegistry",
     "generate_grammar",
+    "run_pipeline",
     "grammar_diff",
     "TypeRepr",
     "UnionType",

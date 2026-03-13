@@ -41,11 +41,18 @@ case "$BRANCH" in
   *) exit 0 ;;
 esac
 
-# Allow team agents (proposer) — they're spawned via claude-teammate-wrapper.sh
-# which sets this env var to signal they're not the team lead
+# Allow team agents (proposer) — detected via env var or active execute team
+# Env var is set by scripts/claude-teammate-wrapper.sh for wrapped invocations.
+# For Agent tool spawns (which can't inherit env vars), check for active
+# execute-* team config files as a fallback signal.
 if [ "${PUSH_HANDS_TEAM_AGENT:-}" = "1" ]; then
   exit 0
 fi
+for team_config in "$HOME/.claude/teams"/execute-*/config.json; do
+  if [ -f "$team_config" ]; then
+    exit 0
+  fi
+done
 
 # Check tier
 TIER_FILE="$(git rev-parse --show-toplevel 2>/dev/null)/.push-hands-tier"
