@@ -111,3 +111,65 @@ class TestModelIntervention:
         assert m.presence_penalty == 0.6
         assert m.frequency_penalty == 0.5
         assert m.logit_bias == {100: 1.0, 200: -1.0}
+
+
+class TestMergeInterventions:
+    """Task 2: merge_interventions merges multiple hooks with last-writer-wins."""
+
+    def test_empty_list_returns_all_none(self) -> None:
+        from tgirl.sample import merge_interventions
+        from tgirl.types import ModelIntervention
+
+        result = merge_interventions([])
+        assert result == ModelIntervention()
+
+    def test_single_intervention_preserves_all_values(self) -> None:
+        from tgirl.sample import merge_interventions
+        from tgirl.types import ModelIntervention
+
+        m = ModelIntervention(temperature=0.5, top_p=0.9, top_k=50)
+        result = merge_interventions([m])
+        assert result.temperature == 0.5
+        assert result.top_p == 0.9
+        assert result.top_k == 50
+
+    def test_later_overrides_earlier(self) -> None:
+        from tgirl.sample import merge_interventions
+        from tgirl.types import ModelIntervention
+
+        m1 = ModelIntervention(temperature=0.5)
+        m2 = ModelIntervention(temperature=0.8)
+        result = merge_interventions([m1, m2])
+        assert result.temperature == 0.8
+
+    def test_non_overlapping_fields_preserved_from_both(self) -> None:
+        from tgirl.sample import merge_interventions
+        from tgirl.types import ModelIntervention
+
+        m1 = ModelIntervention(temperature=0.5)
+        m2 = ModelIntervention(top_p=0.9)
+        result = merge_interventions([m1, m2])
+        assert result.temperature == 0.5
+        assert result.top_p == 0.9
+
+
+class TestInferenceHook:
+    """Task 2: InferenceHook protocol is runtime-checkable."""
+
+    def test_conforming_class_is_accepted(self) -> None:
+        import torch
+
+        from tgirl.sample import GrammarState, InferenceHook
+        from tgirl.types import ModelIntervention
+
+        class MyHook:
+            def pre_forward(
+                self,
+                position: int,
+                grammar_state: GrammarState,
+                token_history: list[int],
+                logits: torch.Tensor,
+            ) -> ModelIntervention:
+                return ModelIntervention()
+
+        assert isinstance(MyHook(), InferenceHook)
