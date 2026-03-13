@@ -146,10 +146,16 @@ class ToolRouter:
         self,
         grammar_guide_factory: Callable[[str], GrammarState],
         forward_fn: Callable[[list[int]], torch.Tensor],
+        tokenizer_encode: Callable[[str], list[int]],
         tokenizer_decode: Callable[[list[int]], str],
         embeddings: torch.Tensor,
         config: RerankConfig | None = None,
-    ) -> None: ...
+    ) -> None:
+        ...
+        # Cache for compiled routing grammar states, keyed on sorted tool names.
+        # Avoids re-compiling the Outlines CFGGuide when the routable tool set
+        # hasn't changed between cycles (common case).
+        self._routing_grammar_cache: dict[tuple[str, ...], GrammarState] = {}
 
     def route(
         self,
@@ -169,11 +175,14 @@ class ToolRouter:
 ```
 
 The `route()` method:
-1. Short-circuits if `len(snapshot.tools) <= 1`
-2. Calls `generate_routing_grammar(snapshot)` for the grammar
-3. Calls `run_constrained_generation()` with the routing grammar, short max_tokens, and the context
-4. Parses the output to extract the tool name
-5. Returns `RerankResult`
+1. Filters the snapshot to exclude quota-exhausted tools (quota=0 in `snapshot.quotas`). This satisfies PRD AC8: "ToolRouter respects quota constraints — exhausted tools are excluded from routing candidates."
+2. Short-circuits if filtered tools count is `<= 1`
+3. Generates the routing prompt via `generate_routing_prompt(filtered_snapshot)` and tokenizes it via `self._tokenizer_encode(routing_prompt)`. Prepends the resulting tokens to `context_tokens` to form `routing_context_tokens`. This is how the classification prompt reaches the model — `run_constrained_generation` only accepts raw token IDs, so the prompt must be encoded and prepended.
+4. Calls `generate_routing_grammar(filtered_snapshot)` to get the Lark EBNF text.
+5. Compiles the grammar text into a `GrammarState` via `self._grammar_guide_factory(routing_grammar_text)`, **with caching**: the compiled state is cached in `self._routing_grammar_cache` keyed on `tuple(sorted(t.name for t in filtered_snapshot.tools))`. Cache hit skips Outlines compilation (which is the dominant cost for a 1-3 token generation pass). Cache invalidates naturally when quota exhaustion changes the routable tool set.
+6. Calls `run_constrained_generation()` with the compiled `GrammarState`, `routing_context_tokens`, short max_tokens, **`hooks=[]`**. The routing pass uses an empty hook list because session-level hooks (e.g., `GrammarTemperatureHook`) assume full grammar complexity — their temperature scheduling would behave incorrectly on a trivial 3-7 alternative routing grammar where `valid_count` is always small. The routing pass uses the config's `temperature` directly via `transport_config`.
+7. Parses the output to extract the tool name.
+8. Returns `RerankResult`.
 
 **Tests:**
 - Mock `GrammarState`, `forward_fn`, `tokenizer_decode` to test routing logic
@@ -183,6 +192,13 @@ The `route()` method:
 - `top_k=2` returns up to 2 tools (run routing grammar twice? Or use top-K from a single pass — design decision noted in uncertainty log)
 - Config `enabled=False` returns all tools (no restriction)
 - Respects max_tokens from config
+- Quota-exhausted tools (quota=0 in snapshot.quotas) are excluded from routing candidates
+- If all tools are quota-exhausted, raises ValueError (no routable tools)
+- If only one tool remains after quota filtering, short-circuits without generation
+- Routing pass calls `run_constrained_generation` with `hooks=[]` (not session hooks)
+- Routing grammar compilation is cached: second call with same tool set does not call `grammar_guide_factory`
+- Cache invalidates when tool set changes (e.g., tool becomes quota-exhausted between cycles)
+- Routing prompt is tokenized via `tokenizer_encode` and prepended to `context_tokens` before generation
 **Validation:** `pytest tests/test_rerank.py -v`
 
 ### Task 5: Integrate ToolRouter into SamplingSession
@@ -201,6 +217,7 @@ def __init__(self, ..., rerank_config: RerankConfig | None = None) -> None:
         ToolRouter(
             grammar_guide_factory=grammar_guide_factory,
             forward_fn=forward_fn,
+            tokenizer_encode=tokenizer_encode,
             tokenizer_decode=tokenizer_decode,
             embeddings=embeddings,
             config=rerank_config,
@@ -223,10 +240,16 @@ if self._router is not None and self._rerank_config and self._rerank_config.enab
         transport_config=self._transport_config,
     )
     total_tokens += rerank_result.routing_tokens
-    # Restrict snapshot to selected tools
-    snapshot = self._registry.snapshot(
-        restrict_to=list(rerank_result.selected_tools),
-        cost_budget=self._config.session_cost_budget,
+    # Restrict the EXISTING quota-adjusted snapshot — do NOT re-snapshot
+    # from the registry, which would reset quotas to original values.
+    selected = frozenset(rerank_result.selected_tools)
+    snapshot = RegistrySnapshot(
+        tools=tuple(t for t in snapshot.tools if t.name in selected),
+        quotas={k: v for k, v in snapshot.quotas.items() if k in selected},
+        cost_remaining=snapshot.cost_remaining,
+        scopes=snapshot.scopes,
+        timestamp=snapshot.timestamp,
+        type_grammars=snapshot.type_grammars,
     )
 
 grammar_output = generate_grammar(snapshot)
@@ -239,6 +262,7 @@ grammar_output = generate_grammar(snapshot)
 - Routing tokens are counted in total_tokens
 - Restricted snapshot is used for grammar generation (verify via mock inspection)
 - Multiple cycles each get their own re-ranking pass
+- Restricted snapshot preserves quota-adjusted values (not original registry quotas)
 **Validation:** `pytest tests/test_sample_rerank.py -v`
 
 ### Task 6: Add rerank telemetry to TelemetryRecord
