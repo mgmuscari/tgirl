@@ -424,6 +424,7 @@ def _analyze_hy_ast(
         return None
 
     for tree in trees:
+        bound_vars.clear()
         err = _check_node(tree)
         if err:
             return err

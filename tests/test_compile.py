@@ -249,6 +249,25 @@ class TestHyAstAnalysis:
         result = _analyze_hy_ast(trees, {"greet"})
         assert result is None
 
+    def test_bound_vars_do_not_leak_between_trees(self) -> None:
+        """Variable bound in first tree must not be visible in second."""
+        from tgirl.compile import _analyze_hy_ast
+
+        # Parse two separate top-level expressions
+        trees = self._parse('(let [x (greet "hi")] x) (greet x)')
+        result = _analyze_hy_ast(trees, {"greet"})
+        # x is bound in tree 1, but tree 2 should reject it
+        assert isinstance(result, PipelineError)
+        assert result.error_type == "UnresolvedReference"
+
+    def test_let_bound_var_visible_within_same_let(self) -> None:
+        """Variable bound in let is visible within same let body."""
+        from tgirl.compile import _analyze_hy_ast
+
+        trees = self._parse('(let [x (greet "hi")] (greet x))')
+        result = _analyze_hy_ast(trees, {"greet"})
+        assert result is None
+
     def test_defn_rejected(self) -> None:
         from tgirl.compile import _analyze_hy_ast
 
