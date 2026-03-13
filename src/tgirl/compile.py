@@ -590,18 +590,33 @@ def _build_sandbox(registry: ToolRegistry) -> dict[str, Any]:
     # Result capture sentinel
     sandbox["_tgirl_result_"] = None
 
-    # Block builtins access
-    sandbox["__builtins__"] = {}
+    # Restricted builtins: only safe types needed by Hy-generated code
+    sandbox["__builtins__"] = {
+        "Exception": Exception,
+        "True": True,
+        "False": False,
+        "None": None,
+        "isinstance": isinstance,
+        "len": len,
+        "list": list,
+        "dict": dict,
+        "int": int,
+        "float": float,
+        "str": str,
+        "bool": bool,
+        "tuple": tuple,
+        "range": range,
+    }
 
     return sandbox
 
 
 def _inject_result_capture(tree: ast.Module) -> ast.Module:
-    """Rewrite the last expression statement to capture its value.
+    """Rewrite the last statement to capture its result value.
 
-    Changes the last ``ast.Expr`` to
-    ``_tgirl_result_ = <expr>`` so the sandbox can retrieve the
-    pipeline result after execution.
+    For ``ast.Expr``: rewrite to ``_tgirl_result_ = <expr>``.
+    For ``ast.Try``: Hy assigns to ``_hy_anon_var_*``; append
+    ``_tgirl_result_ = _hy_anon_var_*`` after the try block.
 
     This runs AFTER security analysis — the injected assignment
     is trusted code from the engine, not model output.
@@ -619,9 +634,38 @@ def _inject_result_capture(tree: ast.Module) -> ast.Module:
         )
         ast.copy_location(assign, last)
         tree.body[-1] = assign
-        ast.fix_missing_locations(tree)
+    elif isinstance(last, ast.Try):
+        # Hy try/except assigns result to _hy_anon_var_*
+        anon_var = _find_hy_anon_var(last)
+        if anon_var:
+            assign = ast.Assign(
+                targets=[
+                    ast.Name(
+                        id="_tgirl_result_", ctx=ast.Store()
+                    )
+                ],
+                value=ast.Name(
+                    id=anon_var, ctx=ast.Load()
+                ),
+            )
+            ast.copy_location(assign, last)
+            tree.body.append(assign)
 
+    ast.fix_missing_locations(tree)
     return tree
+
+
+def _find_hy_anon_var(node: ast.AST) -> str | None:
+    """Find a _hy_anon_var_* assignment target in an AST node."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Assign):
+            for target in child.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id.startswith("_hy_anon_var_")
+                ):
+                    return target.id
+    return None
 
 
 def run_pipeline(

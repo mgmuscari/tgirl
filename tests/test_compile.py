@@ -522,13 +522,23 @@ class TestSandbox:
         assert "_tgirl_result_" in sandbox
         assert sandbox["_tgirl_result_"] is None
 
-    def test_sandbox_builtins_empty(
+    def test_sandbox_builtins_restricted(
         self, registry: ToolRegistry
     ) -> None:
         from tgirl.compile import _build_sandbox
 
         sandbox = _build_sandbox(registry)
-        assert sandbox["__builtins__"] == {}
+        builtins = sandbox["__builtins__"]
+        # Only safe builtins are available
+        assert "Exception" in builtins
+        assert "isinstance" in builtins
+        # Dangerous builtins are NOT available
+        assert "eval" not in builtins
+        assert "exec" not in builtins
+        assert "__import__" not in builtins
+        assert "open" not in builtins
+        assert "getattr" not in builtins
+        assert "compile" not in builtins
 
     def test_sandbox_tool_callables_are_originals(
         self, registry: ToolRegistry
@@ -539,12 +549,13 @@ class TestSandbox:
         assert sandbox["greet"] is registry.get_callable("greet")
         assert sandbox["shout"] is registry.get_callable("shout")
 
-    def test_builtins_access_raises_in_sandbox(
+    def test_dangerous_builtins_blocked_in_sandbox(
         self, registry: ToolRegistry
     ) -> None:
         from tgirl.compile import _build_sandbox
 
         sandbox = _build_sandbox(registry)
+        # print is not in our safe builtins
         code = compile("print('hello')", "<test>", "exec")
         with pytest.raises(NameError):
             exec(code, sandbox)  # noqa: S102
