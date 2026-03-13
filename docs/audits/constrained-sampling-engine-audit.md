@@ -19,14 +19,14 @@ Dual-agent team audit — Security Auditor and Skeptical Client operating as sep
 | 1 | HIGH | INFO | Business Logic | Hook logit_bias can override model distribution | XS (doc) |
 | 2 | MEDIUM | LOW | Numerical Stability | Zero valid tokens causes NaN in constrained path | XS |
 | 3 | MEDIUM | LOW | Numerical Stability | Freeform path missing zero-probability fallback | XS |
-| 4 | HIGH | LOW | Business Logic | Regex quota counting can undercount | XS |
+| 4 | HIGH | MEDIUM | Business Logic | Regex quota counting can undercount | XS |
 | 5 | LOW | INFO | Design | Delimiter spoofing via freeform generation | XS (doc) |
 | 6 | INFO | INFO | Data Exposure | Telemetry contains raw tool outputs | XS (doc) |
-| 7 | MEDIUM | LOW | Resource Exhaustion | No timeout in constrained generation loop | S |
+| 7 | MEDIUM | MEDIUM | Resource Exhaustion | No timeout in constrained generation loop | S |
 | 8 | LOW | LOW | Input Validation | SessionConfig lacks field validation | XS |
 | 9 | LOW | INFO | Design | Result injection may influence delimiter generation | - |
 
-**Post-challenge totals:** 0 CRITICAL, 0 HIGH, 0 MEDIUM, 4 LOW, 4 INFO, 1 no-action
+**Post-challenge totals:** 0 CRITICAL, 0 HIGH, 2 MEDIUM, 3 LOW, 4 INFO
 
 ## Detailed Findings
 
@@ -69,14 +69,14 @@ Dual-agent team audit — Security Auditor and Skeptical Client operating as sep
 
 ### Finding 4: Regex quota counting can undercount
 **Initial Severity:** HIGH
-**Final Severity:** LOW
+**Final Severity:** MEDIUM
 **Category:** Business Logic
 **Affected Code:** `src/tgirl/sample.py:553`
 **Description:** Regex-based `_count_tool_invocations` can undercount in edge cases (comments, aliasing).
 **Client Challenge:** Both attack scenarios are blocked by other layers. Aliasing (`setv`) rejected by Hy AST static analyzer. Comments impossible in grammar-constrained output. Grammar-level quota enforcement is the primary defense.
-**Auditor Defense:** Did not rebut.
-**Resolution:** Downgraded to LOW. Grammar + static analysis layers prevent exploitation. AST-based counting is a cleanliness improvement.
-**Remediation:** Consider AST-based counting via existing compile pipeline (optional).
+**Auditor Defense:** Defended MEDIUM: regex counting is the session-level quota enforcement mechanism. While grammar-level enforcement is the primary defense, the secondary layer should be correct. A contract gap in the counting function weakens defense-in-depth. Not HIGH (grammar prevents exploitation), but stronger than LOW (it's the designated counting mechanism failing at its job).
+**Resolution:** Settled at MEDIUM. Grammar prevents exploitation but AST-based counting should replace regex for correctness of the secondary defense layer.
+**Remediation:** Replace regex counting with AST-based counting via existing compile pipeline.
 **Effort Estimate:** XS
 
 ### Finding 5: Delimiter spoofing via freeform generation
@@ -104,14 +104,14 @@ Dual-agent team audit — Security Auditor and Skeptical Client operating as sep
 
 ### Finding 7: No timeout in constrained generation loop
 **Initial Severity:** MEDIUM
-**Final Severity:** LOW
+**Final Severity:** MEDIUM
 **Category:** Resource Exhaustion
 **Affected Code:** `src/tgirl/sample.py` (run_constrained_generation)
 **Description:** `run_constrained_generation` has no timeout check; only bounded by `max_tokens`. Session timeout only enforced in freeform loop.
 **Client Challenge:** Constrained loop bounded by `max_tokens=512` default. Each OT call bounded by `max_iterations=20`. Worst case is slow but not unbounded.
-**Auditor Defense:** Did not rebut.
-**Resolution:** Downgraded to LOW. Bounded by max_tokens, not truly unbounded.
-**Remediation:** Add optional timeout parameter to `run_constrained_generation` for consistency.
+**Auditor Defense:** Defended MEDIUM: the session-level timeout exists and is enforced in the freeform loop but NOT in the constrained loop — this is an asymmetry in a security-relevant control. While max_tokens bounds the loop, the absence of timeout in constrained mode is a contract gap. The freeform loop having it makes the omission more notable, not less.
+**Resolution:** Settled at MEDIUM. Contract gap — timeout control exists at session level but is not propagated to constrained generation.
+**Remediation:** Add optional timeout parameter to `run_constrained_generation` for consistency with session-level timeout.
 **Effort Estimate:** S
 
 ### Finding 8: SessionConfig lacks field validation
@@ -147,11 +147,11 @@ Dual-agent team audit — Security Auditor and Skeptical Client operating as sep
 
 ## Remediation Priority
 
-1. **Finding 8** — Add SessionConfig field validation (XS, consistency with TransportConfig)
-2. **Finding 2** — Add zero-valid-tokens guard in constrained path (XS, defense-in-depth)
-3. **Finding 3** — Add zero-prob fallback in freeform path (XS, consistency)
-4. **Finding 7** — Add timeout param to run_constrained_generation (S, consistency)
-5. **Finding 4** — Consider AST-based counting (XS, optional cleanliness)
-6. **Findings 1, 5, 6** — Documentation improvements (XS each)
+1. **Finding 4** (MEDIUM) — Replace regex counting with AST-based counting (XS, defense-in-depth correctness)
+2. **Finding 7** (MEDIUM) — Add timeout param to run_constrained_generation (S, contract gap)
+3. **Finding 8** (LOW) — Add SessionConfig field validation (XS, consistency with TransportConfig)
+4. **Finding 2** (LOW) — Add zero-valid-tokens guard in constrained path (XS, defense-in-depth)
+5. **Finding 3** (LOW) — Add zero-prob fallback in freeform path (XS, consistency)
+6. **Findings 1, 5, 6** (INFO) — Documentation improvements (XS each)
 
 All remediations are robustness/hygiene improvements, not security-critical fixes.
