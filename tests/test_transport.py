@@ -198,3 +198,59 @@ class TestCheckBypass:
         should, reason = _check_bypass(logits, mask, TransportConfig())
         assert should is True
         assert reason == "valid_ratio_high"
+
+
+class TestStandardMasking:
+    """Task 3: _standard_masking sets invalid logits to -inf."""
+
+    def test_invalid_become_neg_inf(self) -> None:
+        from tgirl.transport import _standard_masking
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        mask = torch.tensor([True, False, True])
+        result = _standard_masking(logits, mask)
+        assert result[1] == float("-inf")
+
+    def test_valid_unchanged(self) -> None:
+        from tgirl.transport import _standard_masking
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        mask = torch.tensor([True, False, True])
+        result = _standard_masking(logits, mask)
+        assert result[0] == 1.0
+        assert result[2] == 3.0
+
+    def test_output_shape(self) -> None:
+        from tgirl.transport import _standard_masking
+
+        logits = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        mask = torch.tensor([True, False, True, False])
+        result = _standard_masking(logits, mask)
+        assert result.shape == logits.shape
+
+    def test_all_valid_identity(self) -> None:
+        from tgirl.transport import _standard_masking
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        mask = torch.tensor([True, True, True])
+        result = _standard_masking(logits, mask)
+        assert torch.equal(result, logits)
+
+    def test_single_valid(self) -> None:
+        from tgirl.transport import _standard_masking
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        mask = torch.tensor([False, True, False])
+        result = _standard_masking(logits, mask)
+        assert result[1] == 2.0
+        assert result[0] == float("-inf")
+        assert result[2] == float("-inf")
+
+    def test_does_not_mutate_input(self) -> None:
+        from tgirl.transport import _standard_masking
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        original = logits.clone()
+        mask = torch.tensor([True, False, True])
+        _standard_masking(logits, mask)
+        assert torch.equal(logits, original)

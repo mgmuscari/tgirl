@@ -77,3 +77,16 @@ def _check_bypass(
         return True, "invalid_mass_low"
 
     return False, None
+
+
+def _standard_masking(
+    logits: torch.Tensor, valid_mask: torch.Tensor
+) -> torch.Tensor:
+    """Set invalid logits to -inf, preserving valid logits unchanged.
+
+    This is the bypass fast path used when optimal transport is skipped.
+    Does not mutate the input tensor.
+    """
+    result = logits.clone()
+    result[~valid_mask] = float("-inf")
+    return result
