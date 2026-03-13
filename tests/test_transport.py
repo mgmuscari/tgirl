@@ -27,6 +27,38 @@ class TestTransportConfig:
         assert c.valid_ratio_threshold == 0.5
         assert c.invalid_mass_threshold == 0.01
 
+    def test_epsilon_zero_rejected(self) -> None:
+        from tgirl.transport import TransportConfig
+
+        with pytest.raises(ValidationError):
+            TransportConfig(epsilon=0)
+
+    def test_epsilon_negative_rejected(self) -> None:
+        from tgirl.transport import TransportConfig
+
+        with pytest.raises(ValidationError):
+            TransportConfig(epsilon=-1)
+
+    def test_max_iterations_too_high_rejected(self) -> None:
+        from tgirl.transport import TransportConfig
+
+        with pytest.raises(ValidationError):
+            TransportConfig(max_iterations=1001)
+
+    def test_valid_ratio_out_of_range_rejected(self) -> None:
+        from tgirl.transport import TransportConfig
+
+        with pytest.raises(ValidationError):
+            TransportConfig(valid_ratio_threshold=-0.5)
+        with pytest.raises(ValidationError):
+            TransportConfig(valid_ratio_threshold=1.5)
+
+    def test_valid_defaults_still_accepted(self) -> None:
+        from tgirl.transport import TransportConfig
+
+        c = TransportConfig()
+        assert c.epsilon == 0.1
+
     def test_config_custom_values(self) -> None:
         from tgirl.transport import TransportConfig
 

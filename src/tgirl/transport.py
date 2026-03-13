@@ -14,7 +14,7 @@ from typing import NamedTuple
 
 import structlog
 import torch
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = structlog.get_logger()
 
@@ -24,11 +24,11 @@ class TransportConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    epsilon: float = 0.1
-    max_iterations: int = 20
-    convergence_threshold: float = 1e-6
-    valid_ratio_threshold: float = 0.5
-    invalid_mass_threshold: float = 0.01
+    epsilon: float = Field(default=0.1, gt=0)
+    max_iterations: int = Field(default=20, ge=1, le=1000)
+    convergence_threshold: float = Field(default=1e-6, gt=0)
+    valid_ratio_threshold: float = Field(default=0.5, ge=0, le=1)
+    invalid_mass_threshold: float = Field(default=0.01, ge=0, le=1)
 
 
 class TransportResult(NamedTuple):
