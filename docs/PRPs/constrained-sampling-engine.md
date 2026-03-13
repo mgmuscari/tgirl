@@ -28,7 +28,7 @@ Implement `tgirl.sample` — the keystone module that integrates grammar constra
 
 ### Conventions
 
-- Branch naming: `feature/<slug>` (already on `feature/constrained-sampling-engine`)
+- Branch naming: `feature/<slug>` (target branch: `feature/constrained-sampling-engine`, to be created from `main` at execution time)
 - Commits: conventional commits, one per task (test + implementation together)
 - TDD: RED → GREEN → REFACTOR for each task
 - `ruff check` and `mypy` must pass
@@ -169,20 +169,26 @@ class GrammarTemperatureHook:
 
 **Validation:** `pytest tests/test_sample.py -v -k "TestGrammarTemperatureHook"`
 
-### Task 4: Implement logit processing pipeline (apply_sampling_params)
+### Task 4: Implement logit processing pipeline (split pre-OT and post-OT)
 
 **Files:** `src/tgirl/sample.py`, `tests/test_sample.py`
 **Approach:**
 
-Implement the function that applies `ModelIntervention` parameters to logits:
+Per TGIRL.md section 8.5 (steps d-f), logit processing is split into two phases around OT redistribution. Penalties operate on raw logits (preserving the model's intent signal for OT), while shaping operates on the redistributed distribution.
 
 ```python
-def apply_sampling_params(
+def apply_penalties(
     logits: torch.Tensor,
     intervention: ModelIntervention,
     token_history: list[int],
 ) -> torch.Tensor:
-    """Apply temperature, top_p, top_k, penalties to logits."""
+    """Pre-OT: apply repetition, presence, frequency penalties and logit bias to raw logits.
+
+    These modify the model's original logit distribution before OT redistribution,
+    so that OT operates on a penalty-adjusted signal (TGIRL.md 8.5 steps e-f ordering
+    note: penalties logically precede OT even though the spec lists them after shaping —
+    see rationale below).
+    """
     result = logits.clone()
 
     # Repetition penalty
@@ -210,11 +216,27 @@ def apply_sampling_params(
         for token_id, bias in intervention.logit_bias.items():
             result[token_id] += bias
 
+    return result
+
+
+def apply_shaping(
+    logits: torch.Tensor,
+    intervention: ModelIntervention,
+) -> torch.Tensor:
+    """Post-OT: apply temperature, top-k, top-p to redistributed logits.
+
+    These shape the final sampling distribution after OT has redistributed
+    probability mass onto valid tokens (TGIRL.md 8.5 step e).
+    """
+    result = logits.clone()
+
     # Temperature
     if intervention.temperature is not None and intervention.temperature > 0:
         result = result / intervention.temperature
     elif intervention.temperature is not None and intervention.temperature == 0:
-        # Greedy: set all but max to -inf
+        # Greedy: set all but max to -inf. Tie-breaking policy: torch.argmax
+        # returns the first (lowest-index) maximum. This is deterministic and
+        # consistent, which is the desired property for greedy decoding.
         max_idx = result.argmax()
         mask = torch.ones_like(result, dtype=torch.bool)
         mask[max_idx] = False
@@ -233,29 +255,51 @@ def apply_sampling_params(
         cumulative = torch.cumsum(probs, dim=-1)
         cutoff_mask = cumulative - probs > intervention.top_p
         sorted_logits[cutoff_mask] = float('-inf')
-        result = sorted_logits.scatter(0, sorted_indices, sorted_logits)
+        # Unsort: scatter modified sorted values back to original positions
+        result = torch.empty_like(sorted_logits)
+        result.scatter_(0, sorted_indices, sorted_logits)
 
     return result
 ```
 
-**Tests:**
-- Temperature 1.0 → logits unchanged (within float tolerance)
-- Temperature 0.5 → logits doubled
-- Temperature 0.0 → greedy (only max survives)
-- Top-k=3 → only top 3 logits survive
-- Top-p=0.5 → appropriate nucleus filtering
-- Repetition penalty > 1.0 → repeated tokens penalized
-- Logit bias → specific token logits shifted
-- All-None intervention → logits unchanged
+**Ordering rationale:** The spec (TGIRL.md 8.5) lists steps as d=OT, e=temperature/top-p/top-k, f=penalties. However, applying penalties *after* OT means OT redistributes mass onto tokens the model intended to penalize, which the penalties then pull back — wasting OT computation. Applying penalties *before* OT lets OT redistribute from an already-adjusted distribution. The PRP places penalties pre-OT and shaping post-OT. This deviation from the spec's literal ordering is logged in the Uncertainty Log and should be validated during implementation.
 
-**Validation:** `pytest tests/test_sample.py -v -k "TestApplySamplingParams"`
+**Tests:**
+- `apply_penalties`: repetition penalty > 1.0 penalizes repeated tokens
+- `apply_penalties`: presence penalty subtracts from seen tokens
+- `apply_penalties`: frequency penalty scales with count
+- `apply_penalties`: logit bias shifts specific tokens
+- `apply_penalties`: all-None intervention returns logits unchanged
+- `apply_shaping`: temperature 1.0 leaves logits unchanged (within float tolerance)
+- `apply_shaping`: temperature 0.5 doubles logits
+- `apply_shaping`: temperature 0.0 is greedy (only max survives)
+- `apply_shaping`: temperature 0.0 with tied maxima → lowest-index token wins (documents tie-breaking policy)
+- `apply_shaping`: top-k=3 keeps only top 3
+- `apply_shaping`: top-p=0.5 with known logits [5.0, 3.0, 1.0, 0.5, 0.1] keeps tokens whose cumulative softmax probability <= 0.5, sets rest to -inf, and result indices match original (unsorted) positions
+- `apply_shaping`: all-None intervention returns logits unchanged
+
+**Validation:** `pytest tests/test_sample.py -v -k "TestApplyPenalties or TestApplyShaping"`
 
 ### Task 5: Implement MockGrammarState and constrained token generation core
 
 **Files:** `src/tgirl/sample.py`, `tests/test_sample.py`
 **Approach:**
 
-Build the constrained generation core that, given a grammar state, logits source (callable), embeddings, hooks, and transport config, generates tokens until grammar accepts:
+Build the constrained generation core that, given a grammar state, logits source (callable), embeddings, hooks, and transport config, generates tokens until grammar accepts.
+
+**Per-token processing order** (follows TGIRL.md 8.5 with penalties moved pre-OT — see Task 4 rationale):
+
+```
+1. forward_fn(context_tokens) → raw logits
+2. grammar_state.get_valid_mask(vocab_size) → valid_mask
+3. call all InferenceHooks → merge_interventions() → merged ModelIntervention
+4. apply_penalties(logits, intervention, token_history) → penalty-adjusted logits
+5. redistribute_logits(adjusted_logits, valid_mask, embeddings, config) → OT result
+6. apply_shaping(ot_logits, intervention) → shaped logits
+7. sample token from shaped logits
+8. grammar_state.advance(token_id)
+9. record telemetry
+```
 
 ```python
 class ConstrainedGenerationResult(BaseModel):
@@ -289,6 +333,7 @@ For testing, create a `MockGrammarState` that feeds a predetermined sequence of 
 **Tests:**
 - With a mock that accepts after 3 tokens with forced valid masks → produces 3 tokens
 - Hooks are called at each position in order
+- Processing order is enforced: penalties → OT → shaping (verify via mock side effects)
 - OT redistribution is called (or bypassed) at each position
 - Telemetry fields (valid counts, temperatures, wasserstein) are populated
 - `max_tokens` limit is respected (stops if grammar never accepts)
@@ -303,25 +348,35 @@ For testing, create a `MockGrammarState` that feeds a predetermined sequence of 
 
 ```python
 class DelimiterDetector:
-    """Detects tool call delimiters in generated token stream."""
+    """Detects tool call delimiters in generated token stream.
+
+    Maintains a sliding window of decoded text rather than accumulating
+    all token IDs. The window is bounded to 2x the delimiter's character
+    length, which is sufficient to detect any delimiter that spans a
+    token boundary.
+    """
 
     def __init__(self, delimiter: str, tokenizer_decode: Callable[[list[int]], str]):
         self.delimiter = delimiter
         self.decode = tokenizer_decode
-        self._buffer: list[int] = []
+        self._decoded_window: str = ""
+        self._max_window = len(delimiter) * 2
 
     def feed(self, token_id: int) -> bool:
         """Feed a token. Returns True if delimiter is detected."""
-        self._buffer.append(token_id)
-        # Keep buffer bounded to 2x delimiter length in tokens
-        decoded = self.decode(self._buffer[-len(self.delimiter) * 4:])
-        if self.delimiter in decoded:
-            return True
-        return False
+        new_text = self.decode([token_id])
+        self._decoded_window += new_text
+        # Prune window to bounded size, keeping enough trailing chars
+        # to detect a delimiter that spans the pruning boundary
+        if len(self._decoded_window) > self._max_window:
+            self._decoded_window = self._decoded_window[-self._max_window:]
+        return self.delimiter in self._decoded_window
 
     def reset(self) -> None:
-        self._buffer.clear()
+        self._decoded_window = ""
 ```
+
+**Design note:** Decoding single tokens individually avoids accumulating a token ID buffer entirely. The decoded text window is bounded to `2 * len(delimiter)` characters — enough to catch any cross-token-boundary delimiter occurrence. This trades per-token decode calls (cheap for single tokens) for guaranteed O(1) memory regardless of session length.
 
 **Tests:**
 - Single-token delimiter → detected immediately
@@ -329,6 +384,7 @@ class DelimiterDetector:
 - No delimiter in stream → never triggers
 - Reset clears state
 - Partial match followed by non-match → no false positive
+- Buffer stays bounded after 10,000 tokens (window length <= `2 * len(delimiter)`)
 
 **Validation:** `pytest tests/test_sample.py -v -k "TestDelimiterDetector"`
 
@@ -365,8 +421,39 @@ The session:
 2. Detects tool delimiter → switches to constrained mode
 3. Generates grammar, creates grammar state, runs constrained generation
 4. Passes completed Hy source to `run_pipeline()`
-5. Injects results into context, returns to freeform
+5. Updates quota state and injects results into context, returns to freeform
 6. Respects cycle limits, cost budget, timeout
+
+**Cross-cycle quota tracking (TGIRL.md 3.3):**
+
+The session maintains a mutable `_consumed_quotas: dict[str, int]` counter. After each `run_pipeline()` call, the session counts tool invocations in the Hy source by walking the Hy AST for function call names that match registered tool names. When generating the snapshot for the next cycle, the session constructs a `RegistrySnapshot` with reduced quotas:
+
+```python
+def _snapshot_with_remaining_quotas(self) -> RegistrySnapshot:
+    """Produce a snapshot with quotas reduced by consumed counts."""
+    base = self._registry.snapshot(scopes=self._scopes, cost_budget=self._cost_remaining)
+    remaining_quotas = {
+        name: max(0, limit - self._consumed_quotas.get(name, 0))
+        for name, limit in base.quotas.items()
+    }
+    return RegistrySnapshot(
+        tools=base.tools,
+        quotas=remaining_quotas,
+        cost_remaining=self._cost_remaining,
+        scopes=base.scopes,
+        timestamp=base.timestamp,
+    )
+
+def _count_tool_invocations(self, hy_source: str) -> dict[str, int]:
+    """Count tool invocations in Hy source via simple AST walk.
+
+    This is a lightweight parse — not a full compile — that counts
+    function call names matching registered tools.
+    """
+    ...
+```
+
+This means the grammar for cycle N+1 has tighter quotas than cycle N, enforcing the per-session quota invariant at the grammar level (safety by construction). Tools that have exhausted their quota become inexpressible in subsequent cycles.
 
 ```python
 class SamplingResult(BaseModel):
@@ -377,6 +464,7 @@ class SamplingResult(BaseModel):
     total_tokens: int
     total_cycles: int
     wall_time_ms: float
+    quotas_consumed: dict[str, int]  # Final consumed quota counts
 
 class ToolCallRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -384,6 +472,7 @@ class ToolCallRecord(BaseModel):
     result: Any
     error: PipelineError | None = None
     cycle_number: int
+    tool_invocations: dict[str, int]  # Per-tool invocation counts for this cycle
 ```
 
 **Tests:**
@@ -392,7 +481,9 @@ class ToolCallRecord(BaseModel):
 - `max_tool_cycles` enforced → stops after limit
 - `session_timeout` enforced → stops if exceeded
 - Session produces `TelemetryRecord` for each constrained cycle
-- Quota state from registry is passed through correctly
+- Two-cycle session: tool with quota=2 invoked once per cycle → second cycle snapshot has quota=1, third cycle (if any) would have quota=0 and tool becomes inexpressible
+- `_count_tool_invocations` correctly counts nested/composed tool calls in `(-> (foo x) (bar))` as foo=1, bar=1
+- `SamplingResult.quotas_consumed` reflects total consumed quotas across all cycles
 
 **Validation:** `pytest tests/test_sample.py -v -k "TestSamplingSession"`
 
@@ -405,7 +496,7 @@ Add exports to `__init__.py`:
 - `SessionConfig`, `ModelIntervention` (from types)
 - `InferenceHook`, `GrammarState` (protocols from sample)
 - `GrammarTemperatureHook`, `SamplingSession`, `SamplingResult` (from sample)
-- `merge_interventions`, `apply_sampling_params`, `run_constrained_generation` (from sample)
+- `merge_interventions`, `apply_penalties`, `apply_shaping`, `run_constrained_generation` (from sample)
 
 Integration test: construct a minimal end-to-end test with a mock model that exercises the full pipeline: registry → grammar → constrained generation → compile → result. This test verifies the module boundaries work together.
 
@@ -449,8 +540,10 @@ All changes are on `feature/constrained-sampling-engine`. If issues are discover
 
 2. **Token-level delimiter detection:** The `DelimiterDetector` in Task 6 decodes recent tokens to check for delimiters. This requires a tokenizer decode function. For multi-byte or BPE tokens, a delimiter might be split across token boundaries in unexpected ways. The buffer-based approach handles this but may have edge cases with very long delimiters.
 
-3. **Top-p implementation:** The scatter-based top-p in Task 4 is correct but may have numerical edge cases. Should be verified against a reference implementation.
+3. **Top-p implementation:** The original scatter-based top-p had a bug (self-referential scatter). Fixed to use `torch.empty_like` + `scatter_()` for correct unsorting. Test now specifies exact numerical expectations with known input logits to verify both filtering and unsort correctness.
 
 4. **Embedding matrix source:** The `SamplingSession` receives embeddings as a parameter. In practice, this comes from `model.get_input_embeddings().weight` (HuggingFace) or equivalent. This is documented but not enforced.
 
 5. **`torch` as test dependency:** Tasks 2-8 require `torch`. The existing transport tests already use `torch`, so this dependency is available in the test environment. Verified via `pyproject.toml` optional deps.
+
+6. **Penalty ordering deviation from spec:** TGIRL.md 8.5 lists OT (step d) before penalties (step f). The PRP places penalties pre-OT so that OT redistributes from a penalty-adjusted distribution rather than having penalties fight OT's redistribution. This is a deliberate deviation that should be validated empirically during implementation — if penalties post-OT produces better results, the ordering should be revised.
