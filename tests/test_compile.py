@@ -65,14 +65,19 @@ class TestCompileTypes:
 
         c = CompileConfig()
         assert c.pipeline_timeout == 60.0
-        assert c.max_depth == 50
 
     def test_compile_config_custom_values(self) -> None:
         from tgirl.compile import CompileConfig
 
-        c = CompileConfig(pipeline_timeout=30.0, max_depth=25)
+        c = CompileConfig(pipeline_timeout=30.0)
         assert c.pipeline_timeout == 30.0
-        assert c.max_depth == 25
+
+    def test_compile_config_has_only_pipeline_timeout(self) -> None:
+        """max_depth was dead config — CompileConfig has only pipeline_timeout."""
+        from tgirl.compile import CompileConfig
+
+        fields = set(CompileConfig.model_fields.keys())
+        assert fields == {"pipeline_timeout"}
 
 
 class TestCompileStubs:

@@ -65,7 +65,6 @@ class CompileConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
     pipeline_timeout: float = 60.0
-    max_depth: int = 50
 
 
 
