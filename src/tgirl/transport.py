@@ -29,6 +29,7 @@ class TransportConfig(BaseModel):
     convergence_threshold: float = Field(default=1e-6, gt=0)
     valid_ratio_threshold: float = Field(default=0.5, ge=0, le=1)
     invalid_mass_threshold: float = Field(default=0.01, ge=0, le=1)
+    max_problem_size: int = Field(default=1_000_000, ge=1)
 
 
 class TransportResult(NamedTuple):
@@ -275,6 +276,24 @@ def redistribute_logits(
     vocab_size = logits.shape[0]
     invalid_indices = torch.where(~valid_mask)[0]
     valid_indices = torch.where(valid_mask)[0]
+
+    # Check problem size to avoid OOM on large cost matrices
+    problem_size = len(invalid_indices) * len(valid_indices)
+    if problem_size > cfg.max_problem_size:
+        logger.debug(
+            "transport_bypass",
+            reason="problem_size_exceeded",
+            problem_size=problem_size,
+            max_problem_size=cfg.max_problem_size,
+        )
+        masked = _standard_masking(logits, valid_mask)
+        return TransportResult(
+            logits=masked,
+            wasserstein_distance=0.0,
+            bypassed=True,
+            bypass_reason="problem_size_exceeded",
+            iterations=0,
+        )
 
     # Compute source mass (probability on invalid tokens)
     probs = torch.softmax(logits, dim=-1)

@@ -721,6 +721,44 @@ class TestRedistributeLogits:
         probs = torch.softmax(finite, dim=-1)
         assert abs(probs.sum().item() - 1.0) < 1e-5
 
+    def test_large_problem_size_bypassed(self) -> None:
+        """F2: large cost matrix triggers size-based bypass."""
+        from tgirl.transport import TransportConfig, redistribute_logits
+
+        torch.manual_seed(42)
+        vocab_size = 400
+        embeddings = torch.randn(vocab_size, 16)
+        logits = torch.randn(vocab_size)
+        # 200 valid, 200 invalid → problem_size = 200 * 200 = 40000
+        valid_mask = torch.zeros(vocab_size, dtype=torch.bool)
+        valid_mask[:200] = True
+        config = TransportConfig(max_problem_size=100)
+        result = redistribute_logits(logits, valid_mask, embeddings, config=config)
+        assert result.bypassed is True
+        assert result.bypass_reason == "problem_size_exceeded"
+
+    def test_small_problem_size_not_bypassed(self) -> None:
+        """F2: small cost matrix does not trigger size-based bypass."""
+        from tgirl.transport import TransportConfig, redistribute_logits
+
+        torch.manual_seed(42)
+        vocab_size = 10
+        embeddings = torch.randn(vocab_size, 16)
+        logits = torch.randn(vocab_size)
+        valid_mask = torch.tensor(
+            [True, True, False, False, True, False, False, True, False, False]
+        )
+        config = TransportConfig(max_problem_size=100_000)
+        result = redistribute_logits(logits, valid_mask, embeddings, config=config)
+        assert result.bypassed is False
+
+    def test_default_problem_size_reasonable(self) -> None:
+        """F2: default max_problem_size allows 1000x1000 without bypass."""
+        from tgirl.transport import TransportConfig
+
+        config = TransportConfig()
+        assert config.max_problem_size >= 1_000_000
+
     def test_structlog_events_emitted(self, simple_setup: dict) -> None:
         """Structlog events should be emitted during redistribution."""
         from structlog.testing import capture_logs
