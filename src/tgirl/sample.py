@@ -10,7 +10,10 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from tgirl.registry import ToolRegistry
 
 import structlog
 import torch
@@ -384,7 +387,7 @@ class SamplingSession:
 
     def __init__(
         self,
-        registry: object,  # ToolRegistry
+        registry: ToolRegistry,
         forward_fn: Callable[[list[int]], torch.Tensor],
         tokenizer_decode: Callable[[list[int]], str],
         tokenizer_encode: Callable[[str], list[int]],
@@ -407,6 +410,10 @@ class SamplingSession:
 
     def run(self, prompt_tokens: list[int]) -> SamplingResult:
         """Run the full dual-mode sampling loop."""
+        # Deferred imports to break circular dependency at module level
+        from tgirl.compile import run_pipeline
+        from tgirl.grammar import generate as generate_grammar
+
         start_time = time.monotonic()
         token_history = list(prompt_tokens)
         output_parts: list[str] = []
@@ -465,9 +472,7 @@ class SamplingSession:
             freeform_count_before = len(freeform_tokens)
             open_detector.reset()
 
-            # Generate grammar from snapshot with reduced quotas (B1 fix)
-            from tgirl.grammar import generate as generate_grammar
-
+            # Generate grammar from snapshot with reduced quotas
             snapshot = self._snapshot_with_remaining_quotas()
             grammar_output = generate_grammar(snapshot)
             grammar_state = self._grammar_guide_factory(grammar_output.text)
@@ -500,8 +505,6 @@ class SamplingSession:
                 )
 
             # Execute the pipeline
-            from tgirl.compile import run_pipeline
-
             pipeline_result = run_pipeline(
                 gen_result.hy_source, self._registry
             )
