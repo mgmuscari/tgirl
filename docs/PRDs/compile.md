@@ -1,6 +1,6 @@
 # PRD: tgirl.compile — Hy Compilation and Sandboxed Execution
 
-## Status: DRAFT
+## Status: IMPLEMENTED
 ## Author: agent (Proposer)
 ## Date: 2026-03-12
 ## Branch: feature/compile
