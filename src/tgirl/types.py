@@ -244,6 +244,51 @@ class TelemetryRecord(BaseModel):
     registry_snapshot_hash: str
 
 
+# --- Model Intervention ---
+
+
+class ModelIntervention(BaseModel):
+    """Per-token model intervention from inference hooks."""
+
+    model_config = ConfigDict(frozen=True)
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    logit_bias: dict[int, float] | None = None
+    activation_steering: Any | None = None  # Reserved for ESTRADIOL
+
+
+# --- Session Config ---
+
+
+class SessionConfig(BaseModel):
+    """Configuration for a dual-mode sampling session."""
+
+    model_config = ConfigDict(frozen=True)
+    # Freeform mode
+    freeform_temperature: float = 0.7
+    freeform_top_p: float = 0.9
+    freeform_top_k: int | None = None
+    freeform_repetition_penalty: float = 1.0
+    freeform_max_tokens: int = 4096
+    # Constrained mode
+    constrained_base_temperature: float = 0.3
+    constrained_ot_epsilon: float = 0.1
+    constrained_max_tokens: int = 512
+    # Session-level
+    max_tool_cycles: int = 10
+    session_cost_budget: float | None = None
+    session_timeout: float = 300.0
+    # Delimiters
+    tool_open_delimiter: str = "<tool>"
+    tool_close_delimiter: str = "</tool>"
+    result_open_delimiter: str = "<tool_result>"
+    result_close_delimiter: str = "</tool_result>"
+
+
 # Rebuild forward refs for recursive types
 ListType.model_rebuild()
 DictType.model_rebuild()
