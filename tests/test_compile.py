@@ -303,6 +303,43 @@ class TestHyAstAnalysis:
         assert result.stage == "static_analysis"
         assert result.error_type == "DisallowedForm"
 
+    def test_method_call_upper_rejected(self) -> None:
+        """(.upper "hello") — Expression-headed call must be blocked."""
+        from tgirl.compile import _analyze_hy_ast
+
+        trees = self._parse('(.upper "hello")')
+        result = _analyze_hy_ast(trees, {"greet"})
+        assert isinstance(result, PipelineError)
+        assert result.stage == "static_analysis"
+        assert result.error_type == "DisallowedForm"
+        assert "Method call" in result.message
+
+    def test_method_call_format_rejected(self) -> None:
+        """(.format ...) — sandbox escape via format string."""
+        from tgirl.compile import _analyze_hy_ast
+
+        trees = self._parse('(.format "{0}" "x")')
+        result = _analyze_hy_ast(trees, {"greet"})
+        assert isinstance(result, PipelineError)
+        assert result.error_type == "DisallowedForm"
+
+    def test_nested_method_call_rejected(self) -> None:
+        """Method call nested inside composition must be blocked."""
+        from tgirl.compile import _analyze_hy_ast
+
+        trees = self._parse('(greet (.upper "hello"))')
+        result = _analyze_hy_ast(trees, {"greet"})
+        assert isinstance(result, PipelineError)
+        assert result.error_type == "DisallowedForm"
+
+    def test_legitimate_tool_calls_still_pass(self) -> None:
+        """Ensure the Expression-headed check doesn't break normal calls."""
+        from tgirl.compile import _analyze_hy_ast
+
+        trees = self._parse('(greet "hello")')
+        result = _analyze_hy_ast(trees, {"greet"})
+        assert result is None
+
     def test_pmap_operator_accepted(self) -> None:
         from tgirl.compile import _analyze_hy_ast
 

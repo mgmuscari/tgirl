@@ -373,6 +373,19 @@ def _analyze_hy_ast(
                         hy_source=str(node),
                     )
 
+            elif isinstance(head, Expression):
+                # Expression-headed calls like (.upper "hello")
+                # which Hy desugars to ((. None upper) "hello").
+                # This is the method call bypass — reject it.
+                return PipelineError(
+                    stage=STAGE_STATIC_ANALYSIS,
+                    error_type="DisallowedForm",
+                    message=(
+                        "Method call syntax is not allowed"
+                    ),
+                    hy_source=str(node),
+                )
+
             # Recurse into sub-expressions
             for child in node[1:]:
                 err = _check_node(child)
