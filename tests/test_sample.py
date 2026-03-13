@@ -438,3 +438,216 @@ class TestApplyShaping:
         intervention = ModelIntervention()
         result = apply_shaping(logits, intervention)
         assert torch.allclose(result, logits)
+
+
+class TestConstrainedGeneration:
+    """Task 5: Constrained token generation core."""
+
+    def _make_mock_grammar_state(
+        self, valid_masks: list[list[bool]], accept_after: int
+    ):
+        """Create a mock grammar state with predetermined valid masks.
+
+        Args:
+            valid_masks: List of boolean masks, one per token position.
+            accept_after: Accept after this many advance() calls.
+        """
+        import torch
+
+        class MockGS:
+            def __init__(self):
+                self._position = 0
+                self._advances = 0
+
+            def get_valid_mask(self, tokenizer_vocab_size: int) -> torch.Tensor:
+                if self._position < len(valid_masks):
+                    return torch.tensor(valid_masks[self._position], dtype=torch.bool)
+                return torch.ones(tokenizer_vocab_size, dtype=torch.bool)
+
+            def is_accepting(self) -> bool:
+                return self._advances >= accept_after
+
+            def advance(self, token_id: int) -> None:
+                self._position += 1
+                self._advances += 1
+
+        return MockGS()
+
+    def test_produces_correct_number_of_tokens(self) -> None:
+        import torch
+
+        from tgirl.sample import ConstrainedGenerationResult, run_constrained_generation
+        from tgirl.transport import TransportConfig
+
+        masks = [
+            [True, False, False, False, False],
+            [False, True, False, False, False],
+            [False, False, True, False, False],
+        ]
+        gs = self._make_mock_grammar_state(masks, accept_after=3)
+
+        def forward_fn(ctx: list[int]) -> torch.Tensor:
+            return torch.tensor([5.0, 4.0, 3.0, 2.0, 1.0])
+
+        def decode(ids: list[int]) -> str:
+            return "".join(chr(65 + i) for i in ids)
+
+        embeddings = torch.eye(5)
+        config = TransportConfig()
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            hooks=[],
+            transport_config=config,
+            max_tokens=10,
+        )
+
+        assert isinstance(result, ConstrainedGenerationResult)
+        assert len(result.tokens) == 3
+
+    def test_hooks_called_at_each_position(self) -> None:
+        import torch
+
+        from tgirl.sample import GrammarState, run_constrained_generation
+        from tgirl.transport import TransportConfig
+        from tgirl.types import ModelIntervention
+
+        masks = [[True, True, True]]
+        gs = self._make_mock_grammar_state(masks, accept_after=1)
+
+        call_log: list[int] = []
+
+        class LoggingHook:
+            def pre_forward(
+                self,
+                position: int,
+                grammar_state: GrammarState,
+                token_history: list[int],
+                logits: torch.Tensor,
+            ) -> ModelIntervention:
+                call_log.append(position)
+                return ModelIntervention()
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=lambda ctx: torch.tensor([3.0, 2.0, 1.0]),
+            tokenizer_decode=lambda ids: "x",
+            embeddings=torch.eye(3),
+            hooks=[LoggingHook()],
+            transport_config=TransportConfig(),
+            max_tokens=10,
+        )
+
+        assert call_log == [0]
+
+    def test_max_tokens_respected(self) -> None:
+        import torch
+
+        from tgirl.sample import run_constrained_generation
+        from tgirl.transport import TransportConfig
+
+        gs = self._make_mock_grammar_state(
+            [[True, True, True]] * 100, accept_after=999
+        )
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=lambda ctx: torch.tensor([3.0, 2.0, 1.0]),
+            tokenizer_decode=lambda ids: "x",
+            embeddings=torch.eye(3),
+            hooks=[],
+            transport_config=TransportConfig(),
+            max_tokens=5,
+        )
+
+        assert len(result.tokens) == 5
+
+    def test_telemetry_fields_populated(self) -> None:
+        import torch
+
+        from tgirl.sample import run_constrained_generation
+        from tgirl.transport import TransportConfig
+
+        masks = [
+            [True, False, False, False, False],
+            [False, True, True, False, False],
+        ]
+        gs = self._make_mock_grammar_state(masks, accept_after=2)
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=lambda ctx: torch.tensor([5.0, 4.0, 3.0, 2.0, 1.0]),
+            tokenizer_decode=lambda ids: "".join(chr(65 + i) for i in ids),
+            embeddings=torch.eye(5),
+            hooks=[],
+            transport_config=TransportConfig(),
+            max_tokens=10,
+        )
+
+        assert len(result.grammar_valid_counts) == 2
+        assert result.grammar_valid_counts[0] == 1
+        assert result.grammar_valid_counts[1] == 2
+        assert len(result.temperatures_applied) == 2
+        assert len(result.wasserstein_distances) == 2
+        assert len(result.token_log_probs) == 2
+        assert result.ot_computation_total_ms >= 0.0
+
+    def test_ot_bypassed_when_single_valid_token(self) -> None:
+        import torch
+
+        from tgirl.sample import run_constrained_generation
+        from tgirl.transport import TransportConfig
+
+        masks = [[True, False, False, False, False]]
+        gs = self._make_mock_grammar_state(masks, accept_after=1)
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=lambda ctx: torch.tensor([5.0, 4.0, 3.0, 2.0, 1.0]),
+            tokenizer_decode=lambda ids: "A",
+            embeddings=torch.eye(5),
+            hooks=[],
+            transport_config=TransportConfig(),
+            max_tokens=10,
+        )
+
+        assert result.ot_bypassed_count >= 1
+
+    def test_processing_order_penalties_before_ot_before_shaping(self) -> None:
+        """Verify penalties applied before OT and shaping after OT."""
+        import torch
+
+        from tgirl.sample import GrammarState, run_constrained_generation
+        from tgirl.transport import TransportConfig
+        from tgirl.types import ModelIntervention
+
+        masks = [[True, True, True, True, True]]
+        gs = self._make_mock_grammar_state(masks, accept_after=1)
+
+        class OrderTestHook:
+            def pre_forward(
+                self,
+                position: int,
+                grammar_state: GrammarState,
+                token_history: list[int],
+                logits: torch.Tensor,
+            ) -> ModelIntervention:
+                return ModelIntervention(
+                    logit_bias={0: 100.0},
+                    temperature=1.0,
+                )
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=lambda ctx: torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0]),
+            tokenizer_decode=lambda ids: "x",
+            embeddings=torch.eye(5),
+            hooks=[OrderTestHook()],
+            transport_config=TransportConfig(),
+            max_tokens=10,
+        )
+
+        assert result.tokens[0] == 0

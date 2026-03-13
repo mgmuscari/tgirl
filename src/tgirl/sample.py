@@ -6,12 +6,16 @@ and Hy pipeline execution into a dual-mode sampling loop.
 
 from __future__ import annotations
 
+import time
 from collections import Counter
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 import structlog
 import torch
+from pydantic import BaseModel, ConfigDict
 
+from tgirl.transport import TransportConfig, redistribute_logits
 from tgirl.types import ModelIntervention
 
 logger = structlog.get_logger()
@@ -165,3 +169,143 @@ def apply_shaping(
         result.scatter_(0, sorted_indices, sorted_logits)
 
     return result
+
+
+class ConstrainedGenerationResult(BaseModel):
+    """Result of a constrained generation pass."""
+
+    model_config = ConfigDict(frozen=True)
+    tokens: list[int]
+    hy_source: str
+    grammar_valid_counts: list[int]
+    temperatures_applied: list[float]
+    wasserstein_distances: list[float]
+    top_p_applied: list[float]
+    token_log_probs: list[float]
+    ot_computation_total_ms: float
+    ot_bypassed_count: int
+    grammar_generation_ms: float
+
+
+def run_constrained_generation(
+    grammar_state: GrammarState,
+    forward_fn: Callable[[list[int]], torch.Tensor],
+    tokenizer_decode: Callable[[list[int]], str],
+    embeddings: torch.Tensor,
+    hooks: list[InferenceHook],
+    transport_config: TransportConfig,
+    max_tokens: int = 512,
+    context_tokens: list[int] | None = None,
+) -> ConstrainedGenerationResult:
+    """Run constrained token generation until grammar accepts or max_tokens.
+
+    Per-token processing order (TGIRL.md 8.5, penalties moved pre-OT):
+    1. forward_fn(context_tokens) -> raw logits
+    2. grammar_state.get_valid_mask(vocab_size) -> valid_mask
+    3. call all InferenceHooks -> merge_interventions() -> merged
+    4. apply_penalties(logits, intervention, token_history) -> adjusted
+    5. redistribute_logits(adjusted, valid_mask, embeddings, config) -> OT
+    6. apply_shaping(ot_logits, intervention) -> shaped logits
+    7. sample token from shaped logits
+    8. grammar_state.advance(token_id)
+    9. record telemetry
+    """
+    start_time = time.monotonic()
+    tokens: list[int] = []
+    token_history = list(context_tokens) if context_tokens else []
+    grammar_valid_counts: list[int] = []
+    temperatures_applied: list[float] = []
+    wasserstein_distances: list[float] = []
+    top_p_applied: list[float] = []
+    token_log_probs: list[float] = []
+    ot_computation_total_ms = 0.0
+    ot_bypassed_count = 0
+
+    vocab_size = embeddings.shape[0]
+
+    for position in range(max_tokens):
+        # 1. Forward pass
+        raw_logits = forward_fn(token_history)
+
+        # 2. Grammar mask
+        valid_mask = grammar_state.get_valid_mask(vocab_size)
+        valid_count = int(valid_mask.sum().item())
+        grammar_valid_counts.append(valid_count)
+
+        # 3. Hooks
+        interventions = [
+            hook.pre_forward(position, grammar_state, token_history, raw_logits)
+            for hook in hooks
+        ]
+        merged = merge_interventions(interventions)
+
+        # 4. Pre-OT penalties
+        adjusted = apply_penalties(raw_logits, merged, token_history)
+
+        # 5. OT redistribution
+        ot_start = time.monotonic()
+        ot_result = redistribute_logits(
+            adjusted, valid_mask, embeddings, config=transport_config
+        )
+        ot_elapsed_ms = (time.monotonic() - ot_start) * 1000
+        ot_computation_total_ms += ot_elapsed_ms
+        wasserstein_distances.append(ot_result.wasserstein_distance)
+        if ot_result.bypassed:
+            ot_bypassed_count += 1
+
+        # 6. Post-OT shaping
+        shaped = apply_shaping(ot_result.logits, merged)
+
+        # Record temperature and top_p applied
+        temperatures_applied.append(
+            merged.temperature if merged.temperature is not None else -1.0
+        )
+        top_p_applied.append(
+            merged.top_p if merged.top_p is not None else -1.0
+        )
+
+        # 7. Sample token
+        probs = torch.softmax(shaped, dim=-1)
+        probs = torch.clamp(probs, min=0.0)
+        prob_sum = probs.sum()
+        if prob_sum > 0:
+            probs = probs / prob_sum
+        else:
+            # Fallback: uniform over valid tokens
+            probs = valid_mask.float()
+            probs = probs / probs.sum()
+
+        token_id = int(torch.multinomial(probs, 1).item())
+        tokens.append(token_id)
+        token_history.append(token_id)
+
+        # Record log prob
+        log_prob = (
+            torch.log(probs[token_id]).item()
+            if probs[token_id] > 0
+            else float("-inf")
+        )
+        token_log_probs.append(log_prob)
+
+        # 8. Advance grammar
+        grammar_state.advance(token_id)
+
+        # Check if grammar accepts
+        if grammar_state.is_accepting():
+            break
+
+    elapsed_ms = (time.monotonic() - start_time) * 1000
+    hy_source = tokenizer_decode(tokens)
+
+    return ConstrainedGenerationResult(
+        tokens=tokens,
+        hy_source=hy_source,
+        grammar_valid_counts=grammar_valid_counts,
+        temperatures_applied=temperatures_applied,
+        wasserstein_distances=wasserstein_distances,
+        top_p_applied=top_p_applied,
+        token_log_probs=token_log_probs,
+        ot_computation_total_ms=ot_computation_total_ms,
+        ot_bypassed_count=ot_bypassed_count,
+        grammar_generation_ms=elapsed_ms,
+    )
