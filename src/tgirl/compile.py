@@ -13,6 +13,8 @@ Three-layer defense-in-depth:
 from __future__ import annotations
 
 import ast
+import concurrent.futures
+import functools
 import re
 from typing import Any
 
@@ -512,6 +514,56 @@ def _analyze_python_ast(
         )
 
     return None
+
+
+def _run_with_timeout(
+    fn: Any, timeout: float
+) -> Any | PipelineError:
+    """Run a callable with a timeout using ThreadPoolExecutor.
+
+    Returns the result on success, or PipelineError on timeout.
+    """
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1
+    ) as executor:
+        future = executor.submit(fn)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            return PipelineError(
+                stage=STAGE_EXECUTE,
+                error_type="TimeoutError",
+                message=(
+                    f"Execution timed out after {timeout}s"
+                ),
+                hy_source="<timeout>",
+            )
+
+
+def _wrap_with_timeout(
+    fn: Any, timeout: float
+) -> Any:
+    """Wrap a callable with per-tool timeout enforcement.
+
+    The wrapper raises TimeoutError if the call exceeds the timeout.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1
+        ) as executor:
+            future = executor.submit(fn, *args, **kwargs)
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                msg = (
+                    f"Tool '{fn.__name__}' timed out"
+                    f" after {timeout}s"
+                )
+                raise TimeoutError(msg) from None
+
+    return wrapper
 
 
 def _build_sandbox(registry: ToolRegistry) -> dict[str, Any]:

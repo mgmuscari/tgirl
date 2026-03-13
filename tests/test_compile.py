@@ -547,3 +547,49 @@ class TestSandbox:
         code = compile("print('hello')", "<test>", "exec")
         with pytest.raises(NameError):
             exec(code, sandbox)  # noqa: S102
+
+
+class TestTimeoutEnforcement:
+    """Task 7: Timeout enforcement."""
+
+    def test_fast_execution_completes(self) -> None:
+        from tgirl.compile import _run_with_timeout
+
+        result = _run_with_timeout(lambda: 42, timeout=5.0)
+        assert result == 42
+
+    def test_tool_timeout_returns_pipeline_error(self) -> None:
+        import time
+
+        from tgirl.compile import _run_with_timeout
+
+        def slow_fn() -> str:
+            time.sleep(5)
+            return "done"
+
+        result = _run_with_timeout(slow_fn, timeout=0.1)
+        assert isinstance(result, PipelineError)
+        assert result.stage == "execute"
+        assert result.error_type == "TimeoutError"
+
+    def test_wrap_with_timeout(self) -> None:
+        from tgirl.compile import _wrap_with_timeout
+
+        def fast_fn(x: str) -> str:
+            return x.upper()
+
+        wrapped = _wrap_with_timeout(fast_fn, timeout=5.0)
+        assert wrapped("hello") == "HELLO"
+
+    def test_wrapped_tool_timeout(self) -> None:
+        import time
+
+        from tgirl.compile import _wrap_with_timeout
+
+        def slow_fn(x: str) -> str:
+            time.sleep(5)
+            return x
+
+        wrapped = _wrap_with_timeout(slow_fn, timeout=0.1)
+        with pytest.raises(TimeoutError):
+            wrapped("test")
