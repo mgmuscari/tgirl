@@ -263,6 +263,46 @@ class TestHyAstAnalysis:
         result = _analyze_hy_ast(trees, {"greet"})
         assert isinstance(result, PipelineError)
 
+    def test_defmacro_g_bang_rejected(self) -> None:
+        """defmacro/g! executes at compile time — must be blocked."""
+        from tgirl.compile import _analyze_hy_ast
+
+        trees = self._parse("(defmacro/g! evil [] None)")
+        result = _analyze_hy_ast(trees, {"greet"})
+        assert isinstance(result, PipelineError)
+        assert result.stage == "static_analysis"
+        assert result.error_type == "DisallowedForm"
+
+    def test_eval_and_compile_rejected(self) -> None:
+        """eval-and-compile executes at compile time — must be blocked."""
+        from tgirl.compile import _analyze_hy_ast
+
+        trees = self._parse('(eval-and-compile (import os))')
+        result = _analyze_hy_ast(trees, {"greet"})
+        assert isinstance(result, PipelineError)
+        assert result.stage == "static_analysis"
+        assert result.error_type == "DisallowedForm"
+
+    def test_eval_when_compile_rejected(self) -> None:
+        """eval-when-compile executes at compile time — must be blocked."""
+        from tgirl.compile import _analyze_hy_ast
+
+        trees = self._parse('(eval-when-compile (import os))')
+        result = _analyze_hy_ast(trees, {"greet"})
+        assert isinstance(result, PipelineError)
+        assert result.stage == "static_analysis"
+        assert result.error_type == "DisallowedForm"
+
+    def test_include_rejected(self) -> None:
+        """include loads files at compile time — must be blocked."""
+        from tgirl.compile import _analyze_hy_ast
+
+        trees = self._parse('(include "evil.hy")')
+        result = _analyze_hy_ast(trees, {"greet"})
+        assert isinstance(result, PipelineError)
+        assert result.stage == "static_analysis"
+        assert result.error_type == "DisallowedForm"
+
     def test_pmap_operator_accepted(self) -> None:
         from tgirl.compile import _analyze_hy_ast
 

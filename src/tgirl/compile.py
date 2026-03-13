@@ -194,13 +194,17 @@ _DANGEROUS_BUILTINS = frozenset({
     "__import__", "open", "getattr", "setattr", "delattr",
 })
 
-# Definition forms that are not allowed (no recursive definitions)
-_DEFINITION_FORMS = frozenset({
-    "defn", "defmacro", "defclass", "deftype",
+# All disallowed forms: definitions, imports, and compile-time metaprogramming.
+# These must be blocked before hy.compile() — macros and eval-* forms execute
+# at compile time, bypassing the Python AST analyzer and sandbox entirely.
+_DISALLOWED_FORMS = frozenset({
+    # Definition forms (no recursive definitions)
+    "defn", "defmacro", "defmacro/g!", "defclass", "deftype",
+    # Import-like forms
+    "import", "require", "include",
+    # Compile-time metaprogramming (macro-expansion trap)
+    "eval-and-compile", "eval-when-compile",
 })
-
-# Import-like forms
-_IMPORT_FORMS = frozenset({"import", "require"})
 
 
 def _analyze_hy_ast(
@@ -225,17 +229,9 @@ def _analyze_hy_ast(
             if isinstance(head, Symbol):
                 name = str(head)
 
-                # Check import/require forms
-                if name in _IMPORT_FORMS:
-                    return PipelineError(
-                        stage=STAGE_STATIC_ANALYSIS,
-                        error_type="DisallowedForm",
-                        message=f"'{name}' form is not allowed",
-                        hy_source=str(node),
-                    )
-
-                # Check definition forms
-                if name in _DEFINITION_FORMS:
+                # Check disallowed forms (definitions, imports,
+                # compile-time metaprogramming)
+                if name in _DISALLOWED_FORMS:
                     return PipelineError(
                         stage=STAGE_STATIC_ANALYSIS,
                         error_type="DisallowedForm",
