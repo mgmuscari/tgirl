@@ -152,6 +152,8 @@ def _expand_macros(tree: Object) -> Object:
     Hy 1.2 does not expand ``->`` as a macro during compilation,
     so we do it manually before calling hy_compile.
     """
+    if isinstance(tree, List):
+        return List([_expand_macros(child) for child in tree])
     if not isinstance(tree, Expression) or len(tree) < 2:
         return tree
 
@@ -174,10 +176,12 @@ def _expand_macros(tree: Object) -> Object:
                 result = Expression([form, result])
         return result
 
-    # Recurse into sub-expressions
+    # Recurse into sub-expressions and lists
     return Expression(
         [
-            _expand_macros(x) if isinstance(x, Expression) else x
+            _expand_macros(x)
+            if isinstance(x, (Expression, List))
+            else x
             for x in tree
         ]
     )

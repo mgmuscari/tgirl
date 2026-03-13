@@ -562,6 +562,27 @@ class TestCompositionOperators:
         assert len(expanded) == 3  # tool1, "x", "extra"
 
 
+    def test_expand_threading_inside_list(self) -> None:
+        """Threading inside a pmap list must be expanded."""
+        import hy
+        from hy.models import Expression, List
+
+        from tgirl.compile import _expand_macros
+
+        trees = list(hy.read_many('(pmap [(-> x (tool1) (tool2)) tool3] arg)'))
+        expanded = _expand_macros(trees[0])
+        # pmap's first arg is a List
+        assert isinstance(expanded[1], List)
+        # First element of the list should be expanded threading
+        first_fn = expanded[1][0]
+        assert isinstance(first_fn, Expression)
+        # (-> x (tool1) (tool2)) becomes (tool2 (tool1 x))
+        assert str(first_fn[0]) == "tool2"
+        inner = first_fn[1]
+        assert isinstance(inner, Expression)
+        assert str(inner[0]) == "tool1"
+
+
 class TestSandbox:
     """Task 6: Sandbox construction."""
 
