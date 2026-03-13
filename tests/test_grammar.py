@@ -1070,3 +1070,161 @@ class TestDiff:
         result = diff(out1, out2)
         # The param type production should differ
         assert len(result.changed) > 0
+
+
+# --- Routing grammar ---
+
+
+class TestRoutingGrammar:
+    """Verify generate_routing_grammar() for tool re-ranking."""
+
+    def test_routing_grammar_contains_all_tool_names(self) -> None:
+        import time
+
+        from tgirl.grammar import generate_routing_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tools = tuple(
+            ToolDefinition(
+                name=name,
+                parameters=(
+                    ParameterDef(
+                        name="x", type_repr=PrimitiveType(kind="str")
+                    ),
+                ),
+                return_type=PrimitiveType(kind="str"),
+                description=f"Tool {name}",
+            )
+            for name in ["get_field", "set_field", "delete_field"]
+        )
+        snap = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        grammar_text = generate_routing_grammar(snap)
+        assert '"get_field"' in grammar_text
+        assert '"set_field"' in grammar_text
+        assert '"delete_field"' in grammar_text
+
+    def test_routing_grammar_tool_names_as_quoted_alternatives(self) -> None:
+        import time
+
+        from tgirl.grammar import generate_routing_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tools = tuple(
+            ToolDefinition(
+                name=name,
+                parameters=(
+                    ParameterDef(
+                        name="x", type_repr=PrimitiveType(kind="str")
+                    ),
+                ),
+                return_type=PrimitiveType(kind="str"),
+            )
+            for name in ["alpha", "beta"]
+        )
+        snap = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        grammar_text = generate_routing_grammar(snap)
+        assert '"alpha" | "beta"' in grammar_text
+
+    def test_routing_grammar_raises_for_empty_snapshot(self) -> None:
+        import time
+
+        from tgirl.grammar import generate_routing_grammar
+        from tgirl.types import RegistrySnapshot
+
+        snap = RegistrySnapshot(
+            tools=(),
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        with pytest.raises(ValueError, match="empty snapshot"):
+            generate_routing_grammar(snap)
+
+    def test_routing_grammar_single_tool(self) -> None:
+        import time
+
+        from tgirl.grammar import generate_routing_grammar
+        from tgirl.types import (
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tool = ToolDefinition(
+            name="only_tool",
+            parameters=(),
+            return_type=PrimitiveType(kind="str"),
+        )
+        snap = RegistrySnapshot(
+            tools=(tool,),
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        grammar_text = generate_routing_grammar(snap)
+        assert '"only_tool"' in grammar_text
+        # No pipe since single alternative
+        assert "|" not in grammar_text
+
+    def test_routing_grammar_deterministic(self) -> None:
+        import time
+
+        from tgirl.grammar import generate_routing_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tools = tuple(
+            ToolDefinition(
+                name=name,
+                parameters=(
+                    ParameterDef(
+                        name="x", type_repr=PrimitiveType(kind="str")
+                    ),
+                ),
+                return_type=PrimitiveType(kind="str"),
+            )
+            for name in ["alpha", "beta", "gamma"]
+        )
+        snap1 = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=1000.0,
+        )
+        snap2 = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=2000.0,
+        )
+        assert generate_routing_grammar(snap1) == generate_routing_grammar(snap2)
