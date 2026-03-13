@@ -834,6 +834,10 @@ class TestFullPipeline:
             msg = "tool failure"
             raise RuntimeError(msg)
 
+        @reg.tool()
+        def exit_tool(text: str) -> str:
+            raise SystemExit(0)
+
         return reg
 
     def test_simple_tool_call(
@@ -897,6 +901,31 @@ class TestFullPipeline:
         r2 = run_pipeline('(evil "x")', registry)
         assert isinstance(r2, PipelineError)
         assert r2.stage == "static_analysis"
+
+    def test_system_exit_caught(
+        self, registry: ToolRegistry
+    ) -> None:
+        """SystemExit must not kill the host process."""
+        from tgirl.compile import run_pipeline
+
+        result = run_pipeline('(exit_tool "test")', registry)
+        assert isinstance(result, PipelineError)
+        assert result.stage == "execute"
+
+    def test_keyboard_interrupt_propagates(
+        self, registry: ToolRegistry
+    ) -> None:
+        """KeyboardInterrupt must NOT be caught — Ctrl+C must work."""
+        from tgirl.compile import run_pipeline
+
+        reg = ToolRegistry()
+
+        @reg.tool()
+        def interrupt_tool(text: str) -> str:
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            run_pipeline('(interrupt_tool "test")', reg)
 
     def test_threading_pipeline(
         self, registry: ToolRegistry

@@ -798,7 +798,7 @@ def run_pipeline(
     def _execute() -> Any:
         try:
             exec(bytecode, sandbox)  # noqa: S102
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             return PipelineError(
                 stage=STAGE_EXECUTE,
                 error_type=type(exc).__name__,
