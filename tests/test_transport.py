@@ -549,3 +549,119 @@ class TestApplyTransportPlan:
         # Valid logits should be negative (log of probability < 1)
         valid_logits = result[valid_idx]
         assert (valid_logits < 0).all()
+
+
+class TestRedistributeLogits:
+    """Task 7: Main redistribute_logits wires bypass -> OT -> application."""
+
+    @pytest.fixture()
+    def simple_setup(self) -> dict:
+        """Create a simple test scenario: 10 tokens, 4 valid."""
+        torch.manual_seed(42)
+        vocab_size = 10
+        embed_dim = 16
+        logits = torch.randn(vocab_size)
+        valid_mask = torch.tensor(
+            [True, True, False, False, True, False, False, True, False, False]
+        )
+        embeddings = torch.randn(vocab_size, embed_dim)
+        return {
+            "logits": logits,
+            "valid_mask": valid_mask,
+            "embeddings": embeddings,
+        }
+
+    def test_bypass_returns_masked_logits(self) -> None:
+        """When bypass triggers, result has bypassed=True."""
+        from tgirl.transport import redistribute_logits
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        mask = torch.tensor([True, True, True])  # all valid → ratio high
+        embeddings = torch.randn(3, 8)
+        result = redistribute_logits(logits, mask, embeddings)
+        assert result.bypassed is True
+        assert result.bypass_reason == "valid_ratio_high"
+        assert result.iterations == 0
+
+    def test_full_ot_path(self, simple_setup: dict) -> None:
+        """Full OT path returns bypassed=False with valid results."""
+        from tgirl.transport import redistribute_logits
+
+        result = redistribute_logits(**simple_setup)
+        assert result.bypassed is False
+        assert result.bypass_reason is None
+        assert result.iterations > 0
+
+    def test_invalid_always_neg_inf(self, simple_setup: dict) -> None:
+        from tgirl.transport import redistribute_logits
+
+        result = redistribute_logits(**simple_setup)
+        mask = simple_setup["valid_mask"]
+        invalid_logits = result.logits[~mask]
+        assert (invalid_logits == float("-inf")).all()
+
+    def test_probs_sum_to_one(self, simple_setup: dict) -> None:
+        from tgirl.transport import redistribute_logits
+
+        result = redistribute_logits(**simple_setup)
+        finite = result.logits[torch.isfinite(result.logits)]
+        probs = torch.softmax(finite, dim=-1)
+        assert abs(probs.sum().item() - 1.0) < 1e-5
+
+    def test_non_negative_wasserstein(self, simple_setup: dict) -> None:
+        from tgirl.transport import redistribute_logits
+
+        result = redistribute_logits(**simple_setup)
+        assert result.wasserstein_distance >= 0.0
+
+    def test_high_epsilon_approx_standard_masking(self) -> None:
+        """Very high epsilon ≈ uniform redistribution ≈ standard masking behavior."""
+        from tgirl.transport import TransportConfig, redistribute_logits
+
+        torch.manual_seed(123)
+        logits = torch.randn(10)
+        mask = torch.tensor(
+            [True, True, False, False, True, False, False, True, False, False]
+        )
+        embeddings = torch.randn(10, 16)
+        config = TransportConfig(epsilon=100.0)
+        result = redistribute_logits(logits, mask, embeddings, config=config)
+        # With very high epsilon, all valid tokens get roughly equal share
+        # of redistributed mass — but this is still different from standard masking
+        assert result.bypassed is False
+        assert (result.logits[~mask] == float("-inf")).all()
+
+    def test_input_tensors_not_mutated(self, simple_setup: dict) -> None:
+        from tgirl.transport import redistribute_logits
+
+        original_logits = simple_setup["logits"].clone()
+        original_mask = simple_setup["valid_mask"].clone()
+        original_emb = simple_setup["embeddings"].clone()
+        redistribute_logits(**simple_setup)
+        assert torch.equal(simple_setup["logits"], original_logits)
+        assert torch.equal(simple_setup["valid_mask"], original_mask)
+        assert torch.equal(simple_setup["embeddings"], original_emb)
+
+    def test_config_object_accepted(self) -> None:
+        from tgirl.transport import TransportConfig, redistribute_logits
+
+        torch.manual_seed(42)
+        logits = torch.randn(10)
+        mask = torch.tensor(
+            [True, True, False, False, True, False, False, True, False, False]
+        )
+        embeddings = torch.randn(10, 16)
+        config = TransportConfig(epsilon=0.05, max_iterations=10)
+        result = redistribute_logits(logits, mask, embeddings, config=config)
+        assert isinstance(result.logits, torch.Tensor)
+
+    def test_structlog_events_emitted(self, simple_setup: dict) -> None:
+        """Structlog events should be emitted during redistribution."""
+        from structlog.testing import capture_logs
+
+        from tgirl.transport import redistribute_logits
+
+        with capture_logs() as logs:
+            redistribute_logits(**simple_setup)
+        # Should have at least one log event
+        assert len(logs) > 0

@@ -217,3 +217,108 @@ def _apply_transport_plan(
     result[valid_indices] = torch.log(combined_probs)
 
     return result
+
+
+def redistribute_logits(
+    logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+    embeddings: torch.Tensor,
+    epsilon: float = 0.1,
+    max_iterations: int = 20,
+    convergence_threshold: float = 1e-6,
+    config: TransportConfig | None = None,
+) -> TransportResult:
+    """Redistribute probability mass from invalid to valid tokens using OT.
+
+    Accepts either individual parameters or a TransportConfig object.
+    Config takes precedence over individual params when provided.
+
+    Args:
+        logits: Raw logit tensor of shape (vocab_size,).
+        valid_mask: Boolean mask of valid tokens.
+        embeddings: Token embedding matrix of shape (vocab_size, embed_dim).
+        epsilon: Entropic regularization (ignored if config provided).
+        max_iterations: Max Sinkhorn iterations (ignored if config provided).
+        convergence_threshold: Convergence threshold (ignored if config provided).
+        config: TransportConfig object (overrides individual params).
+
+    Returns:
+        TransportResult with redistributed logits.
+    """
+    cfg = config or TransportConfig(
+        epsilon=epsilon,
+        max_iterations=max_iterations,
+        convergence_threshold=convergence_threshold,
+    )
+
+    # Work on clones to avoid mutating inputs
+    logits = logits.clone()
+
+    # Check bypass conditions
+    should_bypass, bypass_reason = _check_bypass(logits, valid_mask, cfg)
+    if should_bypass:
+        logger.debug(
+            "transport_bypass",
+            reason=bypass_reason,
+            n_valid=valid_mask.sum().item(),
+        )
+        masked = _standard_masking(logits, valid_mask)
+        return TransportResult(
+            logits=masked,
+            wasserstein_distance=0.0,
+            bypassed=True,
+            bypass_reason=bypass_reason,
+            iterations=0,
+        )
+
+    # Full OT path
+    vocab_size = logits.shape[0]
+    invalid_indices = torch.where(~valid_mask)[0]
+    valid_indices = torch.where(valid_mask)[0]
+
+    # Compute source mass (probability on invalid tokens)
+    probs = torch.softmax(logits, dim=-1)
+    source_mass = probs[invalid_indices]
+    source_mass = source_mass / source_mass.sum()  # normalize to valid dist
+
+    # Target capacity: proportional to valid token probabilities
+    target_capacity = probs[valid_indices]
+    target_capacity = target_capacity / target_capacity.sum()
+
+    # Compute cost submatrix
+    cost = _compute_cost_submatrix(embeddings, invalid_indices, valid_indices)
+
+    # Run Sinkhorn
+    logger.debug(
+        "transport_sinkhorn_start",
+        n_invalid=len(invalid_indices),
+        n_valid=len(valid_indices),
+        epsilon=cfg.epsilon,
+    )
+    plan, wasserstein, iterations = _sinkhorn_log_domain(
+        cost, source_mass, target_capacity,
+        cfg.epsilon, cfg.max_iterations, cfg.convergence_threshold,
+    )
+
+    # Scale plan by total invalid mass
+    total_invalid_mass = probs[invalid_indices].sum()
+    plan = plan * total_invalid_mass
+
+    # Apply transport plan
+    result_logits = _apply_transport_plan(
+        plan, valid_indices, logits, vocab_size
+    )
+
+    logger.debug(
+        "transport_complete",
+        wasserstein_distance=wasserstein,
+        iterations=iterations,
+    )
+
+    return TransportResult(
+        logits=result_logits,
+        wasserstein_distance=wasserstein,
+        bypassed=False,
+        bypass_reason=None,
+        iterations=iterations,
+    )
