@@ -114,6 +114,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     from mlx_lm import load as mlx_load
 
     from tgirl.bfcl import load_test_data, register_bfcl_tools, sexpr_to_bfcl
+    from tgirl.cache import CacheStats, make_mlx_forward_fn
     from tgirl.format import ChatTemplateFormatter
     from tgirl.outlines_adapter import make_outlines_grammar_factory
     from tgirl.registry import ToolRegistry
@@ -131,12 +132,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
     embeddings = torch.from_numpy(np.array(mlx_embed, copy=False))
     log.info("model_loaded", vocab_size=embeddings.shape[0])
 
-    def forward_fn(token_ids: list[int]) -> torch.Tensor:
-        input_ids = mx.array([token_ids])
-        logits = mlx_model(input_ids)
-        last = logits[0, -1, :].astype(mx.float32)
-        mx.eval(last)
-        return torch.from_numpy(np.array(last, copy=False))
+    cache_stats = CacheStats()
+    forward_fn = make_mlx_forward_fn(mlx_model, stats=cache_stats)
 
     # --- 2. Grammar factory + formatter ---
     grammar_factory = make_outlines_grammar_factory(hf_tokenizer)
@@ -257,6 +254,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
     if n > 0:
         print(f"  Avg per entry:      {round(total_ms / n)}ms")
     print(f"  Results at:         {result_path}")
+    print(f"  Cache hits:         {cache_stats.hits}")
+    print(f"  Cache misses:       {cache_stats.misses}")
+    print(f"  Cache resets:       {cache_stats.resets}")
+    print(f"  Tokens saved:       {cache_stats.tokens_saved}")
     print("=" * 70)
 
     # --- 10. Optional: run BFCL AST checker ---
