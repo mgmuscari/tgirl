@@ -5,6 +5,25 @@ from __future__ import annotations
 import pytest
 
 
+class TestTopLevelExports:
+    """PromptFormatter, PlainFormatter, ChatTemplateFormatter are exported from tgirl."""
+
+    def test_prompt_formatter_exported(self) -> None:
+        from tgirl import PromptFormatter
+
+        assert PromptFormatter is not None
+
+    def test_plain_formatter_exported(self) -> None:
+        from tgirl import PlainFormatter
+
+        assert PlainFormatter is not None
+
+    def test_chat_template_formatter_exported(self) -> None:
+        from tgirl import ChatTemplateFormatter
+
+        assert ChatTemplateFormatter is not None
+
+
 class TestPromptFormatterProtocol:
     """PromptFormatter is a runtime-checkable Protocol in types.py."""
 

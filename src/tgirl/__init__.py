@@ -2,6 +2,10 @@
 
 from annotated_types import Ge, Gt, Le, Lt, MultipleOf
 
+from tgirl.format import (
+    ChatTemplateFormatter,
+    PlainFormatter,
+)
 from tgirl.compile import (
     CompileConfig,
     InsufficientResources,
@@ -42,6 +46,7 @@ from tgirl.transport import (
 )
 from tgirl.types import (
     AnnotatedType,
+    PromptFormatter,
     AnyType,
     ConstraintRepr,
     DictType,
@@ -69,6 +74,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AnnotatedType",
+    "ChatTemplateFormatter",
     "CompileConfig",
     "ConstrainedGenerationResult",
     "AnyType",
@@ -97,7 +103,9 @@ __all__ = [
     "ParameterDef",
     "PipelineError",
     "PipelineResult",
+    "PlainFormatter",
     "PrimitiveType",
+    "PromptFormatter",
     "RegistrySnapshot",
     "RerankConfig",
     "RerankResult",
