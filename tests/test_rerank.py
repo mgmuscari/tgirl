@@ -403,3 +403,117 @@ class TestToolRouterValidation:
 
         with pytest.raises(ValueError, match="not in valid tool set"):
             router.route(snap, context_tokens=[1, 2])
+
+
+class TestToolRouterMlxPath:
+    """Tests for MLX backend dispatch in ToolRouter."""
+
+    def test_router_torch_path_unchanged(self) -> None:
+        """Torch backend router works as before."""
+        from tgirl.rerank import ToolRouter
+
+        mock_gs = _make_mock_grammar_state()
+        factory = MagicMock(return_value=mock_gs)
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        decode = MagicMock(return_value="alpha")
+        embeddings = torch.randn(100, 32)
+
+        router = ToolRouter(
+            grammar_guide_factory=factory,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            backend="torch",
+        )
+        snap = _make_snapshot(["alpha", "beta"])
+        result = router.route(snap, context_tokens=[1, 2])
+
+        assert "alpha" in result.selected_tools
+
+    def test_router_mlx_path(self) -> None:
+        """MLX backend router dispatches to run_constrained_generation_mlx."""
+        from tgirl.rerank import ToolRouter
+
+        mock_gs = _make_mock_grammar_state()
+        factory = MagicMock(return_value=mock_gs)
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        decode = MagicMock(return_value="alpha")
+        embeddings = torch.randn(100, 32)
+
+        router = ToolRouter(
+            grammar_guide_factory=factory,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            backend="mlx",
+        )
+        snap = _make_snapshot(["alpha", "beta"])
+
+        with patch(
+            "tgirl.sample_mlx.run_constrained_generation_mlx"
+        ) as mock_gen_mlx:
+            from tgirl.sample import ConstrainedGenerationResult
+
+            mock_gen_mlx.return_value = ConstrainedGenerationResult(
+                tokens=[5],
+                hy_source="alpha",
+                grammar_valid_counts=[2],
+                temperatures_applied=[0.3],
+                wasserstein_distances=[0.0],
+                top_p_applied=[-1.0],
+                token_log_probs=[-0.5],
+                ot_computation_total_ms=1.0,
+                ot_bypassed_count=0,
+                grammar_generation_ms=5.0,
+            )
+            result = router.route(snap, context_tokens=[1, 2])
+
+            mock_gen_mlx.assert_called_once()
+            assert "alpha" in result.selected_tools
+
+    def test_router_mlx_embeddings_lazy_conversion(self) -> None:
+        """Torch embeddings converted to mx.array on first MLX route."""
+        import mlx.core as mx
+
+        from tgirl.rerank import ToolRouter
+
+        mock_gs = _make_mock_grammar_state()
+        factory = MagicMock(return_value=mock_gs)
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        decode = MagicMock(return_value="alpha")
+        embeddings = torch.randn(100, 32)
+
+        router = ToolRouter(
+            grammar_guide_factory=factory,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            backend="mlx",
+        )
+
+        # Before first route, _embeddings_mlx should be None
+        assert router._embeddings_mlx is None
+
+        snap = _make_snapshot(["alpha", "beta"])
+
+        with patch(
+            "tgirl.sample_mlx.run_constrained_generation_mlx"
+        ) as mock_gen_mlx:
+            from tgirl.sample import ConstrainedGenerationResult
+
+            mock_gen_mlx.return_value = ConstrainedGenerationResult(
+                tokens=[5],
+                hy_source="alpha",
+                grammar_valid_counts=[2],
+                temperatures_applied=[0.3],
+                wasserstein_distances=[0.0],
+                top_p_applied=[-1.0],
+                token_log_probs=[-0.5],
+                ot_computation_total_ms=1.0,
+                ot_bypassed_count=0,
+                grammar_generation_ms=5.0,
+            )
+            router.route(snap, context_tokens=[1, 2])
+
+        # After first route, should have mx.array embeddings
+        assert isinstance(router._embeddings_mlx, mx.array)

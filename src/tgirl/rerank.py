@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from typing import Any, Literal
 
 import structlog
 import torch
@@ -26,16 +27,19 @@ class ToolRouter:
     def __init__(
         self,
         grammar_guide_factory: Callable[[str], GrammarState],
-        forward_fn: Callable[[list[int]], torch.Tensor],
+        forward_fn: Callable[[list[int]], Any],
         tokenizer_decode: Callable[[list[int]], str],
-        embeddings: torch.Tensor,
+        embeddings: torch.Tensor | Any,
         config: RerankConfig | None = None,
+        backend: Literal["torch", "mlx"] = "torch",
     ) -> None:
         self._grammar_guide_factory = grammar_guide_factory
         self._forward_fn = forward_fn
         self._tokenizer_decode = tokenizer_decode
         self._embeddings = embeddings
         self._config = config or RerankConfig()
+        self._backend = backend
+        self._embeddings_mlx: Any = None  # Lazy-converted on first MLX route
         # Cache compiled routing grammar states, keyed on sorted tool names.
         # Stores grammar TEXT (not mutable GrammarState objects) to allow
         # fresh GrammarState creation per route() call.
@@ -100,7 +104,7 @@ class ToolRouter:
                 routing_grammar_text="",
             )
 
-        # Step 3: Use context_tokens as-is (caller provides pre-formatted routing context)
+        # Step 3: Use context_tokens as-is (caller provides routing context)
         routing_context_tokens = list(context_tokens)
 
         # Step 4: Get routing grammar text (with caching)
@@ -117,16 +121,40 @@ class ToolRouter:
 
         # Step 6: Run constrained generation with empty hooks
         tc = transport_config or TransportConfig()
-        gen_result = run_constrained_generation(
-            grammar_state=grammar_state,
-            forward_fn=self._forward_fn,
-            tokenizer_decode=self._tokenizer_decode,
-            embeddings=self._embeddings,
-            hooks=[],
-            transport_config=tc,
-            max_tokens=self._config.max_tokens,
-            context_tokens=routing_context_tokens,
-        )
+        if self._backend == "mlx":
+            from tgirl.sample_mlx import run_constrained_generation_mlx
+
+            # Lazy-convert embeddings to mx.array once
+            if self._embeddings_mlx is None:
+                import mlx.core as mx
+                if isinstance(self._embeddings, torch.Tensor):
+                    self._embeddings_mlx = mx.array(
+                        self._embeddings.numpy()
+                    )
+                else:
+                    self._embeddings_mlx = self._embeddings
+
+            gen_result = run_constrained_generation_mlx(
+                grammar_state=grammar_state,
+                forward_fn=self._forward_fn,
+                tokenizer_decode=self._tokenizer_decode,
+                embeddings=self._embeddings_mlx,
+                hooks=[],
+                transport_config=tc,
+                max_tokens=self._config.max_tokens,
+                context_tokens=routing_context_tokens,
+            )
+        else:
+            gen_result = run_constrained_generation(
+                grammar_state=grammar_state,
+                forward_fn=self._forward_fn,
+                tokenizer_decode=self._tokenizer_decode,
+                embeddings=self._embeddings,
+                hooks=[],
+                transport_config=tc,
+                max_tokens=self._config.max_tokens,
+                context_tokens=routing_context_tokens,
+            )
 
         # Step 7: Parse and validate output
         selected_tool = gen_result.hy_source.strip()
