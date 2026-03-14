@@ -1111,7 +1111,8 @@ class TestSamplingSessionRunChat:
         # Verify that encode was called with formatted text
         assert len(encode_calls) >= 1
 
-    def test_run_chat_stores_last_user_content(self) -> None:
+    def test_run_chat_captures_and_clears_last_user_content(self) -> None:
+        """run_chat() sets _last_user_content for routing, run() consumes and clears it."""
         import torch
 
         from tgirl.format import PlainFormatter
@@ -1140,11 +1141,11 @@ class TestSamplingSessionRunChat:
         )
 
         messages = [
-            {"role": "system", "content": "Be helpful."},
             {"role": "user", "content": "What tools are available?"},
         ]
         session.run_chat(messages)
-        assert session._last_user_content == "What tools are available?"
+        # After run_chat() completes, _last_user_content is consumed and cleared
+        assert session._last_user_content is None
 
     def test_run_chat_requires_formatter(self) -> None:
         import torch

@@ -429,10 +429,12 @@ class SamplingSession:
 
         Generates a system prompt from the registry snapshot, prepends it,
         formats via the configured PromptFormatter, encodes, and delegates
-        to run().
+        to run(). Callers should not include their own system message —
+        run_chat() always prepends the registry-generated system prompt.
 
         Args:
-            messages: Chat messages (role/content dicts).
+            messages: Chat messages (role/content dicts). Should not
+                include a system message; one will be generated automatically.
 
         Returns:
             SamplingResult from the sampling loop.
@@ -467,7 +469,15 @@ class SamplingSession:
         return self.run(prompt_tokens)
 
     def run(self, prompt_tokens: list[int]) -> SamplingResult:
-        """Run the full dual-mode sampling loop."""
+        """Run the full dual-mode sampling loop.
+
+        Note: _last_user_content is consumed and cleared here. It is only
+        valid when set by run_chat() immediately before this call.
+        """
+        # Capture and clear routing state to prevent stale leaks
+        last_user_content = self._last_user_content
+        self._last_user_content = None
+
         # Deferred imports to break circular dependency at module level
         from tgirl.compile import run_pipeline
         from tgirl.grammar import generate as generate_grammar
@@ -541,13 +551,13 @@ class SamplingSession:
             )
             if rerank_active:
                 # Build routing context tokens
-                if self._formatter is not None and self._last_user_content is not None:
+                if self._formatter is not None and last_user_content is not None:
                     from tgirl.instructions import generate_routing_prompt
 
                     routing_prompt = generate_routing_prompt(snapshot)
                     routing_messages = [
                         {"role": "system", "content": routing_prompt},
-                        {"role": "user", "content": self._last_user_content},
+                        {"role": "user", "content": last_user_content},
                     ]
                     routing_context = self._encode(
                         self._formatter.format_messages(routing_messages)
