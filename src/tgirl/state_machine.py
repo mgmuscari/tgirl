@@ -276,6 +276,9 @@ class Checkpoint(BaseModel):
     context_tokens: tuple[int, ...]
     grammar_text: str
     dead_end_tokens: frozenset[int]
+    best_tokens: tuple[int, ...] = ()
+    best_mean_log_prob: float = float("-inf")
+    attempts: int = 0
 
     def with_added_dead_end(self, token_id: int) -> Checkpoint:
         """Return a new Checkpoint with an additional dead-end token."""
@@ -285,6 +288,36 @@ class Checkpoint(BaseModel):
             context_tokens=self.context_tokens,
             grammar_text=self.grammar_text,
             dead_end_tokens=self.dead_end_tokens | {token_id},
+            best_tokens=self.best_tokens,
+            best_mean_log_prob=self.best_mean_log_prob,
+            attempts=self.attempts,
+        )
+
+    def with_attempt(
+        self, tokens: tuple[int, ...], mean_log_prob: float
+    ) -> Checkpoint:
+        """Return new Checkpoint with updated best if better."""
+        new_attempts = self.attempts + 1
+        if mean_log_prob > self.best_mean_log_prob:
+            return Checkpoint(
+                position=self.position,
+                tokens_so_far=self.tokens_so_far,
+                context_tokens=self.context_tokens,
+                grammar_text=self.grammar_text,
+                dead_end_tokens=self.dead_end_tokens,
+                best_tokens=tokens,
+                best_mean_log_prob=mean_log_prob,
+                attempts=new_attempts,
+            )
+        return Checkpoint(
+            position=self.position,
+            tokens_so_far=self.tokens_so_far,
+            context_tokens=self.context_tokens,
+            grammar_text=self.grammar_text,
+            dead_end_tokens=self.dead_end_tokens,
+            best_tokens=self.best_tokens,
+            best_mean_log_prob=self.best_mean_log_prob,
+            attempts=new_attempts,
         )
 
 

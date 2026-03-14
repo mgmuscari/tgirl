@@ -696,6 +696,98 @@ class TestCheckpoint:
         assert cp.dead_end_tokens == frozenset({42})
 
 
+class TestCheckpointBestSoFar:
+    """Best-so-far tracking on Checkpoint model."""
+
+    def test_best_fields_default_values(self) -> None:
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=0,
+            tokens_so_far=(),
+            context_tokens=(),
+            grammar_text="",
+            dead_end_tokens=frozenset(),
+        )
+        assert cp.best_tokens == ()
+        assert cp.best_mean_log_prob == float("-inf")
+        assert cp.attempts == 0
+
+    def test_with_attempt_updates_best_when_better(self) -> None:
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=0,
+            tokens_so_far=(),
+            context_tokens=(),
+            grammar_text="",
+            dead_end_tokens=frozenset(),
+        )
+        cp2 = cp.with_attempt(tokens=(10, 20, 30), mean_log_prob=-0.5)
+        assert cp2.best_tokens == (10, 20, 30)
+        assert cp2.best_mean_log_prob == -0.5
+        assert cp2.attempts == 1
+
+    def test_with_attempt_keeps_best_when_worse(self) -> None:
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=0,
+            tokens_so_far=(),
+            context_tokens=(),
+            grammar_text="",
+            dead_end_tokens=frozenset(),
+            best_tokens=(10, 20),
+            best_mean_log_prob=-0.3,
+            attempts=1,
+        )
+        cp2 = cp.with_attempt(tokens=(99, 98), mean_log_prob=-1.0)
+        assert cp2.best_tokens == (10, 20)  # kept original
+        assert cp2.best_mean_log_prob == -0.3  # kept original
+        assert cp2.attempts == 2  # incremented
+
+    def test_with_attempt_replaces_when_strictly_better(self) -> None:
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=0,
+            tokens_so_far=(),
+            context_tokens=(),
+            grammar_text="",
+            dead_end_tokens=frozenset(),
+            best_tokens=(10,),
+            best_mean_log_prob=-0.5,
+            attempts=1,
+        )
+        cp2 = cp.with_attempt(tokens=(20, 30), mean_log_prob=-0.2)
+        assert cp2.best_tokens == (20, 30)
+        assert cp2.best_mean_log_prob == -0.2
+        assert cp2.attempts == 2
+
+    def test_with_attempt_returns_new_checkpoint(self) -> None:
+        """with_attempt returns a new Checkpoint, original unchanged."""
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=5,
+            tokens_so_far=(1, 2),
+            context_tokens=(100,),
+            grammar_text="test",
+            dead_end_tokens=frozenset({42}),
+        )
+        cp2 = cp.with_attempt(tokens=(10,), mean_log_prob=-0.5)
+        # Original unchanged
+        assert cp.best_tokens == ()
+        assert cp.best_mean_log_prob == float("-inf")
+        assert cp.attempts == 0
+        # New checkpoint preserves other fields
+        assert cp2.position == 5
+        assert cp2.tokens_so_far == (1, 2)
+        assert cp2.context_tokens == (100,)
+        assert cp2.grammar_text == "test"
+        assert cp2.dead_end_tokens == frozenset({42})
+
+
 class TestBacktrackEvent:
     """BacktrackEvent records a single backtrack occurrence."""
 
