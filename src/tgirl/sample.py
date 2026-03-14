@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from tgirl.registry import ToolRegistry
-    from tgirl.state_machine import TransitionPolicy
+    from tgirl.state_machine import Checkpoint, TransitionPolicy
     from tgirl.types import PromptFormatter
 
 import structlog
@@ -262,7 +262,7 @@ class ConstrainedGenerationResult(BaseModel):
     ot_iterations: list[int]
     grammar_generation_ms: float
     backtrack_requested: bool = False
-    backtrack_checkpoint: Any = None
+    backtrack_checkpoint: Checkpoint | None = None
     backtrack_events: list[Any] = []
 
 
