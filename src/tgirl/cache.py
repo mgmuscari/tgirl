@@ -15,10 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import structlog
 import torch
-
-logger = structlog.get_logger()
 
 
 @dataclass
@@ -33,12 +30,17 @@ class CacheStats:
 
 def make_mlx_forward_fn(
     model: Any,
+    *,
     stats: CacheStats | None = None,
 ) -> Callable[[list[int]], torch.Tensor]:
     """Create a cached forward function for MLX models.
 
     The returned closure maintains KV cache state between calls.
     When consecutive calls share a prefix, only new tokens are forwarded.
+
+    Note: The ``tokenizer`` parameter from the original spec is omitted —
+    MLX models handle token conversion internally and the wrapper operates
+    on pre-tokenized integer lists.
 
     Args:
         model: MLX model with ``make_cache()`` and ``__call__(input_ids, cache=)``
@@ -89,18 +91,18 @@ def make_mlx_forward_fn(
             logits_out = model(token_ids, cache=_cache)
 
         # Extract last-position logits
-        if isinstance(logits_out, torch.Tensor):
-            if logits_out.dim() == 3:
-                result = logits_out[0, -1, :]
-            elif logits_out.dim() == 2:
-                result = logits_out[-1, :]
-            else:
-                result = logits_out
-        else:
-            # Assume logits_out is indexable like a tensor
+        if not isinstance(logits_out, torch.Tensor):
+            msg = (
+                f"Model returned {type(logits_out).__name__}, expected torch.Tensor. "
+                "Wrap your model to return torch.Tensor logits."
+            )
+            raise TypeError(msg)
+        if logits_out.dim() == 3:
             result = logits_out[0, -1, :]
-            if not isinstance(result, torch.Tensor):
-                result = torch.tensor(result)
+        elif logits_out.dim() == 2:
+            result = logits_out[-1, :]
+        else:
+            result = logits_out
 
         _prev_tokens = list(token_ids)
         _last_logits = result
