@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 
 from pydantic import (
     BaseModel,
@@ -312,6 +312,16 @@ class SessionConfig(BaseModel):
     tool_close_delimiter: str = "</tool>"
     result_open_delimiter: str = "<tool_result>"
     result_close_delimiter: str = "</tool_result>"
+
+
+# --- Prompt Formatting ---
+
+
+@runtime_checkable
+class PromptFormatter(Protocol):
+    """Protocol for formatting chat messages into model input strings."""
+
+    def format_messages(self, messages: list[dict[str, str]]) -> str: ...
 
 
 # Rebuild forward refs for recursive types
