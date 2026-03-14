@@ -94,6 +94,7 @@ def make_mlx_forward_fn(
             mlx_logits = model(input_ids, cache=_cache)
 
         result = mlx_logits[0, -1, :].astype(mx.float32)
+        mx.eval(result)
 
         _prev_tokens = list(token_ids)
         _last_logits = result
