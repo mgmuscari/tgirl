@@ -2,15 +2,21 @@
 
 from annotated_types import Ge, Gt, Le, Lt, MultipleOf
 
-from tgirl.format import (
-    ChatTemplateFormatter,
-    PlainFormatter,
+from tgirl.bfcl import (
+    load_ground_truth,
+    load_test_data,
+    register_bfcl_tools,
+    sexpr_to_bfcl,
 )
 from tgirl.compile import (
     CompileConfig,
     InsufficientResources,
     PipelineResult,
     run_pipeline,
+)
+from tgirl.format import (
+    ChatTemplateFormatter,
+    PlainFormatter,
 )
 from tgirl.grammar import (
     GrammarConfig,
@@ -46,7 +52,6 @@ from tgirl.transport import (
 )
 from tgirl.types import (
     AnnotatedType,
-    PromptFormatter,
     AnyType,
     ConstraintRepr,
     DictType,
@@ -60,6 +65,7 @@ from tgirl.types import (
     ParameterDef,
     PipelineError,
     PrimitiveType,
+    PromptFormatter,
     RegistrySnapshot,
     RerankConfig,
     RerankResult,
@@ -74,6 +80,10 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AnnotatedType",
+    "load_ground_truth",
+    "load_test_data",
+    "register_bfcl_tools",
+    "sexpr_to_bfcl",
     "ChatTemplateFormatter",
     "CompileConfig",
     "ConstrainedGenerationResult",

@@ -26,6 +26,7 @@ sample = ["outlines>=1.2", "llguidance>=1.6", "torch>=2.0"]
 mlx = ["mlx>=0.31", "mlx-lm>=0.31"]
 serve = ["fastapi>=0.110", "uvicorn>=0.28", "transformers>=5.0"]
 bridge = ["mcp>=1.0"]
+benchmark = ["bfcl-eval"]
 all = [
     "tgirl[grammar]",
     "tgirl[compile]",
