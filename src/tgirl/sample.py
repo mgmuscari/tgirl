@@ -261,6 +261,9 @@ class ConstrainedGenerationResult(BaseModel):
     ot_bypass_reasons: list[str | None]
     ot_iterations: list[int]
     grammar_generation_ms: float
+    backtrack_requested: bool = False
+    backtrack_checkpoint: Any = None
+    backtrack_events: list[Any] = []
 
 
 def run_constrained_generation(
@@ -272,6 +275,8 @@ def run_constrained_generation(
     transport_config: TransportConfig,
     max_tokens: int = 512,
     context_tokens: list[int] | None = None,
+    confidence_monitor: Any | None = None,
+    grammar_text: str | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
@@ -285,7 +290,13 @@ def run_constrained_generation(
     7. sample token from shaped logits
     8. grammar_state.advance(token_id)
     9. record telemetry
+
+    If confidence_monitor is provided, tracks log probs and checkpoints
+    at high-freedom positions. When confidence drops below threshold,
+    returns early with backtrack_requested=True and the checkpoint.
     """
+    from tgirl.state_machine import BacktrackEvent, Checkpoint
+
     start_time = time.monotonic()
     tokens: list[int] = []
     token_history = list(context_tokens) if context_tokens else []
@@ -298,8 +309,11 @@ def run_constrained_generation(
     ot_bypassed_count = 0
     ot_bypass_reasons: list[str | None] = []
     ot_iterations: list[int] = []
+    backtrack_events: list[BacktrackEvent] = []
 
     vocab_size = embeddings.shape[0]
+    last_checkpoint: Checkpoint | None = None
+    backtrack_requested = False
 
     for position in range(max_tokens):
         # 1. Forward pass
@@ -309,6 +323,22 @@ def run_constrained_generation(
         valid_mask = grammar_state.get_valid_mask(vocab_size)
         valid_count = int(valid_mask.sum().item())
         grammar_valid_counts.append(valid_count)
+
+        # Checkpoint if monitor says so
+        if (
+            confidence_monitor is not None
+            and grammar_text is not None
+            and confidence_monitor.should_checkpoint(valid_count)
+        ):
+            last_checkpoint = Checkpoint(
+                position=position,
+                tokens_so_far=tuple(tokens),
+                context_tokens=tuple(
+                    context_tokens if context_tokens else []
+                ),
+                grammar_text=grammar_text,
+                dead_end_tokens=frozenset(),
+            )
 
         # 3. Hooks
         interventions = [
@@ -363,6 +393,28 @@ def run_constrained_generation(
         )
         token_log_probs.append(log_prob)
 
+        # Confidence monitoring and backtrack check
+        if confidence_monitor is not None:
+            confidence_monitor.record_log_prob(log_prob)
+            if (
+                confidence_monitor.should_backtrack()
+                and confidence_monitor.backtracks_remaining > 0
+                and last_checkpoint is not None
+            ):
+                event = BacktrackEvent(
+                    checkpoint_position=last_checkpoint.position,
+                    trigger_position=position,
+                    trigger_log_prob=log_prob,
+                    dead_end_tokens_added=frozenset({token_id}),
+                )
+                backtrack_events.append(event)
+                last_checkpoint = last_checkpoint.with_added_dead_end(
+                    token_id
+                )
+                confidence_monitor.record_backtrack()
+                backtrack_requested = True
+                break
+
         # 8. Advance grammar
         grammar_state.advance(token_id)
 
@@ -386,6 +438,9 @@ def run_constrained_generation(
         ot_bypass_reasons=ot_bypass_reasons,
         ot_iterations=ot_iterations,
         grammar_generation_ms=elapsed_ms,
+        backtrack_requested=backtrack_requested,
+        backtrack_checkpoint=last_checkpoint if backtrack_requested else None,
+        backtrack_events=backtrack_events,
     )
 
 

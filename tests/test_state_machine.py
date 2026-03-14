@@ -1029,6 +1029,176 @@ class TestBacktrackSteeringHookMlx:
         assert result.logit_bias[0] == -50.0
 
 
+class TestConstrainedGenerationResultBacktrack:
+    """ConstrainedGenerationResult has optional backtrack fields."""
+
+    def test_backtrack_fields_default(self) -> None:
+        from tgirl.sample import ConstrainedGenerationResult
+
+        result = ConstrainedGenerationResult(
+            tokens=[1, 2],
+            hy_source="(test)",
+            grammar_valid_counts=[10, 5],
+            temperatures_applied=[0.3, 0.3],
+            wasserstein_distances=[0.1, 0.1],
+            top_p_applied=[0.9, 0.9],
+            token_log_probs=[-0.5, -0.5],
+            ot_computation_total_ms=1.0,
+            ot_bypassed_count=0,
+            ot_bypass_reasons=[None, None],
+            ot_iterations=[10, 10],
+            grammar_generation_ms=5.0,
+        )
+        assert result.backtrack_requested is False
+        assert result.backtrack_checkpoint is None
+        assert result.backtrack_events == []
+
+    def test_backtrack_fields_populated(self) -> None:
+        from tgirl.sample import ConstrainedGenerationResult
+        from tgirl.state_machine import BacktrackEvent, Checkpoint
+
+        cp = Checkpoint(
+            position=3,
+            tokens_so_far=(1, 2, 3),
+            context_tokens=(100,),
+            grammar_text="(test)",
+            dead_end_tokens=frozenset({42}),
+        )
+        event = BacktrackEvent(
+            checkpoint_position=3,
+            trigger_position=7,
+            trigger_log_prob=-2.0,
+            dead_end_tokens_added=frozenset({42}),
+        )
+        result = ConstrainedGenerationResult(
+            tokens=[1, 2],
+            hy_source="(test)",
+            grammar_valid_counts=[10, 5],
+            temperatures_applied=[0.3, 0.3],
+            wasserstein_distances=[0.1, 0.1],
+            top_p_applied=[0.9, 0.9],
+            token_log_probs=[-0.5, -0.5],
+            ot_computation_total_ms=1.0,
+            ot_bypassed_count=0,
+            ot_bypass_reasons=[None, None],
+            ot_iterations=[10, 10],
+            grammar_generation_ms=5.0,
+            backtrack_requested=True,
+            backtrack_checkpoint=cp,
+            backtrack_events=[event],
+        )
+        assert result.backtrack_requested is True
+        assert result.backtrack_checkpoint == cp
+        assert len(result.backtrack_events) == 1
+
+
+class TestBacktrackDispatchTorch:
+    """Backtrack dispatch in run_constrained_generation (torch)."""
+
+    def _make_grammar_state(self, accept_at: int = 5):
+        """Build a mock grammar state that accepts after accept_at advances."""
+        import torch
+
+        class MockGS:
+            def __init__(self):
+                self._advances = 0
+                self._accept_at = accept_at
+
+            def get_valid_mask(self, vocab_size: int) -> torch.Tensor:
+                # All tokens valid
+                return torch.ones(vocab_size, dtype=torch.bool)
+
+            def is_accepting(self) -> bool:
+                return self._advances >= self._accept_at
+
+            def advance(self, token_id: int) -> None:
+                self._advances += 1
+
+        return MockGS()
+
+    def test_no_backtrack_without_monitor(self) -> None:
+        """Without a confidence monitor, no backtrack occurs."""
+        import torch
+
+        from tgirl.sample import run_constrained_generation
+        from tgirl.transport import TransportConfig
+
+        gs = self._make_grammar_state(accept_at=3)
+        embeddings = torch.eye(10)
+        call_count = [0]
+
+        def forward_fn(ctx):
+            call_count[0] += 1
+            logits = torch.zeros(10)
+            logits[1] = 10.0
+            return logits
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "".join(chr(65 + i) for i in ids),
+            embeddings=embeddings,
+            hooks=[],
+            transport_config=TransportConfig(),
+            max_tokens=10,
+        )
+        assert result.backtrack_requested is False
+        assert result.backtrack_checkpoint is None
+
+    def test_backtrack_triggered_with_monitor(self) -> None:
+        """With a confidence monitor signaling backtrack, result flags it."""
+        import torch
+
+        from tgirl.sample import run_constrained_generation
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+        from tgirl.transport import TransportConfig
+
+        # Grammar state with high freedom (many valid tokens)
+        class HighFreedomGS:
+            def __init__(self):
+                self._advances = 0
+
+            def get_valid_mask(self, vocab_size: int) -> torch.Tensor:
+                return torch.ones(vocab_size, dtype=torch.bool)
+
+            def is_accepting(self) -> bool:
+                return self._advances >= 20
+
+            def advance(self, token_id: int) -> None:
+                self._advances += 1
+
+        gs = HighFreedomGS()
+        embeddings = torch.eye(10)
+
+        # Forward function producing low-confidence logits
+        def forward_fn(ctx):
+            logits = torch.randn(10)
+            logits[0] = -5.0  # Force low log probs
+            return logits
+
+        monitor = ConstrainedConfidenceMonitor(
+            log_prob_threshold=-0.5,
+            window_size=2,
+            freedom_threshold=3,
+            max_backtracks=1,
+        )
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "x",
+            embeddings=embeddings,
+            hooks=[],
+            transport_config=TransportConfig(),
+            max_tokens=20,
+            confidence_monitor=monitor,
+            grammar_text="(test)",
+        )
+        # Monitor should have triggered backtrack due to low log probs
+        assert result.backtrack_requested is True
+        assert result.backtrack_checkpoint is not None
+
+
 class TestConfidenceTransitionPolicy:
     """ConfidenceTransitionPolicy uses Markov chain on model signals."""
 
