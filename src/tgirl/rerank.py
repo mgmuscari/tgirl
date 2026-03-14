@@ -51,7 +51,7 @@ class ToolRouter:
 
         1. Filter quota-exhausted tools
         2. Short-circuit if 0 or 1 tools remain
-        3. Generate routing grammar and prompt
+        3. Generate routing grammar (caller provides context_tokens)
         4. Run short constrained generation pass
         5. Parse selected tool name from output
         6. Return RerankResult
