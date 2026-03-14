@@ -820,6 +820,64 @@ class TestConstrainedConfidenceMonitor:
         ) is False
 
 
+class TestBacktrackSteeringHook:
+    """BacktrackSteeringHook applies negative logit bias on dead-end tokens."""
+
+    def test_no_dead_ends_returns_no_bias(self) -> None:
+        import torch
+
+        from tgirl.sample import BacktrackSteeringHook
+
+        hook = BacktrackSteeringHook(dead_end_tokens=frozenset())
+        logits = torch.tensor([1.0, 2.0, 3.0])
+
+        class MockGS:
+            def get_valid_mask(self, vs: int) -> torch.Tensor:
+                return torch.ones(vs, dtype=torch.bool)
+
+            def is_accepting(self) -> bool:
+                return False
+
+            def advance(self, tid: int) -> None:
+                pass
+
+        result = hook.pre_forward(0, MockGS(), [], logits)
+        assert result.logit_bias is None
+
+    def test_dead_end_tokens_get_negative_bias(self) -> None:
+        import torch
+
+        from tgirl.sample import BacktrackSteeringHook
+
+        hook = BacktrackSteeringHook(
+            dead_end_tokens=frozenset({1, 2}),
+            bias_strength=-100.0,
+        )
+        logits = torch.tensor([1.0, 2.0, 3.0])
+
+        class MockGS:
+            def get_valid_mask(self, vs: int) -> torch.Tensor:
+                return torch.ones(vs, dtype=torch.bool)
+
+            def is_accepting(self) -> bool:
+                return False
+
+            def advance(self, tid: int) -> None:
+                pass
+
+        result = hook.pre_forward(0, MockGS(), [], logits)
+        assert result.logit_bias is not None
+        assert result.logit_bias[1] == -100.0
+        assert result.logit_bias[2] == -100.0
+        assert 0 not in result.logit_bias
+
+    def test_conforms_to_inference_hook_protocol(self) -> None:
+        from tgirl.sample import BacktrackSteeringHook, InferenceHook
+
+        hook = BacktrackSteeringHook(dead_end_tokens=frozenset())
+        assert isinstance(hook, InferenceHook)
+
+
 class TestMakeTransitionPolicy:
     """Test the BFCL benchmark policy parser."""
 

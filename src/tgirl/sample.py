@@ -97,6 +97,35 @@ class GrammarTemperatureHook:
         return ModelIntervention(temperature=temp)
 
 
+class BacktrackSteeringHook:
+    """Pre-OT hook that applies negative logit bias on dead-end tokens.
+
+    Used after backtracking to steer the model away from previously
+    failed token choices. The bias is applied before OT redistribution,
+    so OT naturally redistributes mass away from the dead ends.
+    """
+
+    def __init__(
+        self,
+        dead_end_tokens: frozenset[int],
+        bias_strength: float = -100.0,
+    ) -> None:
+        self.dead_end_tokens = dead_end_tokens
+        self.bias_strength = bias_strength
+
+    def pre_forward(
+        self,
+        position: int,
+        grammar_state: GrammarState,
+        token_history: list[int],
+        logits: torch.Tensor,
+    ) -> ModelIntervention:
+        if not self.dead_end_tokens:
+            return ModelIntervention()
+        bias = {tid: self.bias_strength for tid in self.dead_end_tokens}
+        return ModelIntervention(logit_bias=bias)
+
+
 def apply_penalties(
     logits: torch.Tensor,
     intervention: ModelIntervention,

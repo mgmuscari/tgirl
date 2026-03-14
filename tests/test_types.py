@@ -359,6 +359,8 @@ class TestTelemetryRecordRerank:
             grammar_generation_ms=5.0,
             ot_computation_total_ms=2.0,
             ot_bypassed_count=0,
+            ot_bypass_reasons=[None, None],
+            ot_iterations=[5, 3],
             hy_source="(tool 1)",
             cycle_number=1,
             freeform_tokens_before=10,
@@ -385,6 +387,8 @@ class TestTelemetryRecordRerank:
             grammar_generation_ms=5.0,
             ot_computation_total_ms=2.0,
             ot_bypassed_count=0,
+            ot_bypass_reasons=[None, None],
+            ot_iterations=[5, 3],
             hy_source="(tool 1)",
             cycle_number=1,
             freeform_tokens_before=10,
@@ -399,3 +403,66 @@ class TestTelemetryRecordRerank:
         assert record.rerank_selected_tool == "get_field"
         assert record.rerank_routing_tokens == 3
         assert record.rerank_latency_ms == 12.5
+
+
+class TestTelemetryRecordBacktrack:
+    """Phase 3B: TelemetryRecord has backtrack_events and state_transitions."""
+
+    def _make_base_record(self, **kwargs):
+        from tgirl.types import TelemetryRecord
+
+        defaults = dict(
+            pipeline_id="test",
+            tokens=[1, 2],
+            grammar_valid_counts=[10, 5],
+            temperatures_applied=[0.3, 0.3],
+            wasserstein_distances=[0.1, 0.2],
+            top_p_applied=[-1.0, -1.0],
+            token_log_probs=[-0.5, -0.3],
+            grammar_generation_ms=5.0,
+            ot_computation_total_ms=2.0,
+            ot_bypassed_count=0,
+            ot_bypass_reasons=[None, None],
+            ot_iterations=[5, 3],
+            hy_source="(tool 1)",
+            cycle_number=1,
+            freeform_tokens_before=10,
+            wall_time_ms=100.0,
+            total_tokens=12,
+            model_id="test-model",
+            registry_snapshot_hash="abc123",
+        )
+        defaults.update(kwargs)
+        return TelemetryRecord(**defaults)
+
+    def test_backtrack_events_defaults_empty(self) -> None:
+        record = self._make_base_record()
+        assert record.backtrack_events == []
+
+    def test_backtrack_events_populated(self) -> None:
+        from tgirl.state_machine import BacktrackEvent
+
+        events = [
+            BacktrackEvent(
+                checkpoint_position=3,
+                trigger_position=7,
+                trigger_log_prob=-2.5,
+                dead_end_tokens_added=frozenset({42}),
+            ),
+        ]
+        record = self._make_base_record(backtrack_events=events)
+        assert len(record.backtrack_events) == 1
+        assert record.backtrack_events[0].checkpoint_position == 3
+
+    def test_state_transitions_defaults_empty(self) -> None:
+        record = self._make_base_record()
+        assert record.state_transitions == []
+
+    def test_state_transitions_populated(self) -> None:
+        transitions = [
+            ("freeform", "route", 1.0),
+            ("route", "constrained", 1.0),
+        ]
+        record = self._make_base_record(state_transitions=transitions)
+        assert len(record.state_transitions) == 2
+        assert record.state_transitions[0] == ("freeform", "route", 1.0)
