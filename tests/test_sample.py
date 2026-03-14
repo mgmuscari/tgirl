@@ -1004,3 +1004,171 @@ class TestSamplingSession:
         # Should have stopped well before freeform_max_tokens
         assert result.total_tokens < 100
         assert result.wall_time_ms > 0
+
+
+class TestSamplingSessionFormatter:
+    """SamplingSession accepts optional formatter parameter."""
+
+    def test_formatter_param_defaults_to_none(self) -> None:
+        import torch
+
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5, cost=1.0)
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"Hello, {name}!"
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=lambda ctx: torch.zeros(50),
+            tokenizer_decode=lambda ids: "",
+            tokenizer_encode=lambda text: [],
+            embeddings=torch.eye(50),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            transport_config=TransportConfig(),
+        )
+        assert session._formatter is None
+
+    def test_formatter_param_stored(self) -> None:
+        import torch
+
+        from tgirl.format import PlainFormatter
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5, cost=1.0)
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"Hello, {name}!"
+
+        fmt = PlainFormatter()
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=lambda ctx: torch.zeros(50),
+            tokenizer_decode=lambda ids: "",
+            tokenizer_encode=lambda text: [],
+            embeddings=torch.eye(50),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            transport_config=TransportConfig(),
+            formatter=fmt,
+        )
+        assert session._formatter is fmt
+
+
+class TestSamplingSessionRunChat:
+    """SamplingSession.run_chat() formats messages and delegates to run()."""
+
+    def test_run_chat_calls_run_with_encoded_prompt(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        import torch
+
+        from tgirl.format import PlainFormatter
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingResult, SamplingSession
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5, cost=1.0)
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"Hello, {name}!"
+
+        encode_calls: list[str] = []
+
+        def mock_encode(text: str) -> list[int]:
+            encode_calls.append(text)
+            return [ord(c) for c in text[:10]]
+
+        fmt = PlainFormatter()
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=lambda ctx: torch.zeros(50),
+            tokenizer_decode=lambda ids: "",
+            tokenizer_encode=mock_encode,
+            embeddings=torch.eye(50),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            config=SessionConfig(freeform_max_tokens=1, session_timeout=1.0),
+            transport_config=TransportConfig(),
+            formatter=fmt,
+        )
+
+        messages = [{"role": "user", "content": "hello"}]
+        result = session.run_chat(messages)
+
+        assert isinstance(result, SamplingResult)
+        # Verify that encode was called with formatted text
+        assert len(encode_calls) >= 1
+
+    def test_run_chat_stores_last_user_content(self) -> None:
+        import torch
+
+        from tgirl.format import PlainFormatter
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5, cost=1.0)
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"Hello, {name}!"
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=lambda ctx: torch.zeros(50),
+            tokenizer_decode=lambda ids: "",
+            tokenizer_encode=lambda text: [0],
+            embeddings=torch.eye(50),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            config=SessionConfig(freeform_max_tokens=1, session_timeout=1.0),
+            transport_config=TransportConfig(),
+            formatter=PlainFormatter(),
+        )
+
+        messages = [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "user", "content": "What tools are available?"},
+        ]
+        session.run_chat(messages)
+        assert session._last_user_content == "What tools are available?"
+
+    def test_run_chat_requires_formatter(self) -> None:
+        import torch
+
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5, cost=1.0)
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"Hello, {name}!"
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=lambda ctx: torch.zeros(50),
+            tokenizer_decode=lambda ids: "",
+            tokenizer_encode=lambda text: [],
+            embeddings=torch.eye(50),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            transport_config=TransportConfig(),
+        )
+
+        with pytest.raises(ValueError, match="formatter"):
+            session.run_chat([{"role": "user", "content": "hi"}])

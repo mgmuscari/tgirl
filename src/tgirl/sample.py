@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from tgirl.registry import ToolRegistry
+    from tgirl.types import PromptFormatter
 
 import structlog
 import torch
@@ -394,6 +395,7 @@ class SamplingSession:
         hooks: list[InferenceHook] | None = None,
         transport_config: TransportConfig | None = None,
         rerank_config: RerankConfig | None = None,
+        formatter: PromptFormatter | None = None,
     ) -> None:
         from tgirl.rerank import ToolRouter
 
@@ -408,6 +410,8 @@ class SamplingSession:
         self._transport_config = transport_config or TransportConfig()
         self._consumed_quotas: dict[str, int] = {}
         self._rerank_config = rerank_config
+        self._formatter = formatter
+        self._last_user_content: str | None = None
         self._router = (
             ToolRouter(
                 grammar_guide_factory=grammar_guide_factory,
@@ -419,6 +423,48 @@ class SamplingSession:
             if rerank_config is not None
             else None
         )
+
+    def run_chat(self, messages: list[dict[str, str]]) -> SamplingResult:
+        """Format messages and run the dual-mode sampling loop.
+
+        Generates a system prompt from the registry snapshot, prepends it,
+        formats via the configured PromptFormatter, encodes, and delegates
+        to run().
+
+        Args:
+            messages: Chat messages (role/content dicts).
+
+        Returns:
+            SamplingResult from the sampling loop.
+
+        Raises:
+            ValueError: If no formatter is configured.
+        """
+        if self._formatter is None:
+            msg = "run_chat() requires a formatter — pass formatter= to SamplingSession"
+            raise ValueError(msg)
+
+        from tgirl.instructions import generate_system_prompt
+
+        snapshot = self._registry.snapshot(
+            cost_budget=self._config.session_cost_budget
+        )
+        system_prompt = generate_system_prompt(snapshot)
+
+        # Store last user message content for routing context
+        for msg_item in reversed(messages):
+            if msg_item.get("role") == "user":
+                self._last_user_content = msg_item["content"]
+                break
+
+        # Prepend system message
+        full_messages = [{"role": "system", "content": system_prompt}] + list(messages)
+
+        # Format and encode
+        formatted = self._formatter.format_messages(full_messages)
+        prompt_tokens = self._encode(formatted)
+
+        return self.run(prompt_tokens)
 
     def run(self, prompt_tokens: list[int]) -> SamplingResult:
         """Run the full dual-mode sampling loop."""
@@ -494,9 +540,24 @@ class SamplingSession:
                 and self._rerank_config.enabled
             )
             if rerank_active:
+                # Build routing context tokens
+                if self._formatter is not None and self._last_user_content is not None:
+                    from tgirl.instructions import generate_routing_prompt
+
+                    routing_prompt = generate_routing_prompt(snapshot)
+                    routing_messages = [
+                        {"role": "system", "content": routing_prompt},
+                        {"role": "user", "content": self._last_user_content},
+                    ]
+                    routing_context = self._encode(
+                        self._formatter.format_messages(routing_messages)
+                    )
+                else:
+                    routing_context = token_history
+
                 rerank_result = self._router.route(
                     snapshot=snapshot,
-                    context_tokens=token_history,
+                    context_tokens=routing_context,
                     transport_config=self._transport_config,
                 )
                 total_tokens += rerank_result.routing_tokens
