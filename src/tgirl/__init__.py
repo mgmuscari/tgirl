@@ -6,6 +6,7 @@ from tgirl.cache import (
     CacheStats,
     make_hf_forward_fn,
     make_mlx_forward_fn,
+    make_mlx_forward_fn_torch,
 )
 from tgirl.compile import (
     CompileConfig,
@@ -75,6 +76,19 @@ from tgirl.types import (
     UnionType,
 )
 
+try:
+    from tgirl.sample_mlx import (
+        apply_penalties_mlx,
+        apply_shaping_mlx,
+        run_constrained_generation_mlx,
+    )
+    from tgirl.transport_mlx import (
+        TransportResultMlx,
+        redistribute_logits_mlx,
+    )
+except ImportError:
+    pass  # mlx not available
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -130,9 +144,15 @@ __all__ = [
     "generate_grammar",
     "make_hf_forward_fn",
     "make_mlx_forward_fn",
+    "make_mlx_forward_fn_torch",
     "merge_interventions",
     "redistribute_logits",
+    "redistribute_logits_mlx",
+    "TransportResultMlx",
+    "apply_penalties_mlx",
+    "apply_shaping_mlx",
     "run_constrained_generation",
+    "run_constrained_generation_mlx",
     "run_pipeline",
     "grammar_diff",
     "TypeRepr",
