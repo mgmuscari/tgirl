@@ -331,6 +331,162 @@ class TestDelimiterTransitionPolicy:
         assert isinstance(policy, TransitionPolicy)
 
 
+class TestBudgetTransitionPolicy:
+    """BudgetTransitionPolicy forces transition after N freeform tokens."""
+
+    def test_no_transition_before_budget(self) -> None:
+        from tgirl.state_machine import (
+            BudgetTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = BudgetTransitionPolicy(budget=3)
+        for pos in range(3):
+            signal = TransitionSignal(
+                token_position=pos,
+                grammar_mask_overlap=0.0,
+                token_entropy=0.0,
+                token_log_prob=0.0,
+                grammar_freedom=0.0,
+            )
+            decision = policy.evaluate(SessionState.FREEFORM, signal)
+            assert decision.should_transition is False
+
+    def test_transition_at_budget(self) -> None:
+        from tgirl.state_machine import (
+            BudgetTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = BudgetTransitionPolicy(budget=3)
+        # Feed 3 tokens (positions 0, 1, 2)
+        for pos in range(3):
+            signal = TransitionSignal(
+                token_position=pos,
+                grammar_mask_overlap=0.0,
+                token_entropy=0.0,
+                token_log_prob=0.0,
+                grammar_freedom=0.0,
+            )
+            policy.evaluate(SessionState.FREEFORM, signal)
+
+        # Position 3 = budget reached
+        signal = TransitionSignal(
+            token_position=3,
+            grammar_mask_overlap=0.0,
+            token_entropy=0.0,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+        decision = policy.evaluate(SessionState.FREEFORM, signal)
+        assert decision.should_transition is True
+        assert decision.target_state == SessionState.ROUTE
+        assert decision.confidence == 1.0
+
+    def test_only_evaluates_in_freeform_state(self) -> None:
+        from tgirl.state_machine import (
+            BudgetTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = BudgetTransitionPolicy(budget=0)
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=0.0,
+            token_entropy=0.0,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+        decision = policy.evaluate(SessionState.CONSTRAINED, signal)
+        assert decision.should_transition is False
+
+    def test_reset_resets_counter(self) -> None:
+        from tgirl.state_machine import (
+            BudgetTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = BudgetTransitionPolicy(budget=2)
+        # Feed 2 tokens
+        for pos in range(2):
+            signal = TransitionSignal(
+                token_position=pos,
+                grammar_mask_overlap=0.0,
+                token_entropy=0.0,
+                token_log_prob=0.0,
+                grammar_freedom=0.0,
+            )
+            policy.evaluate(SessionState.FREEFORM, signal)
+
+        policy.reset()
+
+        # After reset, position 0 should not trigger
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=0.0,
+            token_entropy=0.0,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+        decision = policy.evaluate(SessionState.FREEFORM, signal)
+        assert decision.should_transition is False
+
+    def test_conforms_to_protocol(self) -> None:
+        from tgirl.state_machine import BudgetTransitionPolicy, TransitionPolicy
+
+        assert isinstance(BudgetTransitionPolicy(budget=5), TransitionPolicy)
+
+
+class TestImmediateTransitionPolicy:
+    """ImmediateTransitionPolicy transitions immediately (budget=0)."""
+
+    def test_transitions_on_first_token(self) -> None:
+        from tgirl.state_machine import (
+            ImmediateTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = ImmediateTransitionPolicy()
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=0.0,
+            token_entropy=0.0,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+        decision = policy.evaluate(SessionState.FREEFORM, signal)
+        assert decision.should_transition is True
+        assert decision.target_state == SessionState.ROUTE
+
+    def test_only_evaluates_in_freeform_state(self) -> None:
+        from tgirl.state_machine import (
+            ImmediateTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = ImmediateTransitionPolicy()
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=0.0,
+            token_entropy=0.0,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+        decision = policy.evaluate(SessionState.CONSTRAINED, signal)
+        assert decision.should_transition is False
+
+    def test_conforms_to_protocol(self) -> None:
+        from tgirl.state_machine import ImmediateTransitionPolicy, TransitionPolicy
+
+        assert isinstance(ImmediateTransitionPolicy(), TransitionPolicy)
+
+
 class TestSamplingSessionTransitionPolicy:
     """Phase 1B: SamplingSession accepts transition_policy param."""
 

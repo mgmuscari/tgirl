@@ -130,3 +130,76 @@ class DelimiterTransitionPolicy:
     def reset(self) -> None:
         """Clear the detection window."""
         self._decoded_window = ""
+
+
+class BudgetTransitionPolicy:
+    """Force transition after a fixed number of freeform tokens.
+
+    Useful for small models where bounded thinking improves accuracy.
+    """
+
+    def __init__(self, budget: int) -> None:
+        self._budget = budget
+        self._tokens_seen = 0
+
+    def evaluate(
+        self,
+        current_state: SessionState,
+        signal: TransitionSignal,
+        **kwargs: object,
+    ) -> TransitionDecision:
+        if current_state != SessionState.FREEFORM:
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="not in freeform state",
+                confidence=0.0,
+            )
+
+        self._tokens_seen += 1
+        if self._tokens_seen > self._budget:
+            return TransitionDecision(
+                should_transition=True,
+                target_state=SessionState.ROUTE,
+                reason=f"budget exhausted ({self._budget} tokens)",
+                confidence=1.0,
+            )
+
+        return TransitionDecision(
+            should_transition=False,
+            target_state=None,
+            reason=f"budget remaining ({self._budget - self._tokens_seen + 1})",
+            confidence=0.0,
+        )
+
+    def reset(self) -> None:
+        """Reset token counter for next cycle."""
+        self._tokens_seen = 0
+
+
+class ImmediateTransitionPolicy:
+    """Skip freeform generation entirely (equivalent to budget=0).
+
+    Useful for pure tool-calling benchmarks like BFCL.
+    """
+
+    def evaluate(
+        self,
+        current_state: SessionState,
+        signal: TransitionSignal,
+        **kwargs: object,
+    ) -> TransitionDecision:
+        if current_state != SessionState.FREEFORM:
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="not in freeform state",
+                confidence=0.0,
+            )
+
+        return TransitionDecision(
+            should_transition=True,
+            target_state=SessionState.ROUTE,
+            reason="immediate transition",
+            confidence=1.0,
+        )
