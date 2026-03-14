@@ -117,25 +117,31 @@ def main() -> int:
     grammar_factory = make_outlines_grammar_factory(hf_tokenizer)
     formatter = ChatTemplateFormatter(hf_tokenizer)
 
-    # --- 4. Create session ---
-    session = SamplingSession(
-        registry=registry,
-        forward_fn=forward_fn,
-        tokenizer_decode=hf_tokenizer.decode,
-        tokenizer_encode=hf_tokenizer.encode,
-        embeddings=embeddings,
-        grammar_guide_factory=grammar_factory,
-        config=SessionConfig(
-            max_tool_cycles=1,
-            freeform_max_tokens=100,
-            constrained_max_tokens=64,
-            session_timeout=30.0,
-        ),
-        hooks=[GrammarTemperatureHook(base_temperature=0.5)],
-        transport_config=TransportConfig(bypass_ratio=0.5),
-        rerank_config=RerankConfig(max_tokens=16, temperature=0.3),
-        formatter=formatter,
+    # --- 4. Session factory (fresh session per request — no quota/state leakage) ---
+    session_config = SessionConfig(
+        max_tool_cycles=1,
+        freeform_max_tokens=100,
+        constrained_max_tokens=64,
+        session_timeout=30.0,
     )
+    session_hooks = [GrammarTemperatureHook(base_temperature=0.5)]
+    transport_config = TransportConfig(bypass_ratio=0.5)
+    rerank_config = RerankConfig(max_tokens=16, temperature=0.3)
+
+    def make_session() -> SamplingSession:
+        return SamplingSession(
+            registry=registry,
+            forward_fn=forward_fn,
+            tokenizer_decode=hf_tokenizer.decode,
+            tokenizer_encode=hf_tokenizer.encode,
+            embeddings=embeddings,
+            grammar_guide_factory=grammar_factory,
+            config=session_config,
+            hooks=session_hooks,
+            transport_config=transport_config,
+            rerank_config=rerank_config,
+            formatter=formatter,
+        )
 
     # --- 5. Test cases: 15 requests, designed to be non-obvious ---
     # Each tests a different kind of understanding:
@@ -171,6 +177,7 @@ def main() -> int:
     for i, (request, expected_tool, expected_result) in enumerate(test_cases):
         log.info("test_case", index=i + 1, request=request, expected=expected_tool)
 
+        session = make_session()
         result = session.run_chat([{"role": "user", "content": request}])
 
         tool_call = result.tool_calls[0] if result.tool_calls else None
