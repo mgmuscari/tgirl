@@ -29,21 +29,29 @@ The canonical specification is `TGIRL.md` (the technical requirements document).
 
 ## Module Architecture
 
-Six core modules, each independently importable and testable:
+Core modules, each independently importable and testable:
 
 ```
 tgirl/
-├── registry.py       # Tool registration, type extraction, snapshots
-├── grammar.py        # Dynamic CFG generation from registry state (Jinja2 templates)
-├── compile.py        # Hy parsing, AST compilation, sandboxed execution
-├── transport.py      # Optimal transport logit redistribution (zero coupling to other modules)
-├── sample.py         # Constrained sampling engine, hooks, telemetry
-├── bridge.py         # MCP compatibility layer (import/export)
-├── serve.py          # Optional: FastAPI local inference server
-├── cli.py            # Optional: CLI entrypoint
-├── templates/        # Jinja grammar templates (base, tools, types, composition)
-├── telemetry.py      # Telemetry data structures and logging
-└── types.py          # Shared type definitions
+├── registry.py          # Tool registration, type extraction, snapshots
+├── grammar.py           # Dynamic CFG generation from registry state (Jinja2 templates)
+├── compile.py           # Hy parsing, AST compilation, sandboxed execution
+├── transport.py         # Optimal transport logit redistribution (torch, zero coupling)
+├── transport_mlx.py     # OT redistribution — MLX-native (zero coupling)
+├── sample.py            # Constrained sampling engine, hooks, telemetry (torch)
+├── sample_mlx.py        # Constrained sampling — MLX-native (zero torch/numpy in hot loop)
+├── outlines_adapter.py  # llguidance bridge: GrammarState (torch) + GrammarStateMlx
+├── cache.py             # KV cache management, forward_fn factories (HF + MLX)
+├── rerank.py            # Grammar-constrained tool reranking
+├── instructions.py      # System prompt generation from registry snapshots
+├── format.py            # Chat template formatting (ChatML, plain)
+├── bfcl.py              # BFCL benchmark integration
+├── bridge.py            # MCP compatibility layer (import/export)
+├── serve.py             # Optional: FastAPI local inference server
+├── cli.py               # Optional: CLI entrypoint
+├── templates/           # Jinja grammar templates (base, tools, types, composition)
+├── telemetry.py         # Telemetry data structures and logging
+└── types.py             # Shared type definitions
 ```
 
 ### Dependency Graph
@@ -55,16 +63,23 @@ grammar   (jinja2, depends on registry)
     ↓
 compile   (hy, RestrictedPython, depends on registry)
     ↓
-transport (torch, POT — NO other tgirl deps)
+transport      (torch, POT — NO other tgirl deps)
+transport_mlx  (mlx — NO other tgirl deps except TransportConfig)
     ↓
-sample    (outlines, torch — depends on grammar, transport)
+sample      (torch — depends on grammar, transport)
+sample_mlx  (mlx — depends on transport_mlx, zero torch/numpy)
     ↓
-bridge    (mcp — depends on registry)
+outlines_adapter  (llguidance — torch via llguidance.torch, mlx via llguidance.mlx)
     ↓
-serve     (fastapi, transformers — depends on all above)
+cache    (transformers | mlx-lm — forward_fn factories)
+rerank   (depends on sample, grammar)
+    ↓
+bridge   (mcp — depends on registry)
+    ↓
+serve    (fastapi, transformers — depends on all above)
 ```
 
-All modules use `structlog` for structured logging. `transport` must have zero coupling to grammar or registry. It operates on raw logit tensors and valid token sets.
+All modules use `structlog` for structured logging. `transport`/`transport_mlx` must have zero coupling to grammar or registry — they operate on raw logit tensors and valid token sets. `sample_mlx` has zero torch and zero numpy imports; all per-token math stays in `mx.array`.
 
 ## Setup
 
@@ -76,7 +91,8 @@ All modules use `structlog` for structured logging. `transport` must have zero c
 
 - Python 3.11, 3.12, 3.13 (test against all three)
 - Pin `hy>=1.0,<2.0`
-- Core deps: `pydantic`, `annotated-types`, `structlog`, `jinja2`, `hy`, `RestrictedPython`, `torch`, `POT`, `outlines`
+- Core deps: `pydantic`, `annotated-types`, `structlog`, `jinja2`, `hy`, `RestrictedPython`, `torch`, `POT`, `outlines`, `llguidance`
+- MLX deps (Apple Silicon): `mlx`, `mlx-lm`, `llguidance` (includes `llguidance.mlx`)
 - Optional deps: `fastapi`, `transformers`, `mcp`
 - Dev tools: `ruff`, `mypy`, `pytest`, `hypothesis`
 

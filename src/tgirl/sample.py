@@ -397,6 +397,7 @@ class SamplingSession:
         rerank_config: RerankConfig | None = None,
         formatter: PromptFormatter | None = None,
         backend: Literal["torch", "mlx", "auto"] = "auto",
+        mlx_grammar_guide_factory: Callable | None = None,
     ) -> None:
         from tgirl.rerank import ToolRouter
 
@@ -406,6 +407,7 @@ class SamplingSession:
         self._encode = tokenizer_encode
         self._embeddings = embeddings
         self._grammar_guide_factory = grammar_guide_factory
+        self._mlx_grammar_guide_factory = mlx_grammar_guide_factory
         self._config = config or SessionConfig()
         self._hooks = hooks or []
         self._transport_config = transport_config or TransportConfig()
@@ -421,6 +423,7 @@ class SamplingSession:
             else None
         )
         self._embeddings_mlx: Any = None  # Lazy-converted on first MLX use
+        self._mlx_hooks: list | None = None  # Lazy-converted on first MLX use
         # Map session backend to router backend ("auto" -> "torch" default)
         _router_backend = "mlx" if backend == "mlx" else "torch"
         self._router = (
@@ -524,7 +527,9 @@ class SamplingSession:
                     timed_out = True
                     break
 
+                _t0 = time.monotonic()
                 raw_logits = self._forward_fn(token_history)
+                _t_forward = time.monotonic()
 
                 # Auto-detect backend on first forward call
                 if self._is_mlx is None:
@@ -539,8 +544,10 @@ class SamplingSession:
                     logits = raw_logits / max(
                         self._config.freeform_temperature, 1e-10
                     )
+                    _t_div = time.monotonic()
                     probs_check = mx.softmax(logits, axis=-1)
                     prob_sum = float(mx.sum(probs_check).item())
+                    _t_softmax = time.monotonic()
                     if prob_sum > 0:
                         token_id = int(
                             mx.random.categorical(logits).item()
@@ -552,6 +559,17 @@ class SamplingSession:
                             mx.random.categorical(
                                 mx.zeros((n,))
                             ).item()
+                        )
+                    _t_sample = time.monotonic()
+                    if total_tokens < 5 or total_tokens % 50 == 0:
+                        logger.info(
+                            "freeform_mlx_timing",
+                            token=total_tokens,
+                            forward_ms=round((_t_forward - _t0) * 1000, 1),
+                            div_ms=round((_t_div - _t_forward) * 1000, 1),
+                            softmax_ms=round((_t_softmax - _t_div) * 1000, 1),
+                            sample_ms=round((_t_sample - _t_softmax) * 1000, 1),
+                            total_ms=round((_t_sample - _t0) * 1000, 1),
                         )
                 else:
                     # Torch path (unchanged)
@@ -636,7 +654,10 @@ class SamplingSession:
 
             # Run constrained generation (dispatch by backend)
             if self._is_mlx:
-                from tgirl.sample_mlx import run_constrained_generation_mlx
+                from tgirl.sample_mlx import (
+                    GrammarTemperatureHookMlx,
+                    run_constrained_generation_mlx,
+                )
 
                 # Lazy-convert embeddings to mx.array once
                 if self._embeddings_mlx is None:
@@ -648,12 +669,33 @@ class SamplingSession:
                     else:
                         self._embeddings_mlx = self._embeddings
 
+                # Lazy-convert hooks to MLX versions
+                if self._mlx_hooks is None:
+                    self._mlx_hooks = []
+                    for hook in self._hooks:
+                        if isinstance(hook, GrammarTemperatureHook):
+                            self._mlx_hooks.append(
+                                GrammarTemperatureHookMlx(
+                                    base_temperature=hook.base_temperature,
+                                    scaling_exponent=hook.scaling_exponent,
+                                )
+                            )
+                        # Skip torch-only hooks — they can't operate on mx.array
+
+                # Use MLX grammar factory if available, else fallback
+                if self._mlx_grammar_guide_factory is not None:
+                    mlx_grammar_state = self._mlx_grammar_guide_factory(
+                        grammar_output.text
+                    )
+                else:
+                    mlx_grammar_state = grammar_state
+
                 gen_result = run_constrained_generation_mlx(
-                    grammar_state=grammar_state,
+                    grammar_state=mlx_grammar_state,
                     forward_fn=self._forward_fn,
                     tokenizer_decode=self._decode,
                     embeddings=self._embeddings_mlx,
-                    hooks=self._hooks,
+                    hooks=self._mlx_hooks,
                     transport_config=self._transport_config,
                     max_tokens=self._config.constrained_max_tokens,
                     context_tokens=token_history,

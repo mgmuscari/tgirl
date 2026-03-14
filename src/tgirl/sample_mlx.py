@@ -1,7 +1,7 @@
 """MLX-native sampling functions for constrained generation.
 
-Ports apply_penalties, apply_shaping, and run_constrained_generation
-from sample.py to MLX, keeping all per-token math in mx.array.
+All per-token math stays in mx.array. Zero torch, zero numpy in the
+hot loop. Only conversion: int() on token ID scalar (unavoidable).
 """
 
 from __future__ import annotations
@@ -9,15 +9,13 @@ from __future__ import annotations
 import time
 from collections import Counter
 from collections.abc import Callable
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
-import numpy as np
 import structlog
 
 from tgirl.sample import (
     ConstrainedGenerationResult,
-    GrammarState,
-    InferenceHook,
     merge_interventions,
 )
 from tgirl.transport import TransportConfig
@@ -27,6 +25,62 @@ from tgirl.types import ModelIntervention
 logger = structlog.get_logger()
 
 
+@runtime_checkable
+class GrammarStateMlx(Protocol):
+    """Protocol for MLX-native grammar state trackers."""
+
+    def get_valid_mask_mx(self, tokenizer_vocab_size: int) -> mx.array: ...
+    def is_accepting(self) -> bool: ...
+    def advance(self, token_id: int) -> None: ...
+
+
+@runtime_checkable
+class InferenceHookMlx(Protocol):
+    """Protocol for MLX-native per-token inference hooks.
+
+    Unlike InferenceHook (torch), receives the pre-computed valid_mask
+    as mx.array rather than the grammar state object. This avoids
+    re-computing the mask inside each hook.
+    """
+
+    def pre_forward(
+        self,
+        position: int,
+        valid_mask: mx.array,
+        token_history: list[int],
+        logits: mx.array,
+    ) -> ModelIntervention: ...
+
+
+class GrammarTemperatureHookMlx:
+    """MLX-native grammar-implied temperature scheduling.
+
+    Receives the valid_mask as a parameter (already computed by the main
+    loop), avoiding redundant grammar state queries.
+    """
+
+    def __init__(
+        self, base_temperature: float = 0.3, scaling_exponent: float = 0.5
+    ) -> None:
+        self.base_temperature = base_temperature
+        self.scaling_exponent = scaling_exponent
+
+    def pre_forward(
+        self,
+        position: int,
+        valid_mask: mx.array,
+        token_history: list[int],
+        logits: mx.array,
+    ) -> ModelIntervention:
+        vocab_size = logits.shape[-1]
+        valid_count = int(mx.sum(valid_mask).item())
+        if valid_count <= 1:
+            return ModelIntervention(temperature=0.0)
+        freedom = valid_count / vocab_size
+        temp = self.base_temperature * (freedom**self.scaling_exponent)
+        return ModelIntervention(temperature=temp)
+
+
 def apply_penalties_mlx(
     logits: mx.array,
     intervention: ModelIntervention,
@@ -34,28 +88,35 @@ def apply_penalties_mlx(
 ) -> mx.array:
     """Pre-OT: apply repetition, presence, frequency penalties and logit bias.
 
-    MLX-native version of sample.apply_penalties.
+    Pure MLX — uses functional scatter via .at[indices].add(deltas).
+    Index/value construction from small Python collections (tens of elements).
     """
-    result_np = np.array(logits, copy=True)
+    result = logits
 
     # Repetition penalty
     if (
         intervention.repetition_penalty is not None
         and intervention.repetition_penalty != 1.0
     ):
-        for token_id in set(token_history):
-            if result_np[token_id] > 0:
-                result_np[token_id] /= intervention.repetition_penalty
-            else:
-                result_np[token_id] *= intervention.repetition_penalty
+        unique_ids = list(set(token_history))
+        if unique_ids:
+            indices = mx.array(unique_ids)
+            vals = result[indices]
+            pos_result = vals / intervention.repetition_penalty
+            neg_result = vals * intervention.repetition_penalty
+            penalized = mx.where(vals > 0, pos_result, neg_result)
+            result = result.at[indices].add(penalized - vals)
 
     # Presence penalty
     if (
         intervention.presence_penalty is not None
         and intervention.presence_penalty != 0.0
     ):
-        for token_id in set(token_history):
-            result_np[token_id] -= intervention.presence_penalty
+        unique_ids = list(set(token_history))
+        if unique_ids:
+            indices = mx.array(unique_ids)
+            deltas = mx.full((len(unique_ids),), -intervention.presence_penalty)
+            result = result.at[indices].add(deltas)
 
     # Frequency penalty
     if (
@@ -63,22 +124,33 @@ def apply_penalties_mlx(
         and intervention.frequency_penalty != 0.0
     ):
         counts = Counter(token_history)
-        for token_id, count in counts.items():
-            result_np[token_id] -= intervention.frequency_penalty * count
+        if counts:
+            ids = list(counts.keys())
+            freq_deltas = [-intervention.frequency_penalty * counts[tid] for tid in ids]
+            indices = mx.array(ids)
+            deltas = mx.array(freq_deltas)
+            result = result.at[indices].add(deltas)
 
     # Logit bias
     if intervention.logit_bias is not None:
-        for token_id, bias in intervention.logit_bias.items():
-            result_np[token_id] += bias
+        ids = list(intervention.logit_bias.keys())
+        if ids:
+            biases = [intervention.logit_bias[tid] for tid in ids]
+            indices = mx.array(ids)
+            deltas = mx.array(biases)
+            result = result.at[indices].add(deltas)
 
-    return mx.array(result_np)
+    return result
 
 
 def apply_shaping_mlx(
     logits: mx.array,
     intervention: ModelIntervention,
 ) -> mx.array:
-    """Post-OT: apply temperature, top-k, top-p to redistributed logits."""
+    """Post-OT: apply temperature, top-k, top-p to redistributed logits.
+
+    Pure MLX — no numpy conversions.
+    """
     result = logits
 
     # Temperature
@@ -88,53 +160,46 @@ def apply_shaping_mlx(
         intervention.temperature is not None
         and intervention.temperature == 0
     ):
-        # Greedy: set all but max to -inf
-        max_idx = int(mx.argmax(result).item())
-        result_np = np.full(result.shape, float("-inf"), dtype=np.float32)
-        result_np[max_idx] = float(result[max_idx].item())
-        result = mx.array(result_np)
+        # Greedy: keep only max value(s), set rest to -inf
+        max_val = mx.max(result)
+        result = mx.where(result >= max_val, result, mx.array(float("-inf")))
 
     # Top-k
     if intervention.top_k is not None and intervention.top_k > 0:
         k = min(intervention.top_k, result.shape[-1])
-        # Get top-k values to find threshold
         top_vals = mx.topk(result, k)
-        threshold = float(mx.min(top_vals).item())
-        result = mx.where(result >= threshold, result, float("-inf"))
+        threshold = mx.min(top_vals)
+        result = mx.where(result >= threshold, result, mx.array(float("-inf")))
 
-    # Top-p (nucleus)
+    # Top-p (nucleus) — pure MLX
     if intervention.top_p is not None and intervention.top_p < 1.0:
-        result_np = np.array(result)
-        sorted_indices = np.argsort(-result_np)
-        sorted_logits = result_np[sorted_indices]
-        probs = np.exp(sorted_logits - sorted_logits.max())
-        probs = probs / probs.sum()
-        cumulative = np.cumsum(probs)
-        cutoff = cumulative - probs > intervention.top_p
-        sorted_logits[cutoff] = float("-inf")
-        # Unsort
-        output = np.empty_like(sorted_logits)
-        output[sorted_indices] = sorted_logits
-        result = mx.array(output)
+        sorted_indices = mx.argsort(-result)
+        sorted_logits = result[sorted_indices]
+        probs = mx.softmax(sorted_logits, axis=-1)
+        cumulative = mx.cumsum(probs)
+        cutoff = (cumulative - probs) > intervention.top_p
+        sorted_logits = mx.where(cutoff, mx.array(float("-inf")), sorted_logits)
+        # Unsort: scatter back to original positions
+        unsort_indices = mx.argsort(sorted_indices)
+        result = sorted_logits[unsort_indices]
 
     return result
 
 
 def run_constrained_generation_mlx(
-    grammar_state: GrammarState,
+    grammar_state: GrammarStateMlx,
     forward_fn: Callable[[list[int]], mx.array],
     tokenizer_decode: Callable[[list[int]], str],
     embeddings: mx.array,
-    hooks: list[InferenceHook],
+    hooks: list[InferenceHookMlx],
     transport_config: TransportConfig,
     max_tokens: int = 512,
     context_tokens: list[int] | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
-    MLX-native version: all per-token math stays in mx.array.
-    Grammar mask converted from torch once per token. Hook calls receive
-    torch tensors (hooks are user-provided and may depend on torch).
+    Fully MLX-native loop. Zero torch, zero numpy in computation.
+    Only Python scalar extraction: int() on token ID.
     """
     start_time = time.monotonic()
     tokens: list[int] = []
@@ -149,47 +214,57 @@ def run_constrained_generation_mlx(
 
     vocab_size = embeddings.shape[0]
 
+    # Detect grammar state type once
+    has_mlx_mask = hasattr(grammar_state, "get_valid_mask_mx")
+
     for position in range(max_tokens):
+        _t0 = time.monotonic()
+
         # 1. Forward pass (returns mx.array)
         raw_logits = forward_fn(token_history)
+        _t1 = time.monotonic()
 
-        # 2. Grammar mask (torch -> numpy -> mx)
-        valid_mask_torch = grammar_state.get_valid_mask(vocab_size)
-        valid_mask_np = valid_mask_torch.numpy()
-        valid_mask_mx = mx.array(valid_mask_np)
-        valid_count = int(valid_mask_np.sum())
+        # 2. Grammar mask — pure MLX via llguidance.mlx (or fallback)
+        if has_mlx_mask:
+            valid_mask = grammar_state.get_valid_mask_mx(vocab_size)
+        else:
+            # Fallback for torch-based grammar states
+            valid_mask_torch = grammar_state.get_valid_mask(vocab_size)
+            valid_mask = mx.array(valid_mask_torch.numpy())
+        valid_count = int(mx.sum(valid_mask).item())
         grammar_valid_counts.append(valid_count)
+        _t2 = time.monotonic()
 
-        # 3. Hooks (convert to torch for hook interface)
+        # 3. Hooks — pure MLX, receive mx.array + pre-computed mask
         if hooks:
-            import torch
-            raw_logits_torch = torch.from_numpy(np.array(raw_logits))
             interventions = [
-                hook.pre_forward(
-                    position, grammar_state, token_history, raw_logits_torch
-                )
+                hook.pre_forward(position, valid_mask, token_history, raw_logits)
                 for hook in hooks
             ]
             merged = merge_interventions(interventions)
         else:
             merged = ModelIntervention()
+        _t3 = time.monotonic()
 
-        # 4. Pre-OT penalties
+        # 4. Pre-OT penalties — pure MLX scatter
         adjusted = apply_penalties_mlx(raw_logits, merged, token_history)
+        _t4 = time.monotonic()
 
-        # 5. OT redistribution
+        # 5. OT redistribution — pure MLX
         ot_start = time.monotonic()
         ot_result = redistribute_logits_mlx(
-            adjusted, valid_mask_mx, embeddings, config=transport_config
+            adjusted, valid_mask, embeddings, config=transport_config
         )
         ot_elapsed_ms = (time.monotonic() - ot_start) * 1000
         ot_computation_total_ms += ot_elapsed_ms
         wasserstein_distances.append(ot_result.wasserstein_distance)
         if ot_result.bypassed:
             ot_bypassed_count += 1
+        _t5 = time.monotonic()
 
-        # 6. Post-OT shaping
+        # 6. Post-OT shaping — pure MLX
         shaped = apply_shaping_mlx(ot_result.logits, merged)
+        _t6 = time.monotonic()
 
         # Record temperature and top_p applied
         temperatures_applied.append(
@@ -201,21 +276,22 @@ def run_constrained_generation_mlx(
             merged.top_p if merged.top_p is not None else -1.0
         )
 
-        # 7. Sample token (mx.random.categorical takes logits)
-        # Guard against all-inf logits: fallback to uniform over valid
+        # 7. Sample token — materialize graph, then sample
+        mx.eval(shaped)
         probs_check = mx.softmax(shaped, axis=-1)
         prob_sum = float(mx.sum(probs_check).item())
         if prob_sum > 0:
             token_id = int(mx.random.categorical(shaped).item())
         else:
             # Fallback: uniform over valid tokens
-            uniform = valid_mask_mx.astype(mx.float32)
+            uniform = valid_mask.astype(mx.float32)
             uniform = uniform / mx.sum(uniform)
             token_id = int(
                 mx.random.categorical(mx.log(uniform)).item()
             )
         tokens.append(token_id)
         token_history.append(token_id)
+        _t7 = time.monotonic()
 
         # Record log prob
         probs = mx.softmax(shaped, axis=-1)
@@ -225,9 +301,27 @@ def run_constrained_generation_mlx(
             else float("-inf")
         )
         token_log_probs.append(log_prob)
+        _t8 = time.monotonic()
 
         # 8. Advance grammar
         grammar_state.advance(token_id)
+        _t9 = time.monotonic()
+
+        if position < 5 or position % 20 == 0:
+            logger.info(
+                "constrained_mlx_timing",
+                pos=position,
+                forward_ms=round((_t1 - _t0) * 1000, 1),
+                grammar_ms=round((_t2 - _t1) * 1000, 1),
+                hooks_ms=round((_t3 - _t2) * 1000, 1),
+                penalties_ms=round((_t4 - _t3) * 1000, 1),
+                ot_ms=round((_t5 - _t4) * 1000, 1),
+                shaping_ms=round((_t6 - _t5) * 1000, 1),
+                sample_ms=round((_t7 - _t6) * 1000, 1),
+                logprob_ms=round((_t8 - _t7) * 1000, 1),
+                advance_ms=round((_t9 - _t8) * 1000, 1),
+                total_ms=round((_t9 - _t0) * 1000, 1),
+            )
 
         # Check if grammar accepts
         if grammar_state.is_accepting():

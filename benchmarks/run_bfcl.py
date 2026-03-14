@@ -23,9 +23,7 @@ from pathlib import Path
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import mlx.core as mx
-import numpy as np
 import structlog
-import torch
 
 structlog.configure(
     processors=[
@@ -104,6 +102,12 @@ def register_model_config(model_name: str) -> None:
 
     if model_name not in MODEL_CONFIG_MAPPING:
         MODEL_CONFIG_MAPPING[model_name] = ModelConfig(
+            model_name=model_name,
+            display_name=model_name,
+            url="",
+            org="tgirl",
+            license="Apache-2.0",
+            model_handler="default",
             underscore_to_dot=False,
         )
         log.info("registered_model_config", model_name=model_name)
@@ -116,7 +120,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
     from tgirl.bfcl import load_test_data, register_bfcl_tools, sexpr_to_bfcl
     from tgirl.cache import CacheStats, make_mlx_forward_fn
     from tgirl.format import ChatTemplateFormatter
-    from tgirl.outlines_adapter import make_outlines_grammar_factory
+    from tgirl.outlines_adapter import (
+        make_outlines_grammar_factory,
+        make_outlines_grammar_factory_mlx,
+    )
     from tgirl.registry import ToolRegistry
     from tgirl.sample import GrammarTemperatureHook, SamplingSession
     from tgirl.transport import TransportConfig
@@ -128,21 +135,22 @@ def run_benchmark(args: argparse.Namespace) -> None:
     hf_tokenizer = mlx_tokenizer._tokenizer
 
     mlx_embed = mlx_model.language_model.model.embed_tokens.weight.astype(mx.float32)
-    mx.eval(mlx_embed)
-    embeddings = torch.from_numpy(np.array(mlx_embed, copy=False))
+    mx.eval(mlx_embed)  # materialize embedding weights
+    embeddings = mlx_embed  # Keep as mx.array for MLX backend
     log.info("model_loaded", vocab_size=embeddings.shape[0])
 
     cache_stats = CacheStats()
     forward_fn = make_mlx_forward_fn(mlx_model, stats=cache_stats)
 
-    # --- 2. Grammar factory + formatter ---
+    # --- 2. Grammar factories + formatter ---
     grammar_factory = make_outlines_grammar_factory(hf_tokenizer)
+    mlx_grammar_factory = make_outlines_grammar_factory_mlx(hf_tokenizer)
     formatter = ChatTemplateFormatter(hf_tokenizer)
 
     # --- 3. Session config ---
     session_config = SessionConfig(
         max_tool_cycles=1,
-        freeform_max_tokens=4096,
+        freeform_max_tokens=512,
         constrained_max_tokens=4096,
         session_timeout=30.0,
     )
@@ -192,6 +200,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
             transport_config=transport_config,
             rerank_config=rerank_config,
             formatter=formatter,
+            backend="mlx",
+            mlx_grammar_guide_factory=mlx_grammar_factory,
         )
 
         t0 = time.monotonic()

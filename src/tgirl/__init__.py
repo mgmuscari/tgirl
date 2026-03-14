@@ -78,6 +78,9 @@ from tgirl.types import (
 
 try:
     from tgirl.sample_mlx import (
+        GrammarStateMlx,
+        GrammarTemperatureHookMlx,
+        InferenceHookMlx,
         apply_penalties_mlx,
         apply_shaping_mlx,
         run_constrained_generation_mlx,
@@ -88,6 +91,14 @@ try:
     )
 except ImportError:
     pass  # mlx not available
+
+try:
+    from tgirl.outlines_adapter import (
+        LLGuidanceGrammarStateMlx,
+        make_outlines_grammar_factory_mlx,
+    )
+except ImportError:
+    pass  # llguidance/mlx not available
 
 __version__ = "0.1.0"
 
@@ -151,6 +162,11 @@ __all__ = [
     "TransportResultMlx",
     "apply_penalties_mlx",
     "apply_shaping_mlx",
+    "GrammarStateMlx",
+    "GrammarTemperatureHookMlx",
+    "InferenceHookMlx",
+    "LLGuidanceGrammarStateMlx",
+    "make_outlines_grammar_factory_mlx",
     "run_constrained_generation",
     "run_constrained_generation_mlx",
     "run_pipeline",

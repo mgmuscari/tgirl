@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import mlx.core as mx
+import numpy as np
 import structlog
 
 from tgirl.transport import TransportConfig
@@ -126,6 +127,9 @@ def _sinkhorn_log_domain_mlx(
             log_kernel + mx.expand_dims(log_u, axis=1), axis=0
         )
 
+        # Materialize graph to prevent unbounded growth
+        mx.eval(log_u, log_v)
+
         # Check convergence
         log_plan_row_sums = mx.logsumexp(
             log_kernel + mx.expand_dims(log_u, axis=1) + mx.expand_dims(log_v, axis=0),
@@ -216,14 +220,12 @@ def redistribute_logits_mlx(
             iterations=0,
         )
 
-    # Full OT path
+    # Full OT path — vectorized index construction (no O(vocab) .item())
     vocab_size = logits.shape[0]
-    invalid_indices = mx.array(
-        [i for i in range(vocab_size) if not bool(valid_mask[i].item())]
-    )
-    valid_indices = mx.array(
-        [i for i in range(vocab_size) if bool(valid_mask[i].item())]
-    )
+    mx.eval(valid_mask)  # materialize mask before numpy conversion
+    mask_np = np.array(valid_mask)
+    valid_indices = mx.array(np.where(mask_np)[0].astype(np.int32))
+    invalid_indices = mx.array(np.where(~mask_np)[0].astype(np.int32))
 
     # Check problem size
     problem_size = len(invalid_indices) * len(valid_indices)

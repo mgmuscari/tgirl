@@ -31,6 +31,14 @@ except ImportError as e:
         "Install with: pip install 'tgirl[sample]' llguidance"
     ) from e
 
+try:
+    import llguidance.mlx as llg_mlx
+    import mlx.core as mx
+
+    _HAS_MLX = True
+except ImportError:
+    _HAS_MLX = False
+
 
 class LLGuidanceGrammarState:
     """GrammarState implementation backed by llguidance's LLMatcher.
@@ -117,5 +125,77 @@ def make_outlines_grammar_factory(
         spec = llguidance.grammar_from("lark", grammar_text)
         matcher = LLMatcher(llg_tokenizer, spec)
         return LLGuidanceGrammarState(matcher, llg_vocab_size)
+
+    return factory
+
+
+class LLGuidanceGrammarStateMlx:
+    """GrammarState implementation using llguidance.mlx — zero torch.
+
+    Uses llguidance's native MLX support for grammar mask application,
+    avoiding all torch tensor allocations in the constrained generation loop.
+    """
+
+    def __init__(self, matcher: LLMatcher, llg_vocab_size: int) -> None:
+        self._matcher = matcher
+        self._llg_vocab_size = llg_vocab_size
+        self._bitmask = llg_mlx.allocate_token_bitmask(1, llg_vocab_size)
+
+    def apply_mask_to_logits(self, logits: mx.array) -> mx.array:
+        """Apply grammar mask directly to mx.array logits. Zero torch."""
+        llg_mlx.fill_next_token_bitmask(self._matcher, self._bitmask, 0)
+        result = llg_mlx.apply_token_bitmask(logits, self._bitmask[0])
+        # Preserve input shape — apply_token_bitmask may add batch dim
+        if result.ndim > logits.ndim:
+            result = result.reshape(logits.shape)
+        return result
+
+    def get_valid_mask_mx(self, tokenizer_vocab_size: int) -> mx.array:
+        """Return boolean mask as mx.array for use in OT/sampling."""
+        zeros = mx.zeros(self._llg_vocab_size)
+        masked = self.apply_mask_to_logits(zeros)
+        mask = masked > float("-inf")
+        # apply_token_bitmask may return 2D — squeeze to 1D
+        if mask.ndim > 1:
+            mask = mask.reshape(-1)
+        if tokenizer_vocab_size > self._llg_vocab_size:
+            mask = mx.concatenate(
+                [mask, mx.zeros(tokenizer_vocab_size - self._llg_vocab_size, dtype=mx.bool_)]
+            )
+        elif tokenizer_vocab_size < self._llg_vocab_size:
+            mask = mask[:tokenizer_vocab_size]
+        return mask
+
+    def is_accepting(self) -> bool:
+        """Check if the grammar is in an accepting/final state."""
+        return bool(self._matcher.is_accepting())
+
+    def advance(self, token_id: int) -> None:
+        """Consume a token and advance the grammar state."""
+        self._matcher.consume_token(token_id)
+        error = self._matcher.get_error()
+        if error:
+            logger.warning("llguidance_error", error=error, token_id=token_id)
+
+
+def make_outlines_grammar_factory_mlx(
+    tokenizer: object,
+) -> Callable[[str], LLGuidanceGrammarStateMlx]:
+    """Create a grammar factory that produces MLX-native GrammarState.
+
+    Uses llguidance.mlx for zero-torch grammar mask application.
+    """
+    if not _HAS_MLX:
+        raise ImportError(
+            "MLX grammar factory requires mlx and llguidance.mlx. "
+            "Install with: pip install mlx llguidance"
+        )
+    llg_tokenizer = llguidance.hf.from_tokenizer(tokenizer)
+    llg_vocab_size: int = llg_tokenizer.vocab_size
+
+    def factory(grammar_text: str) -> LLGuidanceGrammarStateMlx:
+        spec = llguidance.grammar_from("lark", grammar_text)
+        matcher = LLMatcher(llg_tokenizer, spec)
+        return LLGuidanceGrammarStateMlx(matcher, llg_vocab_size)
 
     return factory
