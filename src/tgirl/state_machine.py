@@ -301,3 +301,156 @@ class ConstrainedConfidenceMonitor:
         """Reset monitor state for a new constrained generation pass."""
         self._log_probs.clear()
         self._backtrack_count = 0
+
+
+# --- Confidence-Based Transition Policy ---
+
+
+class ConfidenceTransitionPolicy:
+    """Markov chain on model signals for freeform-to-constrained transition.
+
+    Accumulates belief that the model is converging on structured output.
+    Signals: grammar mask overlap (rising), entropy (dropping),
+    log prob at grammar-valid tokens, and trend over a sliding window.
+
+    Belief update: belief = clamp(belief + weighted_signal, 0, 1)
+    Transition when belief exceeds threshold.
+    """
+
+    def __init__(
+        self,
+        threshold: float = 0.7,
+        w_readiness: float = 0.4,
+        w_certainty: float = 0.3,
+        w_quality: float = 0.2,
+        w_trend: float = 0.1,
+        decay: float = 0.9,
+    ) -> None:
+        self.threshold = threshold
+        self.w_readiness = w_readiness
+        self.w_certainty = w_certainty
+        self.w_quality = w_quality
+        self.w_trend = w_trend
+        self.decay = decay
+        self._belief = 0.0
+        self._overlap_history: list[float] = []
+
+    def evaluate(
+        self,
+        current_state: SessionState,
+        signal: TransitionSignal,
+        **kwargs: object,
+    ) -> TransitionDecision:
+        if current_state != SessionState.FREEFORM:
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="not in freeform state",
+                confidence=0.0,
+            )
+
+        # Compute signal components
+        readiness = signal.grammar_mask_overlap  # 0-1
+        certainty = max(0.0, 1.0 - signal.token_entropy / 10.0)  # normalize
+        quality = max(0.0, 1.0 + signal.token_log_prob)  # log_prob near 0 = good
+
+        # Trend: rising overlap
+        self._overlap_history.append(signal.grammar_mask_overlap)
+        if len(self._overlap_history) >= 3:
+            recent = self._overlap_history[-3:]
+            trend = (recent[-1] - recent[0]) / 2.0  # positive = rising
+        else:
+            trend = 0.0
+
+        # Weighted signal update
+        delta = (
+            self.w_readiness * readiness
+            + self.w_certainty * certainty
+            + self.w_quality * quality
+            + self.w_trend * max(0.0, trend)
+        )
+
+        # Belief update with decay
+        self._belief = min(1.0, max(0.0, self._belief * self.decay + delta))
+
+        if self._belief >= self.threshold:
+            return TransitionDecision(
+                should_transition=True,
+                target_state=SessionState.ROUTE,
+                reason=f"confidence threshold reached ({self._belief:.3f})",
+                confidence=self._belief,
+            )
+
+        return TransitionDecision(
+            should_transition=False,
+            target_state=None,
+            reason=f"belief below threshold ({self._belief:.3f}/{self.threshold})",
+            confidence=self._belief,
+        )
+
+    def reset(self) -> None:
+        """Reset belief for next cycle."""
+        self._belief = 0.0
+        self._overlap_history.clear()
+
+
+class CompositeTransitionPolicy:
+    """Combine multiple policies with OR or AND logic.
+
+    OR mode: transition if ANY policy triggers (first match wins).
+    AND mode: transition only if ALL policies agree.
+    """
+
+    def __init__(
+        self,
+        policies: list,
+        mode: str = "or",
+    ) -> None:
+        self.policies = policies
+        self.mode = mode
+
+    def evaluate(
+        self,
+        current_state: SessionState,
+        signal: TransitionSignal,
+        **kwargs: object,
+    ) -> TransitionDecision:
+        if not self.policies:
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="no policies configured",
+                confidence=0.0,
+            )
+
+        decisions = [
+            p.evaluate(current_state, signal, **kwargs) for p in self.policies
+        ]
+
+        if self.mode == "or":
+            for d in decisions:
+                if d.should_transition:
+                    return d
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="no policy triggered (OR mode)",
+                confidence=max(d.confidence for d in decisions),
+            )
+        else:  # "and"
+            if all(d.should_transition for d in decisions):
+                # Use highest confidence decision
+                best = max(decisions, key=lambda d: d.confidence)
+                return best
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="not all policies agree (AND mode)",
+                confidence=min(d.confidence for d in decisions),
+            )
+
+    def reset(self) -> None:
+        """Reset all sub-policies."""
+        for p in self.policies:
+            if hasattr(p, "reset"):
+                p.reset()

@@ -878,6 +878,212 @@ class TestBacktrackSteeringHook:
         assert isinstance(hook, InferenceHook)
 
 
+class TestConfidenceTransitionPolicy:
+    """ConfidenceTransitionPolicy uses Markov chain on model signals."""
+
+    def test_construction_defaults(self) -> None:
+        from tgirl.state_machine import ConfidenceTransitionPolicy
+
+        policy = ConfidenceTransitionPolicy()
+        assert policy.threshold > 0
+        assert policy.w_readiness >= 0
+        assert policy.w_certainty >= 0
+
+    def test_no_transition_at_low_belief(self) -> None:
+        from tgirl.state_machine import (
+            ConfidenceTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = ConfidenceTransitionPolicy(threshold=0.8)
+        # Low overlap, high entropy = low belief
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=0.01,
+            token_entropy=5.0,
+            token_log_prob=-3.0,
+            grammar_freedom=0.5,
+        )
+        decision = policy.evaluate(SessionState.FREEFORM, signal)
+        assert decision.should_transition is False
+
+    def test_transition_at_high_belief(self) -> None:
+        from tgirl.state_machine import (
+            ConfidenceTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = ConfidenceTransitionPolicy(threshold=0.3)
+        # High overlap, low entropy = high belief
+        # Feed enough signals to accumulate belief
+        for _ in range(5):
+            signal = TransitionSignal(
+                token_position=0,
+                grammar_mask_overlap=0.9,
+                token_entropy=0.5,
+                token_log_prob=-0.1,
+                grammar_freedom=0.01,
+            )
+            decision = policy.evaluate(SessionState.FREEFORM, signal)
+
+        # After accumulation, should transition
+        assert decision.should_transition is True
+        assert decision.target_state == SessionState.ROUTE
+
+    def test_only_evaluates_in_freeform_state(self) -> None:
+        from tgirl.state_machine import (
+            ConfidenceTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = ConfidenceTransitionPolicy()
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=1.0,
+            token_entropy=0.0,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+        decision = policy.evaluate(SessionState.CONSTRAINED, signal)
+        assert decision.should_transition is False
+
+    def test_reset_clears_belief(self) -> None:
+        from tgirl.state_machine import (
+            ConfidenceTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = ConfidenceTransitionPolicy(threshold=0.3)
+        # Build up belief
+        for _ in range(10):
+            signal = TransitionSignal(
+                token_position=0,
+                grammar_mask_overlap=0.9,
+                token_entropy=0.1,
+                token_log_prob=-0.01,
+                grammar_freedom=0.0,
+            )
+            policy.evaluate(SessionState.FREEFORM, signal)
+
+        policy.reset()
+
+        # After reset, low signal should not transition
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=0.01,
+            token_entropy=5.0,
+            token_log_prob=-3.0,
+            grammar_freedom=0.5,
+        )
+        decision = policy.evaluate(SessionState.FREEFORM, signal)
+        assert decision.should_transition is False
+
+    def test_conforms_to_protocol(self) -> None:
+        from tgirl.state_machine import ConfidenceTransitionPolicy, TransitionPolicy
+
+        assert isinstance(ConfidenceTransitionPolicy(), TransitionPolicy)
+
+
+class TestCompositeTransitionPolicy:
+    """CompositeTransitionPolicy combines policies with OR/AND modes."""
+
+    def test_or_mode_any_triggers(self) -> None:
+        from tgirl.state_machine import (
+            CompositeTransitionPolicy,
+            ImmediateTransitionPolicy,
+            SessionState,
+            TransitionDecision,
+            TransitionSignal,
+        )
+
+        class NeverPolicy:
+            def evaluate(self, cs, sig, **kw):
+                return TransitionDecision(
+                    should_transition=False,
+                    target_state=None,
+                    reason="never",
+                    confidence=0.0,
+                )
+
+        policy = CompositeTransitionPolicy(
+            policies=[NeverPolicy(), ImmediateTransitionPolicy()],
+            mode="or",
+        )
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=0.0,
+            token_entropy=0.0,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+        decision = policy.evaluate(SessionState.FREEFORM, signal)
+        assert decision.should_transition is True
+
+    def test_and_mode_requires_all(self) -> None:
+        from tgirl.state_machine import (
+            CompositeTransitionPolicy,
+            ImmediateTransitionPolicy,
+            SessionState,
+            TransitionDecision,
+            TransitionSignal,
+        )
+
+        class NeverPolicy:
+            def evaluate(self, cs, sig, **kw):
+                return TransitionDecision(
+                    should_transition=False,
+                    target_state=None,
+                    reason="never",
+                    confidence=0.0,
+                )
+
+        policy = CompositeTransitionPolicy(
+            policies=[NeverPolicy(), ImmediateTransitionPolicy()],
+            mode="and",
+        )
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=0.0,
+            token_entropy=0.0,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+        decision = policy.evaluate(SessionState.FREEFORM, signal)
+        assert decision.should_transition is False
+
+    def test_and_mode_all_agree(self) -> None:
+        from tgirl.state_machine import (
+            CompositeTransitionPolicy,
+            ImmediateTransitionPolicy,
+            SessionState,
+            TransitionSignal,
+        )
+
+        policy = CompositeTransitionPolicy(
+            policies=[ImmediateTransitionPolicy(), ImmediateTransitionPolicy()],
+            mode="and",
+        )
+        signal = TransitionSignal(
+            token_position=0,
+            grammar_mask_overlap=0.0,
+            token_entropy=0.0,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+        decision = policy.evaluate(SessionState.FREEFORM, signal)
+        assert decision.should_transition is True
+
+    def test_conforms_to_protocol(self) -> None:
+        from tgirl.state_machine import CompositeTransitionPolicy, TransitionPolicy
+
+        policy = CompositeTransitionPolicy(policies=[], mode="or")
+        assert isinstance(policy, TransitionPolicy)
+
+
 class TestMakeTransitionPolicy:
     """Test the BFCL benchmark policy parser."""
 
