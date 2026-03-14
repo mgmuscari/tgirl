@@ -1,6 +1,6 @@
 # PRD: MLX-Native Inference Path
 
-## Status: DRAFT
+## Status: IMPLEMENTED
 ## Author: agent
 ## Date: 2026-03-13
 ## Branch: feature/mlx-native-inference
