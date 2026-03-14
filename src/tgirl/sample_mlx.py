@@ -13,7 +13,6 @@ from collections.abc import Callable
 import mlx.core as mx
 import numpy as np
 import structlog
-import torch
 
 from tgirl.sample import (
     ConstrainedGenerationResult,
@@ -163,6 +162,7 @@ def run_constrained_generation_mlx(
 
         # 3. Hooks (convert to torch for hook interface)
         if hooks:
+            import torch
             raw_logits_torch = torch.from_numpy(np.array(raw_logits))
             interventions = [
                 hook.pre_forward(
@@ -202,7 +202,18 @@ def run_constrained_generation_mlx(
         )
 
         # 7. Sample token (mx.random.categorical takes logits)
-        token_id = int(mx.random.categorical(shaped).item())
+        # Guard against all-inf logits: fallback to uniform over valid
+        probs_check = mx.softmax(shaped, axis=-1)
+        prob_sum = float(mx.sum(probs_check).item())
+        if prob_sum > 0:
+            token_id = int(mx.random.categorical(shaped).item())
+        else:
+            # Fallback: uniform over valid tokens
+            uniform = valid_mask_mx.astype(mx.float32)
+            uniform = uniform / mx.sum(uniform)
+            token_id = int(
+                mx.random.categorical(mx.log(uniform)).item()
+            )
         tokens.append(token_id)
         token_history.append(token_id)
 

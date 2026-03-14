@@ -421,6 +421,8 @@ class SamplingSession:
             else None
         )
         self._embeddings_mlx: Any = None  # Lazy-converted on first MLX use
+        # Map session backend to router backend ("auto" -> "torch" default)
+        _router_backend = "mlx" if backend == "mlx" else "torch"
         self._router = (
             ToolRouter(
                 grammar_guide_factory=grammar_guide_factory,
@@ -428,6 +430,7 @@ class SamplingSession:
                 tokenizer_decode=tokenizer_decode,
                 embeddings=embeddings,
                 config=rerank_config,
+                backend=_router_backend,
             )
             if rerank_config is not None
             else None
@@ -536,9 +539,20 @@ class SamplingSession:
                     logits = raw_logits / max(
                         self._config.freeform_temperature, 1e-10
                     )
-                    token_id = int(
-                        mx.random.categorical(logits).item()
-                    )
+                    probs_check = mx.softmax(logits, axis=-1)
+                    prob_sum = float(mx.sum(probs_check).item())
+                    if prob_sum > 0:
+                        token_id = int(
+                            mx.random.categorical(logits).item()
+                        )
+                    else:
+                        # Fallback: uniform over vocab
+                        n = logits.shape[0]
+                        token_id = int(
+                            mx.random.categorical(
+                                mx.zeros((n,))
+                            ).item()
+                        )
                 else:
                     # Torch path (unchanged)
                     logits = raw_logits / max(
