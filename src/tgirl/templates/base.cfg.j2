@@ -21,5 +21,8 @@ SPACE: " "
 
 // Shared terminals
 %import common.ESCAPED_STRING
-%import common.SIGNED_INT
-%import common.SIGNED_FLOAT
+
+// Bounded numeric terminals — prevent runaway digit generation
+// that exhausts constrained_max_tokens before the closing ")"
+SIGNED_INT: /[+-]?[0-9]{1,18}/
+SIGNED_FLOAT: /[+-]?[0-9]{1,18}(\.[0-9]{1,10})?([eE][+-]?[0-9]{1,3})?/

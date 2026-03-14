@@ -195,6 +195,96 @@ class TestFactory:
         assert mask.sum().item() < gpt2_tokenizer.vocab_size
 
 
+class TestGetValidMaskNp:
+    """get_valid_mask_np returns correct numpy array."""
+
+    def test_returns_ndarray(self, grammar_factory, gpt2_tokenizer):
+        import numpy as np
+
+        state = grammar_factory(SIMPLE_GRAMMAR)
+        mask = state.get_valid_mask_np(gpt2_tokenizer.vocab_size)
+        assert isinstance(mask, np.ndarray)
+        assert mask.dtype == np.bool_
+
+    def test_matches_torch_mask(self, grammar_factory, gpt2_tokenizer):
+        import numpy as np
+
+        state = grammar_factory(SIMPLE_GRAMMAR)
+        mask_torch = state.get_valid_mask(gpt2_tokenizer.vocab_size)
+        mask_np = state.get_valid_mask_np(gpt2_tokenizer.vocab_size)
+        np.testing.assert_array_equal(mask_np, mask_torch.numpy())
+
+
+class TestMlxGrammarState:
+    """LLGuidanceGrammarStateMlx produces correct MLX-native masks."""
+
+    @pytest.fixture(scope="class")
+    def mlx_grammar_factory(self, gpt2_tokenizer):
+        mlx = pytest.importorskip("mlx.core")
+        pytest.importorskip("llguidance.mlx")
+        from tgirl.outlines_adapter import make_outlines_grammar_factory_mlx
+
+        return make_outlines_grammar_factory_mlx(gpt2_tokenizer)
+
+    def test_produces_mlx_grammar_state(self, mlx_grammar_factory):
+        from tgirl.outlines_adapter import LLGuidanceGrammarStateMlx
+
+        state = mlx_grammar_factory(SIMPLE_GRAMMAR)
+        assert isinstance(state, LLGuidanceGrammarStateMlx)
+
+    def test_get_valid_mask_mx_returns_mx_array(self, mlx_grammar_factory, gpt2_tokenizer):
+        import mlx.core as mx
+
+        state = mlx_grammar_factory(SIMPLE_GRAMMAR)
+        mask = state.get_valid_mask_mx(gpt2_tokenizer.vocab_size)
+        assert isinstance(mask, mx.array)
+
+    def test_mask_constrains_initial_state(self, mlx_grammar_factory, gpt2_tokenizer):
+        import mlx.core as mx
+        import numpy as np
+
+        state = mlx_grammar_factory(SIMPLE_GRAMMAR)
+        mask = state.get_valid_mask_mx(gpt2_tokenizer.vocab_size)
+        valid_count = int(mx.sum(mask).item())
+        assert valid_count < gpt2_tokenizer.vocab_size
+        assert valid_count >= 1
+
+    def test_mlx_mask_matches_torch_mask(self, grammar_factory, gpt2_tokenizer):
+        """MLX and torch grammar states produce equivalent masks."""
+        mlx = pytest.importorskip("mlx.core")
+        pytest.importorskip("llguidance.mlx")
+        import numpy as np
+
+        from tgirl.outlines_adapter import make_outlines_grammar_factory_mlx
+
+        mlx_factory = make_outlines_grammar_factory_mlx(gpt2_tokenizer)
+
+        torch_state = grammar_factory(SIMPLE_GRAMMAR)
+        mlx_state = mlx_factory(SIMPLE_GRAMMAR)
+
+        torch_mask = torch_state.get_valid_mask(gpt2_tokenizer.vocab_size)
+        mlx_mask = mlx_state.get_valid_mask_mx(gpt2_tokenizer.vocab_size)
+
+        np.testing.assert_array_equal(
+            np.array(mlx_mask),
+            torch_mask.numpy(),
+        )
+
+    def test_advance_and_accepting(self, mlx_grammar_factory, gpt2_tokenizer):
+        state = mlx_grammar_factory(SIMPLE_GRAMMAR)
+        assert state.is_accepting() is False
+        tokens = gpt2_tokenizer.encode("(add 1 2)")
+        for tid in tokens:
+            state.advance(tid)
+        assert state.is_accepting() is True
+
+    def test_satisfies_grammar_state_mlx_protocol(self, mlx_grammar_factory):
+        from tgirl.sample_mlx import GrammarStateMlx
+
+        state = mlx_grammar_factory(SIMPLE_GRAMMAR)
+        assert isinstance(state, GrammarStateMlx)
+
+
 class TestWithRealTgirlGrammar:
     """Integration: generate grammar from registry, use with adapter."""
 

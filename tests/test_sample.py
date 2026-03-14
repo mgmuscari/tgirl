@@ -1173,3 +1173,176 @@ class TestSamplingSessionRunChat:
 
         with pytest.raises(ValueError, match="formatter"):
             session.run_chat([{"role": "user", "content": "hi"}])
+
+
+class TestSamplingSessionBackend:
+    """Backend detection and dispatch in SamplingSession."""
+
+    def test_session_torch_backend_unchanged(self) -> None:
+        """Existing torch forward_fn continues to work."""
+        import torch
+
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5)
+        def greet(name: str) -> str:
+            return f"Hello, {name}!"
+
+        # Forward fn returns torch.Tensor
+        token_idx = [0]
+
+        def forward_fn(ctx):
+            token_idx[0] += 1
+            logits = torch.zeros(256)
+            logits[ord("x")] = 100.0
+            return logits
+
+        config = SessionConfig(
+            freeform_max_tokens=3,
+            max_tool_cycles=0,
+        )
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "".join(chr(i) for i in ids),
+            tokenizer_encode=lambda s: [ord(c) for c in s],
+            embeddings=torch.eye(256),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            config=config,
+            transport_config=TransportConfig(),
+        )
+
+        result = session.run(prompt_tokens=[1, 2, 3])
+        assert result.total_tokens > 0
+        assert result.total_cycles == 0
+
+    def test_session_mlx_backend_detection(self) -> None:
+        """forward_fn returning mx.array triggers MLX path."""
+        import mlx.core as mx
+        import torch
+
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5)
+        def greet(name: str) -> str:
+            return f"Hello, {name}!"
+
+        token_idx = [0]
+
+        def forward_fn(ctx):
+            token_idx[0] += 1
+            logits = mx.zeros((256,))
+            logits = logits.at[ord("x")].add(mx.array(100.0))
+            return logits
+
+        config = SessionConfig(
+            freeform_max_tokens=3,
+            max_tool_cycles=0,
+        )
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "".join(chr(i) for i in ids),
+            tokenizer_encode=lambda s: [ord(c) for c in s],
+            embeddings=torch.eye(256),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            config=config,
+            transport_config=TransportConfig(),
+        )
+
+        result = session.run(prompt_tokens=[1, 2, 3])
+        assert result.total_tokens > 0
+        assert session._is_mlx is True
+
+    def test_session_explicit_backend(self) -> None:
+        """backend='mlx' forces MLX path."""
+        import mlx.core as mx
+        import torch
+
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5)
+        def greet(name: str) -> str:
+            return f"Hello, {name}!"
+
+        def forward_fn(ctx):
+            logits = mx.zeros((256,))
+            logits = logits.at[ord("x")].add(mx.array(100.0))
+            return logits
+
+        config = SessionConfig(
+            freeform_max_tokens=3,
+            max_tool_cycles=0,
+        )
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "".join(chr(i) for i in ids),
+            tokenizer_encode=lambda s: [ord(c) for c in s],
+            embeddings=torch.eye(256),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            config=config,
+            transport_config=TransportConfig(),
+            backend="mlx",
+        )
+
+        assert session._is_mlx is True
+
+    def test_session_freeform_mlx(self) -> None:
+        """Freeform generation works with MLX forward_fn."""
+        import mlx.core as mx
+        import torch
+
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5)
+        def greet(name: str) -> str:
+            return f"Hello, {name}!"
+
+        def forward_fn(ctx):
+            logits = mx.zeros((256,))
+            logits = logits.at[ord("a")].add(mx.array(100.0))
+            return logits
+
+        config = SessionConfig(
+            freeform_max_tokens=5,
+            max_tool_cycles=0,
+        )
+
+        session = SamplingSession(
+            registry=registry,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "".join(chr(i) for i in ids),
+            tokenizer_encode=lambda s: [ord(c) for c in s],
+            embeddings=torch.eye(256),
+            grammar_guide_factory=lambda t: None,  # type: ignore
+            config=config,
+            transport_config=TransportConfig(),
+        )
+
+        result = session.run(prompt_tokens=[1, 2, 3])
+        assert result.total_tokens == 5
+        assert "a" in result.output_text

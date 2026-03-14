@@ -40,16 +40,22 @@ The model generates freely until it needs to invoke tools. The grammar then dyna
 
 ## Architecture
 
-Six core modules, each independently importable:
+Core modules, each independently importable:
 
 ```
 tgirl/
-├── registry.py    # Tool registration, type extraction, snapshots
-├── grammar.py     # Dynamic CFG generation from registry state
-├── compile.py     # Hy parsing, AST compilation, sandboxed execution
-├── transport.py   # Optimal transport logit redistribution
-├── sample.py      # Constrained sampling engine
-└── bridge.py      # MCP compatibility layer (import/export)
+├── registry.py          # Tool registration, type extraction, snapshots
+├── grammar.py           # Dynamic CFG generation from registry state
+├── compile.py           # Hy parsing, AST compilation, sandboxed execution
+├── transport.py         # Optimal transport logit redistribution (torch)
+├── transport_mlx.py     # OT redistribution — MLX-native for Apple Silicon
+├── sample.py            # Constrained sampling engine (torch)
+├── sample_mlx.py        # Constrained sampling — MLX-native (zero torch in hot loop)
+├── outlines_adapter.py  # llguidance grammar constraint bridge
+├── cache.py             # KV cache management, forward_fn factories
+├── rerank.py            # Grammar-constrained tool reranking
+├── bridge.py            # MCP compatibility layer (import/export)
+└── serve.py             # Optional: FastAPI local inference server
 ```
 
 ### Defense-in-depth (compile module)
@@ -60,12 +66,22 @@ Three layers ensure safety — any one is sufficient, all three are active:
 2. **Static analysis** — Hy AST + Python AST analysis catches anything the grammar might miss
 3. **Sandbox** — restricted namespace with only registered tools and safe builtins
 
+### Optimal transport logit redistribution
+
+When grammar constraints mask out most of the vocabulary, naive masking discards the model's probability mass on invalid tokens. tgirl uses optimal transport (Sinkhorn algorithm) to redistribute that mass to semantically similar valid tokens, preserving the model's intent while enforcing grammatical correctness.
+
+### MLX-native inference
+
+On Apple Silicon, the entire inference hot loop runs in MLX with zero torch or numpy conversions per token. Grammar masks are applied via `llguidance.mlx`, penalties use functional scatter, and shaping uses pure MLX ops. Typical constrained generation speed: **~7-10ms/token** (comparable to freeform generation).
+
 ## Installation
 
 ```bash
 pip install tgirl                     # Core (registry + types)
 pip install tgirl[grammar]            # + grammar generation
 pip install tgirl[compile]            # + Hy compilation + sandbox
+pip install tgirl[sample]             # + sampling engine + OT
+pip install tgirl[mlx]                # + MLX backend (Apple Silicon)
 pip install tgirl[all]                # Everything
 ```
 
@@ -73,10 +89,11 @@ Requires Python 3.11+.
 
 ## Quick start
 
+### Register tools and execute pipelines
+
 ```python
 from tgirl import ToolRegistry, generate_grammar, run_pipeline
 
-# Register tools
 registry = ToolRegistry()
 
 @registry.tool()
@@ -90,17 +107,61 @@ def summarize(texts: list[str]) -> str:
 # Generate grammar from registry state
 grammar = generate_grammar(registry)
 
-# Execute a pipeline (from model output or manual)
+# Execute a pipeline
 result = run_pipeline(
     '(-> "transformers" (search) (summarize))',
     registry,
 )
-# result.result == "Transformers are a neural network architecture..."
+```
+
+### Run inference with grammar-constrained sampling (MLX)
+
+```python
+from tgirl import (
+    ToolRegistry, SamplingSession, GrammarTemperatureHook,
+    TransportConfig, SessionConfig,
+    make_mlx_forward_fn,
+)
+from tgirl.outlines_adapter import (
+    make_outlines_grammar_factory,
+    make_outlines_grammar_factory_mlx,
+)
+from tgirl.format import ChatTemplateFormatter
+from mlx_lm import load as mlx_load
+
+# Load model
+model, tokenizer = mlx_load("mlx-community/Qwen3.5-0.8B-MLX-4bit")
+hf_tokenizer = tokenizer._tokenizer
+embeddings = model.language_model.model.embed_tokens.weight
+
+# Register tools
+registry = ToolRegistry()
+
+@registry.tool()
+def add(a: int, b: int) -> int:
+    return a + b
+
+# Create session
+session = SamplingSession(
+    registry=registry,
+    forward_fn=make_mlx_forward_fn(model),
+    tokenizer_decode=hf_tokenizer.decode,
+    tokenizer_encode=hf_tokenizer.encode,
+    embeddings=embeddings,
+    grammar_guide_factory=make_outlines_grammar_factory(hf_tokenizer),
+    hooks=[GrammarTemperatureHook()],
+    transport_config=TransportConfig(),
+    formatter=ChatTemplateFormatter(hf_tokenizer),
+    backend="mlx",
+    mlx_grammar_guide_factory=make_outlines_grammar_factory_mlx(hf_tokenizer),
+)
+
+result = session.run_chat([{"role": "user", "content": "What is 2 + 3?"}])
 ```
 
 ## Status
 
-**v0.1.0** — Active development. `registry`, `grammar`, and `compile` modules are implemented and tested. `transport`, `sample`, `bridge`, and `serve` are next.
+**v0.1.0** — All core modules implemented and tested: `registry`, `grammar`, `compile`, `transport`, `sample`, `cache`, `rerank`, `outlines_adapter`. MLX-native backend operational with ~7-10ms/token constrained generation on Apple Silicon. BFCL benchmark integration for evaluation.
 
 ## License
 

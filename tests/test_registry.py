@@ -7,6 +7,10 @@ from pydantic import ValidationError
 
 from tgirl.registry import ToolRegistry
 from tgirl.types import (
+    AnyType,
+    DictType,
+    ListType,
+    LiteralType,
     PrimitiveType,
     RegistrySnapshot,
     ToolDefinition,
@@ -329,3 +333,226 @@ class TestSnapshot:
         snap = registry.snapshot()
         schema = snap.model_json_schema()
         assert isinstance(schema, dict)
+
+
+class TestRegisterFromSchema:
+    def test_register_from_schema_simple(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Register a function with int and str params, verify ToolDefinition."""
+        schema_params = {
+            "type": "dict",
+            "properties": {
+                "base": {"type": "integer"},
+                "height": {"type": "string"},
+            },
+            "required": ["base", "height"],
+        }
+        registry.register_from_schema(
+            name="calculate_area",
+            parameters=schema_params,
+            description="Calculate area",
+        )
+        assert "calculate_area" in registry
+        td = registry.get("calculate_area")
+        assert td.name == "calculate_area"
+        assert len(td.parameters) == 2
+        assert td.parameters[0].name == "base"
+        assert td.parameters[0].type_repr == PrimitiveType(kind="int")
+        assert td.parameters[1].name == "height"
+        assert td.parameters[1].type_repr == PrimitiveType(kind="str")
+        assert td.description == "Calculate area"
+
+    def test_register_from_schema_types(
+        self, registry: ToolRegistry
+    ) -> None:
+        """All JSON schema types map to correct TypeRepr."""
+        schema_params = {
+            "type": "dict",
+            "properties": {
+                "s": {"type": "string"},
+                "i": {"type": "integer"},
+                "f": {"type": "number"},
+                "b": {"type": "boolean"},
+                "a": {"type": "any"},
+            },
+            "required": ["s", "i", "f", "b", "a"],
+        }
+        registry.register_from_schema(
+            name="all_types",
+            parameters=schema_params,
+            description="",
+        )
+        td = registry.get("all_types")
+        assert td.parameters[0].type_repr == PrimitiveType(kind="str")
+        assert td.parameters[1].type_repr == PrimitiveType(kind="int")
+        assert td.parameters[2].type_repr == PrimitiveType(kind="float")
+        assert td.parameters[3].type_repr == PrimitiveType(kind="bool")
+        assert td.parameters[4].type_repr == AnyType()
+
+    def test_register_from_schema_optional_params(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Parameters not in required list get has_default=True."""
+        schema_params = {
+            "type": "dict",
+            "properties": {
+                "required_param": {"type": "string"},
+                "optional_param": {"type": "integer"},
+            },
+            "required": ["required_param"],
+        }
+        registry.register_from_schema(
+            name="opt_func",
+            parameters=schema_params,
+            description="",
+        )
+        td = registry.get("opt_func")
+        req = td.parameters[0]
+        opt = td.parameters[1]
+        assert req.name == "required_param"
+        assert req.has_default is False
+        assert opt.name == "optional_param"
+        assert opt.has_default is True
+        assert opt.default is None
+
+    def test_register_from_schema_accepts_any_name(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Registers with pre-sanitized name, no name transformation."""
+        schema_params = {
+            "type": "dict",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        registry.register_from_schema(
+            name="spotify_play",
+            parameters=schema_params,
+            description="",
+        )
+        assert "spotify_play" in registry
+        td = registry.get("spotify_play")
+        assert td.name == "spotify_play"
+
+    def test_register_from_schema_enum(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Enum field creates LiteralType."""
+        schema_params = {
+            "type": "dict",
+            "properties": {
+                "color": {
+                    "type": "string",
+                    "enum": ["red", "green", "blue"],
+                },
+            },
+            "required": ["color"],
+        }
+        registry.register_from_schema(
+            name="paint",
+            parameters=schema_params,
+            description="",
+        )
+        td = registry.get("paint")
+        assert td.parameters[0].type_repr == LiteralType(
+            values=("red", "green", "blue")
+        )
+
+    def test_register_from_schema_array(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Array with items type maps to ListType."""
+        schema_params = {
+            "type": "dict",
+            "properties": {
+                "numbers": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                },
+                "tags": {"type": "array"},
+            },
+            "required": ["numbers", "tags"],
+        }
+        registry.register_from_schema(
+            name="list_func",
+            parameters=schema_params,
+            description="",
+        )
+        td = registry.get("list_func")
+        assert td.parameters[0].type_repr == ListType(
+            element=PrimitiveType(kind="int")
+        )
+        assert td.parameters[1].type_repr == ListType(element=AnyType())
+
+    def test_register_from_schema_snapshot(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Registered schema tools appear in snapshot."""
+        schema_params = {
+            "type": "dict",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        registry.register_from_schema(
+            name="snap_tool",
+            parameters=schema_params,
+            description="A snap tool",
+        )
+        snap = registry.snapshot()
+        assert len(snap.tools) == 1
+        assert snap.tools[0].name == "snap_tool"
+
+    def test_register_from_schema_duplicate_raises(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Duplicate registration raises ValueError."""
+        schema_params = {
+            "type": "dict",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        registry.register_from_schema(
+            name="dup", parameters=schema_params, description=""
+        )
+        with pytest.raises(ValueError, match="already registered"):
+            registry.register_from_schema(
+                name="dup", parameters=schema_params, description=""
+            )
+
+    def test_register_from_schema_dict_type(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Dict type without properties maps to DictType."""
+        schema_params = {
+            "type": "dict",
+            "properties": {
+                "data": {"type": "dict"},
+            },
+            "required": ["data"],
+        }
+        registry.register_from_schema(
+            name="dict_func", parameters=schema_params, description=""
+        )
+        td = registry.get("dict_func")
+        assert td.parameters[0].type_repr == DictType(
+            key=PrimitiveType(kind="str"), value=AnyType()
+        )
+
+    def test_register_from_schema_tuple_type(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Tuple type maps to ListType(element=AnyType)."""
+        schema_params = {
+            "type": "dict",
+            "properties": {
+                "coords": {"type": "tuple"},
+            },
+            "required": ["coords"],
+        }
+        registry.register_from_schema(
+            name="tuple_func", parameters=schema_params, description=""
+        )
+        td = registry.get("tuple_func")
+        assert td.parameters[0].type_repr == ListType(
+            element=AnyType()
+        )
