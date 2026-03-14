@@ -94,7 +94,21 @@ class TestCacheStats:
 
 
 class TestMakeMLXForwardFn:
-    """make_mlx_forward_fn creates a cached forward function for MLX models."""
+    """make_mlx_forward_fn creates a cached forward function returning mx.array."""
+
+    def test_returns_mx_array(self) -> None:
+        """Return type is mx.array, not torch.Tensor."""
+        from tgirl.cache import CacheStats, make_mlx_forward_fn
+
+        model = MockMLXModel()
+        stats = CacheStats()
+        forward = make_mlx_forward_fn(model, stats=stats)
+
+        logits = forward([1, 2, 3])
+
+        assert isinstance(logits, mx.array)
+        assert logits.shape == (model.vocab_size,)
+        assert stats.misses == 1
 
     def test_first_call_cache_miss_all_tokens_forwarded(self) -> None:
         """First call is always a cache miss — all tokens forwarded."""
@@ -107,7 +121,7 @@ class TestMakeMLXForwardFn:
         tokens = [1, 2, 3]
         logits = forward(tokens)
 
-        assert isinstance(logits, torch.Tensor)
+        assert isinstance(logits, mx.array)
         assert logits.shape == (model.vocab_size,)
         assert stats.misses == 1
         assert stats.hits == 0
@@ -166,7 +180,7 @@ class TestMakeMLXForwardFn:
 
         # No additional forward call
         assert len(model.forwarded_inputs) == n_forwards_after_first
-        assert torch.equal(logits1, logits2)
+        assert mx.array_equal(logits1, logits2)
         assert stats.hits == 1
 
     def test_stats_counters_correct_sequence(self) -> None:
@@ -196,7 +210,7 @@ class TestMakeMLXForwardFn:
         forward = make_mlx_forward_fn(model)
 
         logits = forward([1, 2, 3])
-        assert isinstance(logits, torch.Tensor)
+        assert isinstance(logits, mx.array)
 
     def test_returns_last_position_logits(self) -> None:
         """Returns logits for the last token position only."""
@@ -207,6 +221,50 @@ class TestMakeMLXForwardFn:
 
         logits = forward([1, 2, 3])
         assert logits.shape == (10,)
+
+
+class TestMakeMLXForwardFnTorch:
+    """make_mlx_forward_fn_torch returns torch.Tensor (compat wrapper)."""
+
+    def test_returns_torch_tensor(self) -> None:
+        from tgirl.cache import CacheStats, make_mlx_forward_fn_torch
+
+        model = MockMLXModel()
+        stats = CacheStats()
+        forward = make_mlx_forward_fn_torch(model, stats=stats)
+
+        logits = forward([1, 2, 3])
+
+        assert isinstance(logits, torch.Tensor)
+        assert logits.shape == (model.vocab_size,)
+        assert stats.misses == 1
+
+    def test_cache_hit_continuation(self) -> None:
+        from tgirl.cache import CacheStats, make_mlx_forward_fn_torch
+
+        model = MockMLXModel()
+        stats = CacheStats()
+        forward = make_mlx_forward_fn_torch(model, stats=stats)
+
+        forward([1, 2, 3])
+        model.forwarded_inputs.clear()
+        forward([1, 2, 3, 4])
+
+        assert stats.hits == 1
+        assert model.forwarded_inputs[0] == [4]
+
+    def test_same_tokens_cached(self) -> None:
+        from tgirl.cache import CacheStats, make_mlx_forward_fn_torch
+
+        model = MockMLXModel()
+        stats = CacheStats()
+        forward = make_mlx_forward_fn_torch(model, stats=stats)
+
+        logits1 = forward([1, 2, 3])
+        logits2 = forward([1, 2, 3])
+
+        assert torch.equal(logits1, logits2)
+        assert stats.hits == 1
 
 
 # --- Mock HuggingFace model for testing ---

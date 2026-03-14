@@ -32,32 +32,96 @@ def make_mlx_forward_fn(
     model: Any,
     *,
     stats: CacheStats | None = None,
-) -> Callable[[list[int]], torch.Tensor]:
-    """Create a cached forward function for MLX models.
+) -> Callable[[list[int]], Any]:
+    """Create a cached forward function for MLX models (MLX-native).
 
     The returned closure maintains KV cache state between calls.
     When consecutive calls share a prefix, only new tokens are forwarded.
 
-    Handles the full MLX-to-torch conversion pipeline:
-    1. Wraps token lists as ``mx.array([tokens])``
-    2. Extracts last-position logits with ``.astype(mx.float32)``
-    3. Materializes lazy MLX computation with ``mx.eval()``
-    4. Converts to torch via ``torch.from_numpy(np.array(...))``
-
-    Note: The ``tokenizer`` parameter from the original spec is omitted --
-    MLX models handle token conversion internally and the wrapper operates
-    on pre-tokenized integer lists.
+    Returns ``mx.array`` logits directly — no torch conversion.
+    Use ``make_mlx_forward_fn_torch`` if you need ``torch.Tensor`` output.
 
     Args:
-        model: MLX model with ``make_cache()`` and ``__call__(input_ids, cache=)``
-            interface.
+        model: MLX model with ``make_cache()`` and
+            ``__call__(input_ids, cache=)`` interface.
+        stats: Optional CacheStats to record hit/miss/reset/tokens_saved.
+
+    Returns:
+        A function ``(token_ids: list[int]) -> mx.array`` returning
+        last-position logits of shape ``(vocab_size,)``.
+    """
+    import mlx.core as mx
+
+    _cache: list[Any] = model.make_cache()
+    _prev_tokens: list[int] = []
+    _last_logits: Any = None
+
+    def forward(token_ids: list[int]) -> Any:
+        nonlocal _cache, _prev_tokens, _last_logits
+
+        # Same tokens as last call — return cached logits
+        if token_ids == _prev_tokens and _last_logits is not None:
+            if stats is not None:
+                stats.hits += 1
+            return _last_logits
+
+        # Check if this is a prefix continuation
+        prev_len = len(_prev_tokens)
+        is_continuation = (
+            prev_len > 0
+            and len(token_ids) > prev_len
+            and token_ids[:prev_len] == _prev_tokens
+        )
+
+        if is_continuation:
+            # Cache hit: only forward the new tokens
+            new_tokens = token_ids[prev_len:]
+            if stats is not None:
+                stats.hits += 1
+                stats.tokens_saved += prev_len
+
+            input_ids = mx.array([new_tokens])
+            mlx_logits = model(input_ids, cache=_cache)
+        else:
+            # Cache miss: reset and forward all tokens
+            _cache = model.make_cache()
+            if stats is not None:
+                stats.misses += 1
+                if _prev_tokens:
+                    stats.resets += 1
+
+            input_ids = mx.array([token_ids])
+            mlx_logits = model(input_ids, cache=_cache)
+
+        result = mlx_logits[0, -1, :].astype(mx.float32)
+
+        _prev_tokens = list(token_ids)
+        _last_logits = result
+        return result
+
+    return forward
+
+
+def make_mlx_forward_fn_torch(
+    model: Any,
+    *,
+    stats: CacheStats | None = None,
+) -> Callable[[list[int]], torch.Tensor]:
+    """Create a cached forward function for MLX models (torch output).
+
+    Compatibility wrapper: same as ``make_mlx_forward_fn`` but converts
+    the MLX output to ``torch.Tensor`` via numpy. Use this if your
+    downstream code expects ``torch.Tensor`` logits.
+
+    Args:
+        model: MLX model with ``make_cache()`` and
+            ``__call__(input_ids, cache=)`` interface.
         stats: Optional CacheStats to record hit/miss/reset/tokens_saved.
 
     Returns:
         A function ``(token_ids: list[int]) -> torch.Tensor`` returning
         last-position logits of shape ``(vocab_size,)``.
     """
-    # Lazy imports — mlx is an optional dependency
     import mlx.core as mx
     import numpy as np
 
@@ -65,7 +129,6 @@ def make_mlx_forward_fn(
     _prev_tokens: list[int] = []
     _last_logits: torch.Tensor | None = None
 
-    # mx.eval is MLX's computation graph materializer, not Python's eval()
     _mx_eval = mx.eval
 
     def _mlx_to_torch(mlx_logits: Any) -> torch.Tensor:
