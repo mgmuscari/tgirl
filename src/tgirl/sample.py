@@ -10,7 +10,7 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from tgirl.registry import ToolRegistry
@@ -386,16 +386,17 @@ class SamplingSession:
     def __init__(
         self,
         registry: ToolRegistry,
-        forward_fn: Callable[[list[int]], torch.Tensor],
+        forward_fn: Callable[[list[int]], Any],
         tokenizer_decode: Callable[[list[int]], str],
         tokenizer_encode: Callable[[str], list[int]],
-        embeddings: torch.Tensor,
+        embeddings: torch.Tensor | Any,
         grammar_guide_factory: Callable[[str], GrammarState],
         config: SessionConfig | None = None,
         hooks: list[InferenceHook] | None = None,
         transport_config: TransportConfig | None = None,
         rerank_config: RerankConfig | None = None,
         formatter: PromptFormatter | None = None,
+        backend: Literal["torch", "mlx", "auto"] = "auto",
     ) -> None:
         from tgirl.rerank import ToolRouter
 
@@ -412,6 +413,14 @@ class SamplingSession:
         self._rerank_config = rerank_config
         self._formatter = formatter
         self._last_user_content: str | None = None
+        self._backend = backend
+        # Set on first forward call if backend="auto"
+        self._is_mlx: bool | None = (
+            True if backend == "mlx"
+            else False if backend == "torch"
+            else None
+        )
+        self._embeddings_mlx: Any = None  # Lazy-converted on first MLX use
         self._router = (
             ToolRouter(
                 grammar_guide_factory=grammar_guide_factory,
@@ -513,15 +522,37 @@ class SamplingSession:
                     break
 
                 raw_logits = self._forward_fn(token_history)
-                # Simple freeform sampling with config temperature
-                logits = raw_logits / max(self._config.freeform_temperature, 1e-10)
-                probs = torch.softmax(logits, dim=-1)
-                probs = torch.clamp(probs, min=0.0)
-                prob_sum = probs.sum()
-                if prob_sum > 0:
-                    probs = probs / prob_sum
 
-                token_id = int(torch.multinomial(probs, 1).item())
+                # Auto-detect backend on first forward call
+                if self._is_mlx is None:
+                    try:
+                        import mlx.core as mx
+                        self._is_mlx = isinstance(raw_logits, mx.array)
+                    except ImportError:
+                        self._is_mlx = False
+
+                if self._is_mlx:
+                    import mlx.core as mx
+                    logits = raw_logits / max(
+                        self._config.freeform_temperature, 1e-10
+                    )
+                    token_id = int(
+                        mx.random.categorical(logits).item()
+                    )
+                else:
+                    # Torch path (unchanged)
+                    logits = raw_logits / max(
+                        self._config.freeform_temperature, 1e-10
+                    )
+                    probs = torch.softmax(logits, dim=-1)
+                    probs = torch.clamp(probs, min=0.0)
+                    prob_sum = probs.sum()
+                    if prob_sum > 0:
+                        probs = probs / prob_sum
+                    token_id = int(
+                        torch.multinomial(probs, 1).item()
+                    )
+
                 freeform_tokens.append(token_id)
                 token_history.append(token_id)
                 total_tokens += 1
@@ -589,17 +620,41 @@ class SamplingSession:
             grammar_output = generate_grammar(snapshot)
             grammar_state = self._grammar_guide_factory(grammar_output.text)
 
-            # Run constrained generation
-            gen_result = run_constrained_generation(
-                grammar_state=grammar_state,
-                forward_fn=self._forward_fn,
-                tokenizer_decode=self._decode,
-                embeddings=self._embeddings,
-                hooks=self._hooks,
-                transport_config=self._transport_config,
-                max_tokens=self._config.constrained_max_tokens,
-                context_tokens=token_history,
-            )
+            # Run constrained generation (dispatch by backend)
+            if self._is_mlx:
+                from tgirl.sample_mlx import run_constrained_generation_mlx
+
+                # Lazy-convert embeddings to mx.array once
+                if self._embeddings_mlx is None:
+                    import mlx.core as mx
+                    if isinstance(self._embeddings, torch.Tensor):
+                        self._embeddings_mlx = mx.array(
+                            self._embeddings.numpy()
+                        )
+                    else:
+                        self._embeddings_mlx = self._embeddings
+
+                gen_result = run_constrained_generation_mlx(
+                    grammar_state=grammar_state,
+                    forward_fn=self._forward_fn,
+                    tokenizer_decode=self._decode,
+                    embeddings=self._embeddings_mlx,
+                    hooks=self._hooks,
+                    transport_config=self._transport_config,
+                    max_tokens=self._config.constrained_max_tokens,
+                    context_tokens=token_history,
+                )
+            else:
+                gen_result = run_constrained_generation(
+                    grammar_state=grammar_state,
+                    forward_fn=self._forward_fn,
+                    tokenizer_decode=self._decode,
+                    embeddings=self._embeddings,
+                    hooks=self._hooks,
+                    transport_config=self._transport_config,
+                    max_tokens=self._config.constrained_max_tokens,
+                    context_tokens=token_history,
+                )
 
             token_history.extend(gen_result.tokens)
             total_tokens += len(gen_result.tokens)
