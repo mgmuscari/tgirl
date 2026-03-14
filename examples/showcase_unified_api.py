@@ -5,7 +5,7 @@ Registers 8 tools spanning math, text, data, and utility domains.
 Tests routing accuracy on 15 requests designed to be ambiguous —
 the model must understand intent, not just match keywords.
 
-This demonstrates that grammar-constrained generation on a 0.8B model
+This demonstrates that grammar-constrained generation on a 4B model
 can reliably select and invoke the correct tool from a large set.
 
 Requirements:
@@ -37,7 +37,7 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
-MODEL_ID = "mlx-community/Qwen3.5-0.8B-MLX-4bit"
+MODEL_ID = "mlx-community/Qwen3.5-4B-MLX-4bit"
 
 
 def main() -> int:
@@ -104,31 +104,61 @@ def main() -> int:
 
     log.info("model_loaded", vocab_size=embeddings.shape[0])
 
+    # --- KV-cached forward function ---
+    # tgirl's forward_fn contract: f(token_ids: list[int]) -> Tensor
+    # The engine passes the FULL token history each call. Without caching,
+    # this means re-processing every token on every step — O(n²) for n tokens.
+    #
+    # This wrapper detects whether the new input extends the previous sequence
+    # (incremental decode → feed only new tokens with KV cache) or is a
+    # different sequence (cache miss → reset cache and prefill from scratch).
+    # The reranker triggers cache misses because it uses a different prompt.
+
+    _cache_state: dict[str, object] = {"cache": None, "prev_tokens": []}
+
     def forward_fn(token_ids: list[int]) -> torch.Tensor:
-        input_ids = mx.array([token_ids])
-        logits = mlx_model(input_ids)
+        prev = _cache_state["prev_tokens"]
+        cache = _cache_state["cache"]
+
+        # Check if new input extends the cached sequence
+        if cache is not None and len(token_ids) > len(prev) and token_ids[:len(prev)] == prev:
+            # Cache hit — only process new tokens
+            new_tokens = token_ids[len(prev):]
+        else:
+            # Cache miss — reset and prefill
+            cache = mlx_model.make_cache()
+            _cache_state["cache"] = cache
+            new_tokens = token_ids
+
+        input_ids = mx.array([new_tokens])
+        logits = mlx_model(input_ids, cache=cache)
         last = logits[0, -1, :].astype(mx.float32)
         mx.eval(last)
+
+        _cache_state["prev_tokens"] = list(token_ids)
         return torch.from_numpy(np.array(last, copy=False))
 
     # --- 3. Grammar factory + formatter ---
     from tgirl.outlines_adapter import make_outlines_grammar_factory
 
     grammar_factory = make_outlines_grammar_factory(hf_tokenizer)
-    formatter = ChatTemplateFormatter(hf_tokenizer)
+    formatter = ChatTemplateFormatter(hf_tokenizer, enable_thinking=False)
 
     # --- 4. Session factory (fresh session per request — no quota/state leakage) ---
     session_config = SessionConfig(
         max_tool_cycles=1,
-        freeform_max_tokens=100,
+        freeform_max_tokens=200,
         constrained_max_tokens=64,
-        session_timeout=30.0,
+        session_timeout=120.0,
     )
     session_hooks = [GrammarTemperatureHook(base_temperature=0.5)]
     transport_config = TransportConfig(bypass_ratio=0.5)
     rerank_config = RerankConfig(max_tokens=16, temperature=0.3)
 
     def make_session() -> SamplingSession:
+        # Reset KV cache for fresh session
+        _cache_state["cache"] = None
+        _cache_state["prev_tokens"] = []
         return SamplingSession(
             registry=registry,
             forward_fn=forward_fn,
