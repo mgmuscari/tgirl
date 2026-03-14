@@ -25,16 +25,20 @@ class PlainFormatter:
 class ChatTemplateFormatter:
     """Wraps a HuggingFace tokenizer's apply_chat_template method."""
 
-    def __init__(self, tokenizer: object) -> None:
+    def __init__(self, tokenizer: object, **defaults: object) -> None:
         self._tokenizer = tokenizer
+        self._defaults = defaults
 
     def format_messages(
         self,
         messages: list[dict[str, str]],
         add_generation_prompt: bool = True,
+        **kwargs: object,
     ) -> str:
+        merged = {**self._defaults, **kwargs}
         return self._tokenizer.apply_chat_template(  # type: ignore[union-attr]
             messages,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
+            **merged,
         )
