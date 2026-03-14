@@ -38,7 +38,13 @@ def make_mlx_forward_fn(
     The returned closure maintains KV cache state between calls.
     When consecutive calls share a prefix, only new tokens are forwarded.
 
-    Note: The ``tokenizer`` parameter from the original spec is omitted —
+    Handles the full MLX-to-torch conversion pipeline:
+    1. Wraps token lists as ``mx.array([tokens])``
+    2. Extracts last-position logits with ``.astype(mx.float32)``
+    3. Materializes lazy MLX computation with ``mx.eval()``
+    4. Converts to torch via ``torch.from_numpy(np.array(...))``
+
+    Note: The ``tokenizer`` parameter from the original spec is omitted --
     MLX models handle token conversion internally and the wrapper operates
     on pre-tokenized integer lists.
 
@@ -51,9 +57,22 @@ def make_mlx_forward_fn(
         A function ``(token_ids: list[int]) -> torch.Tensor`` returning
         last-position logits of shape ``(vocab_size,)``.
     """
+    # Lazy imports — mlx is an optional dependency
+    import mlx.core as mx
+    import numpy as np
+
     _cache: list[Any] = model.make_cache()
     _prev_tokens: list[int] = []
     _last_logits: torch.Tensor | None = None
+
+    # mx.eval is MLX's computation graph materializer, not Python's eval()
+    _mx_eval = mx.eval
+
+    def _mlx_to_torch(mlx_logits: Any) -> torch.Tensor:
+        """Extract last-position logits from MLX output, convert to torch."""
+        last = mlx_logits[0, -1, :].astype(mx.float32)
+        _mx_eval(last)
+        return torch.from_numpy(np.array(last, copy=False))
 
     def forward(token_ids: list[int]) -> torch.Tensor:
         nonlocal _cache, _prev_tokens, _last_logits
@@ -79,7 +98,8 @@ def make_mlx_forward_fn(
                 stats.hits += 1
                 stats.tokens_saved += prev_len
 
-            logits_out = model(new_tokens, cache=_cache)
+            input_ids = mx.array([new_tokens])
+            mlx_logits = model(input_ids, cache=_cache)
         else:
             # Cache miss: reset and forward all tokens
             _cache = model.make_cache()
@@ -88,21 +108,10 @@ def make_mlx_forward_fn(
                 if _prev_tokens:
                     stats.resets += 1
 
-            logits_out = model(token_ids, cache=_cache)
+            input_ids = mx.array([token_ids])
+            mlx_logits = model(input_ids, cache=_cache)
 
-        # Extract last-position logits
-        if not isinstance(logits_out, torch.Tensor):
-            msg = (
-                f"Model returned {type(logits_out).__name__}, expected torch.Tensor. "
-                "Wrap your model to return torch.Tensor logits."
-            )
-            raise TypeError(msg)
-        if logits_out.dim() == 3:
-            result = logits_out[0, -1, :]
-        elif logits_out.dim() == 2:
-            result = logits_out[-1, :]
-        else:
-            result = logits_out
+        result = _mlx_to_torch(mlx_logits)
 
         _prev_tokens = list(token_ids)
         _last_logits = result

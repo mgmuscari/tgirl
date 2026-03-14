@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import mlx.core as mx
+import numpy as np
 import pytest
 import torch
 
@@ -23,7 +25,8 @@ class MockMLXModel:
     """Mock MLX model that records forwarded input_ids.
 
     Tracks what tokens were forwarded and how many times make_cache was called.
-    Returns deterministic logits based on the last token ID.
+    Returns MLX arrays matching the real MLX model interface:
+    input is mx.array([token_ids]), output is mx.array of shape [1, seq_len, vocab].
     """
 
     forwarded_inputs: list[list[int]] = field(default_factory=list)
@@ -39,29 +42,23 @@ class MockMLXModel:
     ) -> Any:
         """Simulate MLX model forward pass.
 
-        Records what tokens were forwarded. Returns logits tensor
-        where the value at each position equals the last input token ID.
+        Accepts mx.array([token_ids]) as input.
+        Records the token list for test assertions.
+        Returns mx.array of shape [1, seq_len, vocab_size].
         """
-        # input_ids is expected to be like mx.array([token_ids])
-        # For testing, we accept a list of lists or similar
-        if hasattr(input_ids, "tolist"):
-            tokens = input_ids.tolist()
-        else:
-            tokens = list(input_ids)
-
-        # Flatten if nested
+        # input_ids is mx.array([token_ids]) — shape [1, seq_len]
+        tokens = input_ids.tolist()
         if tokens and isinstance(tokens[0], list):
             tokens = tokens[0]
 
         self.forwarded_inputs.append(tokens)
 
-        # Return logits: a 3D tensor [batch=1, seq_len, vocab_size]
+        # Return MLX array: shape [batch=1, seq_len, vocab_size]
         seq_len = len(tokens)
-        logits = torch.zeros(1, seq_len, self.vocab_size)
-        # Make logits depend on last token for determinism
+        logits = np.zeros((1, seq_len, self.vocab_size), dtype=np.float32)
         if tokens:
             logits[0, -1, tokens[-1] % self.vocab_size] = 10.0
-        return logits
+        return mx.array(logits)
 
 
 class TestCacheStats:
