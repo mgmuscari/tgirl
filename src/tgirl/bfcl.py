@@ -111,9 +111,16 @@ def _format_python_value(val: Any) -> str:
     if isinstance(val, bool):
         return str(val)
     if isinstance(val, str):
-        # BFCL expects double-quoted strings
-        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
+        # Use repr() for proper escaping of control chars, then
+        # normalize to double quotes for BFCL compatibility
+        r = repr(val)
+        if r.startswith("'") and r.endswith("'"):
+            inner = r[1:-1]
+            # repr with single quotes doesn't escape double quotes,
+            # but does escape single quotes — swap
+            inner = inner.replace("\\'", "'").replace('"', '\\"')
+            return f'"{inner}"'
+        return r
     if isinstance(val, list):
         items = ", ".join(_format_python_value(v) for v in val)
         return f"[{items}]"

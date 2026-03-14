@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
-import pytest
+from bfcl_eval.model_handler.utils import default_decode_ast_prompting
 
-from tgirl.registry import ToolRegistry
-from tgirl.types import (
-    LiteralType,
-    PrimitiveType,
+from tgirl.bfcl import (
+    load_ground_truth,
+    load_test_data,
+    register_bfcl_tools,
+    sexpr_to_bfcl,
 )
+from tgirl.registry import ToolRegistry
+from tgirl.types import PrimitiveType
 
 
 class TestLoadTestData:
     def test_load_test_data_simple_python(self) -> None:
         """Loads simple_python category, correct count and fields."""
-        from tgirl.bfcl import load_test_data
-
         entries = load_test_data("simple_python")
         assert len(entries) > 0
         entry = entries[0]
@@ -28,8 +29,6 @@ class TestLoadTestData:
 class TestLoadGroundTruth:
     def test_load_ground_truth_simple_python(self) -> None:
         """Loads ground truth for simple_python."""
-        from tgirl.bfcl import load_ground_truth
-
         entries = load_ground_truth("simple_python")
         assert len(entries) > 0
         entry = entries[0]
@@ -40,8 +39,6 @@ class TestLoadGroundTruth:
 class TestRegisterBfclTools:
     def test_register_bfcl_tools(self) -> None:
         """Registers BFCL function defs, name mapping correct."""
-        from tgirl.bfcl import register_bfcl_tools
-
         functions = [
             {
                 "name": "calculate_triangle_area",
@@ -68,8 +65,6 @@ class TestRegisterBfclTools:
 
     def test_register_bfcl_tools_dotted_name(self) -> None:
         """Dotted names are sanitized to underscores."""
-        from tgirl.bfcl import register_bfcl_tools
-
         functions = [
             {
                 "name": "spotify.play",
@@ -93,9 +88,7 @@ class TestRegisterBfclTools:
 
 class TestSexprToBfcl:
     def test_sexpr_to_bfcl_simple(self) -> None:
-        """(calculate_triangle_area 10 5) -> [calculate_triangle_area(base=10, height=5)]"""
-        from tgirl.bfcl import register_bfcl_tools, sexpr_to_bfcl
-
+        """Simple int args map to named params."""
         functions = [
             {
                 "name": "calculate_triangle_area",
@@ -123,8 +116,6 @@ class TestSexprToBfcl:
 
     def test_sexpr_to_bfcl_string_args(self) -> None:
         """(reverse "hello") -> [reverse(text="hello")]"""
-        from tgirl.bfcl import register_bfcl_tools, sexpr_to_bfcl
-
         functions = [
             {
                 "name": "reverse",
@@ -148,8 +139,6 @@ class TestSexprToBfcl:
 
     def test_sexpr_to_bfcl_string_with_spaces(self) -> None:
         """(greet "hello world") -> [greet(msg="hello world")]"""
-        from tgirl.bfcl import register_bfcl_tools, sexpr_to_bfcl
-
         functions = [
             {
                 "name": "greet",
@@ -173,8 +162,6 @@ class TestSexprToBfcl:
 
     def test_sexpr_to_bfcl_nested_list(self) -> None:
         """(func [1 2 3] "hello") -> [func(nums=[1, 2, 3], label="hello")]"""
-        from tgirl.bfcl import register_bfcl_tools, sexpr_to_bfcl
-
         functions = [
             {
                 "name": "func",
@@ -202,8 +189,6 @@ class TestSexprToBfcl:
 
     def test_sexpr_to_bfcl_boolean_none(self) -> None:
         """(func True False None) -> [func(a=True, b=False, c=None)]"""
-        from tgirl.bfcl import register_bfcl_tools, sexpr_to_bfcl
-
         functions = [
             {
                 "name": "func",
@@ -228,9 +213,7 @@ class TestSexprToBfcl:
         assert result == "[func(a=True, b=False, c=None)]"
 
     def test_sexpr_to_bfcl_dotted_name(self) -> None:
-        """(spotify_play "Taylor Swift" 20) -> [spotify.play(artist="Taylor Swift", duration=20)]"""
-        from tgirl.bfcl import register_bfcl_tools, sexpr_to_bfcl
-
+        """Sanitized name maps back to dotted original."""
         functions = [
             {
                 "name": "spotify.play",
@@ -260,8 +243,6 @@ class TestSexprToBfcl:
 
     def test_sexpr_to_bfcl_optional_params_omitted(self) -> None:
         """2 required + 2 optional, only 3 args -> maps to req0, req1, opt0."""
-        from tgirl.bfcl import register_bfcl_tools, sexpr_to_bfcl
-
         functions = [
             {
                 "name": "search",
@@ -291,8 +272,6 @@ class TestSexprToBfcl:
 
     def test_sexpr_to_bfcl_multiple_calls(self) -> None:
         """Multiple s-expressions -> [func1(...), func2(...)]."""
-        from tgirl.bfcl import register_bfcl_tools, sexpr_to_bfcl
-
         functions = [
             {
                 "name": "add",
@@ -332,12 +311,6 @@ class TestSexprToBfcl:
 
     def test_bfcl_output_parseable(self) -> None:
         """Verify translated output parses through default_decode_ast_prompting."""
-        from bfcl_eval.model_handler.utils import (
-            default_decode_ast_prompting,
-        )
-
-        from tgirl.bfcl import register_bfcl_tools, sexpr_to_bfcl
-
         functions = [
             {
                 "name": "calculate_triangle_area",
