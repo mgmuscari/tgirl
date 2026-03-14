@@ -228,6 +228,8 @@ class ConstrainedGenerationResult(BaseModel):
     token_log_probs: list[float]
     ot_computation_total_ms: float
     ot_bypassed_count: int
+    ot_bypass_reasons: list[str | None]
+    ot_iterations: list[int]
     grammar_generation_ms: float
 
 
@@ -264,6 +266,8 @@ def run_constrained_generation(
     token_log_probs: list[float] = []
     ot_computation_total_ms = 0.0
     ot_bypassed_count = 0
+    ot_bypass_reasons: list[str | None] = []
+    ot_iterations: list[int] = []
 
     vocab_size = embeddings.shape[0]
 
@@ -294,6 +298,8 @@ def run_constrained_generation(
         ot_elapsed_ms = (time.monotonic() - ot_start) * 1000
         ot_computation_total_ms += ot_elapsed_ms
         wasserstein_distances.append(ot_result.wasserstein_distance)
+        ot_bypass_reasons.append(ot_result.bypass_reason)
+        ot_iterations.append(ot_result.iterations)
         if ot_result.bypassed:
             ot_bypassed_count += 1
 
@@ -347,6 +353,8 @@ def run_constrained_generation(
         token_log_probs=token_log_probs,
         ot_computation_total_ms=ot_computation_total_ms,
         ot_bypassed_count=ot_bypassed_count,
+        ot_bypass_reasons=ot_bypass_reasons,
+        ot_iterations=ot_iterations,
         grammar_generation_ms=elapsed_ms,
     )
 
@@ -398,8 +406,10 @@ class SamplingSession:
         formatter: PromptFormatter | None = None,
         backend: Literal["torch", "mlx", "auto"] = "auto",
         mlx_grammar_guide_factory: Callable | None = None,
+        transition_policy: Any | None = None,
     ) -> None:
         from tgirl.rerank import ToolRouter
+        from tgirl.state_machine import DelimiterTransitionPolicy
 
         self._registry = registry
         self._forward_fn = forward_fn
@@ -416,6 +426,10 @@ class SamplingSession:
         self._formatter = formatter
         self._last_user_content: str | None = None
         self._backend = backend
+        self._transition_policy = transition_policy or DelimiterTransitionPolicy(
+            delimiter=self._config.tool_open_delimiter,
+            tokenizer_decode=self._decode,
+        )
         # Set on first forward call if backend="auto"
         self._is_mlx: bool | None = (
             True if backend == "mlx"
@@ -509,10 +523,11 @@ class SamplingSession:
         total_tokens = 0
         cycle_count = 0
 
-        # Set up delimiter detector
-        open_detector = DelimiterDetector(
-            self._config.tool_open_delimiter, self._decode
-        )
+        from tgirl.state_machine import SessionState, TransitionSignal
+
+        # Reset transition policy for fresh run
+        if hasattr(self._transition_policy, "reset"):
+            self._transition_policy.reset()
 
         for _ in range(self._config.max_tool_cycles + 1):
             # --- Freeform mode ---
@@ -520,7 +535,7 @@ class SamplingSession:
             delimiter_found = False
             timed_out = False
 
-            for _ in range(self._config.freeform_max_tokens):
+            for freeform_pos in range(self._config.freeform_max_tokens):
                 # Check timeout
                 elapsed = (time.monotonic() - start_time) * 1000
                 if elapsed > self._config.session_timeout * 1000:
@@ -589,7 +604,20 @@ class SamplingSession:
                 token_history.append(token_id)
                 total_tokens += 1
 
-                if open_detector.feed(token_id):
+                # Evaluate transition policy
+                signal = TransitionSignal(
+                    token_position=freeform_pos,
+                    grammar_mask_overlap=0.0,
+                    token_entropy=0.0,
+                    token_log_prob=0.0,
+                    grammar_freedom=0.0,
+                )
+                decision = self._transition_policy.evaluate(
+                    SessionState.FREEFORM,
+                    signal,
+                    token_id=token_id,
+                )
+                if decision.should_transition:
                     delimiter_found = True
                     break
 
@@ -605,7 +633,8 @@ class SamplingSession:
             # --- Constrained mode ---
             cycle_count += 1
             freeform_count_before = len(freeform_tokens)
-            open_detector.reset()
+            if hasattr(self._transition_policy, "reset"):
+                self._transition_policy.reset()
 
             # Generate grammar from snapshot with reduced quotas
             snapshot = self._snapshot_with_remaining_quotas()
@@ -761,6 +790,8 @@ class SamplingSession:
                     grammar_generation_ms=gen_result.grammar_generation_ms,
                     ot_computation_total_ms=gen_result.ot_computation_total_ms,
                     ot_bypassed_count=gen_result.ot_bypassed_count,
+                    ot_bypass_reasons=gen_result.ot_bypass_reasons,
+                    ot_iterations=gen_result.ot_iterations,
                     hy_source=gen_result.hy_source,
                     execution_result=result_val,
                     execution_error=error,

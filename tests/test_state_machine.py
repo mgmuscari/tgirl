@@ -331,6 +331,152 @@ class TestDelimiterTransitionPolicy:
         assert isinstance(policy, TransitionPolicy)
 
 
+class TestSamplingSessionTransitionPolicy:
+    """Phase 1B: SamplingSession accepts transition_policy param."""
+
+    def _make_session_with_policy(
+        self,
+        transition_policy=None,
+        tool_delimiter_tokens: list[int] | None = None,
+        freeform_tokens: int = 5,
+    ):
+        """Build a SamplingSession, optionally with a custom transition policy."""
+        import torch
+
+        from tgirl.registry import ToolRegistry
+        from tgirl.sample import SamplingSession
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        vocab = [chr(i) for i in range(256)]
+
+        def decode(ids: list[int]) -> str:
+            return "".join(vocab[i] for i in ids)
+
+        def encode(text: str) -> list[int]:
+            return [ord(c) for c in text]
+
+        registry = ToolRegistry()
+
+        @registry.tool(quota=5, cost=1.0)
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"Hello, {name}!"
+
+        freeform_tok = list(range(freeform_tokens))
+        if tool_delimiter_tokens is not None:
+            all_tokens = freeform_tok + tool_delimiter_tokens
+        else:
+            all_tokens = freeform_tok
+
+        token_idx = [0]
+
+        def forward_fn(ctx: list[int]) -> torch.Tensor:
+            idx = token_idx[0]
+            token_idx[0] += 1
+            logits = torch.zeros(256)
+            if idx < len(all_tokens):
+                logits[all_tokens[idx]] = 100.0
+            else:
+                logits[ord("x")] = 100.0
+            return logits
+
+        embeddings = torch.eye(256)
+
+        def grammar_guide_factory(grammar_text: str):
+            class MockGS:
+                def __init__(self):
+                    self._done = False
+
+                def get_valid_mask(self, vocab_size: int) -> torch.Tensor:
+                    mask = torch.zeros(vocab_size, dtype=torch.bool)
+                    for c in '(greet "hi")':
+                        mask[ord(c)] = True
+                    return mask
+
+                def is_accepting(self) -> bool:
+                    return self._done
+
+                def advance(self, token_id: int) -> None:
+                    self._done = True
+
+            return MockGS()
+
+        config = SessionConfig(
+            max_tool_cycles=10,
+            freeform_max_tokens=20,
+            constrained_max_tokens=10,
+            session_timeout=30.0,
+        )
+
+        kwargs = dict(
+            registry=registry,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            tokenizer_encode=encode,
+            embeddings=embeddings,
+            grammar_guide_factory=grammar_guide_factory,
+            config=config,
+            transport_config=TransportConfig(),
+        )
+        if transition_policy is not None:
+            kwargs["transition_policy"] = transition_policy
+
+        return SamplingSession(**kwargs)
+
+    def test_default_transition_policy_is_delimiter(self) -> None:
+        """SamplingSession defaults to DelimiterTransitionPolicy when none specified."""
+        from tgirl.state_machine import DelimiterTransitionPolicy
+
+        session = self._make_session_with_policy()
+        assert isinstance(session._transition_policy, DelimiterTransitionPolicy)
+
+    def test_custom_transition_policy_accepted(self) -> None:
+        """SamplingSession accepts a custom transition policy."""
+        from tgirl.state_machine import (
+            SessionState,
+            TransitionDecision,
+            TransitionSignal,
+        )
+
+        class AlwaysTransitionPolicy:
+            def evaluate(
+                self,
+                current_state: SessionState,
+                signal: TransitionSignal,
+                **kwargs: object,
+            ) -> TransitionDecision:
+                return TransitionDecision(
+                    should_transition=True,
+                    target_state=SessionState.ROUTE,
+                    reason="always",
+                    confidence=1.0,
+                )
+
+        session = self._make_session_with_policy(
+            transition_policy=AlwaysTransitionPolicy()
+        )
+        assert isinstance(session._transition_policy, AlwaysTransitionPolicy)
+
+    def test_default_policy_backward_compat_freeform_only(self) -> None:
+        """With default policy, freeform-only sessions work identically."""
+        session = self._make_session_with_policy(tool_delimiter_tokens=None)
+        result = session.run(prompt_tokens=[])
+        assert result.total_cycles == 0
+        assert len(result.tool_calls) == 0
+        assert result.total_tokens > 0
+
+    def test_default_policy_backward_compat_with_delimiter(self) -> None:
+        """With default policy, delimiter detection triggers constrained mode."""
+        delimiter_tokens = [ord(c) for c in "<tool>"]
+        session = self._make_session_with_policy(
+            tool_delimiter_tokens=delimiter_tokens
+        )
+        result = session.run(prompt_tokens=[])
+        assert result.total_cycles == 1
+        assert len(result.tool_calls) == 1
+
+
 class TestStateMachineModuleConstraints:
     """Verify state_machine.py has zero torch/mlx imports."""
 
