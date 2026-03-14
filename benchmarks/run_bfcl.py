@@ -145,8 +145,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
     # --- 3. Session config ---
     session_config = SessionConfig(
         max_tool_cycles=1,
-        freeform_max_tokens=100,
-        constrained_max_tokens=64,
+        freeform_max_tokens=4096,
+        constrained_max_tokens=4096,
         session_timeout=30.0,
     )
     session_hooks = [GrammarTemperatureHook(base_temperature=0.5)]
