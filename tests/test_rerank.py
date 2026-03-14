@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -65,14 +64,12 @@ class TestToolRouterSingleTool:
 
         factory = MagicMock()
         forward_fn = MagicMock()
-        encode = MagicMock()
         decode = MagicMock()
         embeddings = torch.randn(100, 32)
 
         router = ToolRouter(
             grammar_guide_factory=factory,
             forward_fn=forward_fn,
-            tokenizer_encode=encode,
             tokenizer_decode=decode,
             embeddings=embeddings,
         )
@@ -94,7 +91,6 @@ class TestToolRouterEmptySnapshot:
         router = ToolRouter(
             grammar_guide_factory=MagicMock(),
             forward_fn=MagicMock(),
-            tokenizer_encode=MagicMock(),
             tokenizer_decode=MagicMock(),
             embeddings=torch.randn(100, 32),
         )
@@ -112,14 +108,12 @@ class TestToolRouterRoute:
         mock_gs = _make_mock_grammar_state()
         factory = MagicMock(return_value=mock_gs)
         forward_fn = MagicMock(return_value=torch.randn(100))
-        encode = MagicMock(return_value=[10, 11, 12])
         decode = MagicMock(return_value="get_field")
         embeddings = torch.randn(100, 32)
 
         router = ToolRouter(
             grammar_guide_factory=factory,
             forward_fn=forward_fn,
-            tokenizer_encode=encode,
             tokenizer_decode=decode,
             embeddings=embeddings,
         )
@@ -138,14 +132,12 @@ class TestToolRouterRoute:
         mock_gs = _make_mock_grammar_state()
         factory = MagicMock(return_value=mock_gs)
         forward_fn = MagicMock(return_value=torch.randn(100))
-        encode = MagicMock(return_value=[10, 11])
         decode = MagicMock(return_value="alpha")
         embeddings = torch.randn(100, 32)
 
         router = ToolRouter(
             grammar_guide_factory=factory,
             forward_fn=forward_fn,
-            tokenizer_encode=encode,
             tokenizer_decode=decode,
             embeddings=embeddings,
         )
@@ -179,7 +171,6 @@ class TestToolRouterRoute:
         router = ToolRouter(
             grammar_guide_factory=MagicMock(),
             forward_fn=MagicMock(),
-            tokenizer_encode=MagicMock(),
             tokenizer_decode=MagicMock(),
             embeddings=torch.randn(100, 32),
             config=config,
@@ -200,14 +191,12 @@ class TestToolRouterQuotaFiltering:
         mock_gs = _make_mock_grammar_state()
         factory = MagicMock(return_value=mock_gs)
         forward_fn = MagicMock(return_value=torch.randn(100))
-        encode = MagicMock(return_value=[10])
         decode = MagicMock(return_value="beta")
         embeddings = torch.randn(100, 32)
 
         router = ToolRouter(
             grammar_guide_factory=factory,
             forward_fn=forward_fn,
-            tokenizer_encode=encode,
             tokenizer_decode=decode,
             embeddings=embeddings,
         )
@@ -228,7 +217,6 @@ class TestToolRouterQuotaFiltering:
         router = ToolRouter(
             grammar_guide_factory=MagicMock(),
             forward_fn=MagicMock(),
-            tokenizer_encode=MagicMock(),
             tokenizer_decode=MagicMock(),
             embeddings=torch.randn(100, 32),
         )
@@ -246,7 +234,6 @@ class TestToolRouterQuotaFiltering:
         router = ToolRouter(
             grammar_guide_factory=MagicMock(),
             forward_fn=forward_fn,
-            tokenizer_encode=MagicMock(),
             tokenizer_decode=MagicMock(),
             embeddings=torch.randn(100, 32),
         )
@@ -272,14 +259,12 @@ class TestToolRouterCache:
         mock_gs = _make_mock_grammar_state()
         factory = MagicMock(return_value=mock_gs)
         forward_fn = MagicMock(return_value=torch.randn(100))
-        encode = MagicMock(return_value=[10])
         decode = MagicMock(return_value="alpha")
         embeddings = torch.randn(100, 32)
 
         router = ToolRouter(
             grammar_guide_factory=factory,
             forward_fn=forward_fn,
-            tokenizer_encode=encode,
             tokenizer_decode=decode,
             embeddings=embeddings,
         )
@@ -318,14 +303,12 @@ class TestToolRouterCache:
         mock_gs = _make_mock_grammar_state()
         factory = MagicMock(return_value=mock_gs)
         forward_fn = MagicMock(return_value=torch.randn(100))
-        encode = MagicMock(return_value=[10])
         decode = MagicMock(return_value="alpha")
         embeddings = torch.randn(100, 32)
 
         router = ToolRouter(
             grammar_guide_factory=factory,
             forward_fn=forward_fn,
-            tokenizer_encode=encode,
             tokenizer_decode=decode,
             embeddings=embeddings,
         )
@@ -355,23 +338,21 @@ class TestToolRouterCache:
             assert factory.call_count == 2
 
 
-class TestToolRouterPromptTokenization:
-    """Tests for routing prompt tokenization and prepending."""
+class TestToolRouterContextPassthrough:
+    """Tests that context_tokens are passed through as-is (no prompt prepending)."""
 
-    def test_routing_prompt_tokenized_and_prepended(self) -> None:
+    def test_context_tokens_passed_through_unchanged(self) -> None:
         from tgirl.rerank import ToolRouter
 
         mock_gs = _make_mock_grammar_state()
         factory = MagicMock(return_value=mock_gs)
         forward_fn = MagicMock(return_value=torch.randn(100))
-        encode = MagicMock(return_value=[100, 101, 102])
         decode = MagicMock(return_value="alpha")
         embeddings = torch.randn(100, 32)
 
         router = ToolRouter(
             grammar_guide_factory=factory,
             forward_fn=forward_fn,
-            tokenizer_encode=encode,
             tokenizer_decode=decode,
             embeddings=embeddings,
         )
@@ -394,13 +375,9 @@ class TestToolRouterPromptTokenization:
             )
             router.route(snap, context_tokens=[1, 2, 3])
 
-            # Verify tokenizer_encode was called with routing prompt
-            encode.assert_called_once()
-
-            # Verify context_tokens passed to run_constrained_generation
-            # should be routing_prompt_tokens + original context_tokens
+            # context_tokens should be passed through as-is, no prepending
             _, kwargs = mock_gen.call_args
-            assert kwargs["context_tokens"] == [100, 101, 102, 1, 2, 3]
+            assert kwargs["context_tokens"] == [1, 2, 3]
 
 
 class TestToolRouterValidation:
@@ -413,14 +390,12 @@ class TestToolRouterValidation:
         mock_gs = _make_mock_grammar_state()
         factory = MagicMock(return_value=mock_gs)
         forward_fn = MagicMock(return_value=torch.randn(100))
-        encode = MagicMock(return_value=[10])
         decode = MagicMock(return_value="bogus_tool")
         embeddings = torch.randn(100, 32)
 
         router = ToolRouter(
             grammar_guide_factory=factory,
             forward_fn=forward_fn,
-            tokenizer_encode=encode,
             tokenizer_decode=decode,
             embeddings=embeddings,
         )

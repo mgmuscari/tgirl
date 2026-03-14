@@ -412,7 +412,6 @@ class SamplingSession:
             ToolRouter(
                 grammar_guide_factory=grammar_guide_factory,
                 forward_fn=forward_fn,
-                tokenizer_encode=tokenizer_encode,
                 tokenizer_decode=tokenizer_decode,
                 embeddings=embeddings,
                 config=rerank_config,

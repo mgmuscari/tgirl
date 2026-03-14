@@ -13,7 +13,6 @@ import structlog
 import torch
 
 from tgirl.grammar import generate_routing_grammar
-from tgirl.instructions import generate_routing_prompt
 from tgirl.sample import GrammarState, run_constrained_generation
 from tgirl.transport import TransportConfig
 from tgirl.types import RegistrySnapshot, RerankConfig, RerankResult
@@ -28,14 +27,12 @@ class ToolRouter:
         self,
         grammar_guide_factory: Callable[[str], GrammarState],
         forward_fn: Callable[[list[int]], torch.Tensor],
-        tokenizer_encode: Callable[[str], list[int]],
         tokenizer_decode: Callable[[list[int]], str],
         embeddings: torch.Tensor,
         config: RerankConfig | None = None,
     ) -> None:
         self._grammar_guide_factory = grammar_guide_factory
         self._forward_fn = forward_fn
-        self._tokenizer_encode = tokenizer_encode
         self._tokenizer_decode = tokenizer_decode
         self._embeddings = embeddings
         self._config = config or RerankConfig()
@@ -103,10 +100,8 @@ class ToolRouter:
                 routing_grammar_text="",
             )
 
-        # Step 3: Generate routing prompt and tokenize
-        routing_prompt = generate_routing_prompt(filtered_snapshot)
-        routing_prompt_tokens = self._tokenizer_encode(routing_prompt)
-        routing_context_tokens = routing_prompt_tokens + list(context_tokens)
+        # Step 3: Use context_tokens as-is (caller provides pre-formatted routing context)
+        routing_context_tokens = list(context_tokens)
 
         # Step 4: Get routing grammar text (with caching)
         cache_key = tuple(sorted(t.name for t in filtered_tools))
