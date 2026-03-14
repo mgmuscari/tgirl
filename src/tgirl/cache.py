@@ -107,3 +107,94 @@ def make_mlx_forward_fn(
         return result
 
     return forward
+
+
+def make_hf_forward_fn(
+    model: Any,
+    *,
+    device: str = "cpu",
+    stats: CacheStats | None = None,
+) -> Callable[[list[int]], torch.Tensor]:
+    """Create a cached forward function for HuggingFace Transformers models.
+
+    The returned closure maintains past_key_values state between calls.
+    Uses the immutable cache pattern: stores the returned past_key_values
+    from each forward call.
+
+    Args:
+        model: HuggingFace model with
+            ``__call__(input_ids, past_key_values=, use_cache=True)``
+            returning an object with ``.logits`` and ``.past_key_values``.
+        device: Device for input tensors (default "cpu").
+        stats: Optional CacheStats to record hit/miss/reset/tokens_saved.
+
+    Returns:
+        A function ``(token_ids: list[int]) -> torch.Tensor`` returning
+        last-position logits of shape ``(vocab_size,)``.
+    """
+    _past_key_values: Any = None
+    _prev_tokens: list[int] = []
+    _last_logits: torch.Tensor | None = None
+
+    def forward(token_ids: list[int]) -> torch.Tensor:
+        nonlocal _past_key_values, _prev_tokens, _last_logits
+
+        # Same tokens as last call — return cached logits
+        if token_ids == _prev_tokens and _last_logits is not None:
+            if stats is not None:
+                stats.hits += 1
+            return _last_logits
+
+        # Check if this is a prefix continuation
+        prev_len = len(_prev_tokens)
+        is_continuation = (
+            prev_len > 0
+            and len(token_ids) > prev_len
+            and token_ids[:prev_len] == _prev_tokens
+        )
+
+        if is_continuation:
+            # Cache hit: only forward new tokens with past_key_values
+            new_tokens = token_ids[prev_len:]
+            if stats is not None:
+                stats.hits += 1
+                stats.tokens_saved += prev_len
+
+            input_ids = torch.tensor([new_tokens], device=device)
+            output = model(
+                input_ids,
+                past_key_values=_past_key_values,
+                use_cache=True,
+            )
+        else:
+            # Cache miss: reset and forward all tokens
+            if stats is not None:
+                stats.misses += 1
+                if _prev_tokens:
+                    stats.resets += 1
+
+            _past_key_values = None
+            input_ids = torch.tensor([token_ids], device=device)
+            output = model(
+                input_ids,
+                past_key_values=None,
+                use_cache=True,
+            )
+
+        # Store new past_key_values (immutable pattern)
+        _past_key_values = output.past_key_values
+
+        # Extract last-position logits
+        logits_out: torch.Tensor = output.logits
+        if logits_out.dim() == 3:
+            result = logits_out[0, -1, :]
+        elif logits_out.dim() == 2:
+            result = logits_out[-1, :]
+        else:
+            result = logits_out
+
+        _prev_tokens = list(token_ids)
+        _last_logits = result
+        return result
+
+    return forward

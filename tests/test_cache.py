@@ -212,6 +212,182 @@ class TestMakeMLXForwardFn:
         assert logits.shape == (10,)
 
 
+# --- Mock HuggingFace model for testing ---
+
+@dataclass
+class MockHFPastKeyValues:
+    """Simulates HuggingFace past_key_values (immutable pattern)."""
+
+    token_count: int = 0
+
+
+@dataclass
+class MockHFModelOutput:
+    """Simulates HuggingFace model output with logits and past_key_values."""
+
+    logits: torch.Tensor
+    past_key_values: MockHFPastKeyValues
+
+
+@dataclass
+class MockHFModel:
+    """Mock HuggingFace model that records forwarded input_ids.
+
+    Returns (logits, new_past_key_values) following the HF convention
+    where model() returns an object with .logits and .past_key_values.
+    """
+
+    forwarded_inputs: list[list[int]] = field(default_factory=list)
+    vocab_size: int = 10
+
+    def __call__(
+        self,
+        input_ids: Any,
+        past_key_values: Any = None,
+        use_cache: bool = True,
+    ) -> MockHFModelOutput:
+        """Simulate HF model forward pass."""
+        # input_ids is a torch tensor of shape [batch, seq_len]
+        if isinstance(input_ids, torch.Tensor):
+            tokens = input_ids[0].tolist()
+        elif hasattr(input_ids, "tolist"):
+            tokens = input_ids.tolist()
+        else:
+            tokens = list(input_ids)
+
+        if tokens and isinstance(tokens[0], list):
+            tokens = tokens[0]
+
+        self.forwarded_inputs.append(tokens)
+
+        seq_len = len(tokens)
+        logits = torch.zeros(1, seq_len, self.vocab_size)
+        if tokens:
+            logits[0, -1, tokens[-1] % self.vocab_size] = 10.0
+
+        # Return new past_key_values tracking total tokens seen
+        prev_count = past_key_values.token_count if past_key_values else 0
+        new_pkv = MockHFPastKeyValues(token_count=prev_count + seq_len)
+
+        return MockHFModelOutput(logits=logits, past_key_values=new_pkv)
+
+
+class TestMakeHFForwardFn:
+    """make_hf_forward_fn creates a cached forward function for HF models."""
+
+    def test_first_call_cache_miss_all_tokens_forwarded(self) -> None:
+        """First call is always a cache miss — all tokens forwarded."""
+        from tgirl.cache import CacheStats, make_hf_forward_fn
+
+        model = MockHFModel()
+        stats = CacheStats()
+        forward = make_hf_forward_fn(model, device="cpu", stats=stats)
+
+        tokens = [1, 2, 3]
+        logits = forward(tokens)
+
+        assert isinstance(logits, torch.Tensor)
+        assert logits.shape == (model.vocab_size,)
+        assert stats.misses == 1
+        assert stats.hits == 0
+        assert len(model.forwarded_inputs) == 1
+        assert model.forwarded_inputs[0] == [1, 2, 3]
+
+    def test_append_one_token_cache_hit(self) -> None:
+        """Appending one token = cache hit, only new token forwarded."""
+        from tgirl.cache import CacheStats, make_hf_forward_fn
+
+        model = MockHFModel()
+        stats = CacheStats()
+        forward = make_hf_forward_fn(model, device="cpu", stats=stats)
+
+        forward([1, 2, 3])  # miss
+        model.forwarded_inputs.clear()
+
+        forward([1, 2, 3, 4])  # hit
+
+        assert stats.hits == 1
+        assert len(model.forwarded_inputs) == 1
+        assert model.forwarded_inputs[0] == [4]
+        assert stats.tokens_saved == 3
+
+    def test_divergent_prefix_cache_miss_full_reset(self) -> None:
+        """Different prefix = cache miss, full reset."""
+        from tgirl.cache import CacheStats, make_hf_forward_fn
+
+        model = MockHFModel()
+        stats = CacheStats()
+        forward = make_hf_forward_fn(model, device="cpu", stats=stats)
+
+        forward([1, 2, 3])  # miss
+        model.forwarded_inputs.clear()
+
+        forward([1, 9, 3])  # divergent — miss + reset
+
+        assert stats.misses == 2
+        assert stats.resets == 1
+        assert model.forwarded_inputs[0] == [1, 9, 3]
+
+    def test_same_tokens_returns_cached_logits(self) -> None:
+        """Same tokens = cached logits without forward."""
+        from tgirl.cache import CacheStats, make_hf_forward_fn
+
+        model = MockHFModel()
+        stats = CacheStats()
+        forward = make_hf_forward_fn(model, device="cpu", stats=stats)
+
+        logits1 = forward([1, 2, 3])
+        n_forwards = len(model.forwarded_inputs)
+
+        logits2 = forward([1, 2, 3])
+
+        assert len(model.forwarded_inputs) == n_forwards
+        assert torch.equal(logits1, logits2)
+        assert stats.hits == 1
+
+    def test_stats_counters_correct_sequence(self) -> None:
+        """Stats counters accumulate correctly."""
+        from tgirl.cache import CacheStats, make_hf_forward_fn
+
+        model = MockHFModel()
+        stats = CacheStats()
+        forward = make_hf_forward_fn(model, device="cpu", stats=stats)
+
+        forward([1, 2, 3])        # miss
+        forward([1, 2, 3, 4])     # hit, 3 saved
+        forward([1, 2, 3, 4, 5])  # hit, 4 saved
+        forward([9, 8, 7])        # miss, reset
+        forward([9, 8, 7])        # hit (same)
+
+        assert stats.misses == 2
+        assert stats.hits == 3
+        assert stats.resets == 1
+        assert stats.tokens_saved == 7
+
+    def test_stats_optional(self) -> None:
+        """Forward function works without stats."""
+        from tgirl.cache import make_hf_forward_fn
+
+        model = MockHFModel()
+        forward = make_hf_forward_fn(model)
+
+        logits = forward([1, 2, 3])
+        assert isinstance(logits, torch.Tensor)
+
+    def test_past_key_values_passed_on_continuation(self) -> None:
+        """On cache hit, past_key_values from previous call is reused."""
+        from tgirl.cache import make_hf_forward_fn
+
+        model = MockHFModel()
+        forward = make_hf_forward_fn(model, device="cpu")
+
+        forward([1, 2, 3])      # miss: 3 tokens
+        forward([1, 2, 3, 4])   # hit: 1 token with past_key_values
+
+        # The second call should have only forwarded [4]
+        assert model.forwarded_inputs[-1] == [4]
+
+
 class TestZeroCoupling:
     """cache.py must not import from other tgirl modules."""
 
