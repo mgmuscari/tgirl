@@ -695,6 +695,24 @@ class TestCheckpoint:
         # Original unchanged
         assert cp.dead_end_tokens == frozenset({42})
 
+    def test_with_added_dead_end_preserves_best_fields(self) -> None:
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=0,
+            tokens_so_far=(),
+            context_tokens=(),
+            grammar_text="",
+            dead_end_tokens=frozenset(),
+            best_tokens=(10, 20),
+            best_mean_log_prob=-0.3,
+            attempts=2,
+        )
+        cp2 = cp.with_added_dead_end(99)
+        assert cp2.best_tokens == (10, 20)
+        assert cp2.best_mean_log_prob == -0.3
+        assert cp2.attempts == 2
+
 
 class TestCheckpointBestSoFar:
     """Best-so-far tracking on Checkpoint model."""
