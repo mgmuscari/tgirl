@@ -1584,6 +1584,84 @@ class TestComputeTransitionSignal:
         expected_entropy = math.log(4)  # ~1.386
         assert abs(signal.token_entropy - expected_entropy) < 1e-5
 
+    def test_sampled_token_log_prob(self) -> None:
+        """token_log_prob uses log prob of the sampled token."""
+        from tgirl.state_machine import compute_transition_signal
+
+        import math
+
+        # Non-uniform logits: token 0 has most mass
+        logits = [10.0, 0.0, 0.0, 0.0]
+        grammar_valid_mask = [1.0, 1.0, 1.0, 1.0]
+
+        def softmax_fn(x):
+            max_x = max(x)
+            exps = [math.exp(v - max_x) for v in x]
+            s = sum(exps)
+            return [e / s for e in exps]
+
+        def sum_fn(x):
+            return sum(x)
+
+        def log_fn(x):
+            return [math.log(v) if v > 0 else float("-inf") for v in x]
+
+        # Sample token 0 (high prob)
+        signal_0 = compute_transition_signal(
+            token_position=0,
+            logits=logits,
+            grammar_valid_mask=grammar_valid_mask,
+            softmax_fn=softmax_fn,
+            sum_fn=sum_fn,
+            log_fn=log_fn,
+            vocab_size=4,
+            sampled_token_id=0,
+        )
+        # Sample token 1 (low prob)
+        signal_1 = compute_transition_signal(
+            token_position=0,
+            logits=logits,
+            grammar_valid_mask=grammar_valid_mask,
+            softmax_fn=softmax_fn,
+            sum_fn=sum_fn,
+            log_fn=log_fn,
+            vocab_size=4,
+            sampled_token_id=1,
+        )
+        # Token 0 should have higher log prob than token 1
+        assert signal_0.token_log_prob > signal_1.token_log_prob
+        # Token 0 log prob should be near 0 (high probability)
+        assert signal_0.token_log_prob > -0.1
+
+    def test_no_sampled_token_falls_back_to_max(self) -> None:
+        """Without sampled_token_id, falls back to max log prob."""
+        from tgirl.state_machine import compute_transition_signal
+
+        import math
+
+        logits = [10.0, 0.0, 0.0, 0.0]
+        grammar_valid_mask = [1.0, 1.0, 1.0, 1.0]
+
+        def softmax_fn(x):
+            max_x = max(x)
+            exps = [math.exp(v - max_x) for v in x]
+            s = sum(exps)
+            return [e / s for e in exps]
+
+        signal = compute_transition_signal(
+            token_position=0,
+            logits=logits,
+            grammar_valid_mask=grammar_valid_mask,
+            softmax_fn=softmax_fn,
+            sum_fn=sum,
+            log_fn=lambda x: [
+                math.log(v) if v > 0 else float("-inf") for v in x
+            ],
+            vocab_size=4,
+        )
+        # Without sampled_token_id, should use max (token 0)
+        assert signal.token_log_prob > -0.1
+
     def test_zero_torch_mlx_in_function(self) -> None:
         """compute_transition_signal itself has no torch/mlx imports."""
         import inspect

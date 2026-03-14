@@ -216,6 +216,7 @@ def compute_transition_signal(
     sum_fn: Callable,
     log_fn: Callable,
     vocab_size: int,
+    sampled_token_id: int | None = None,
 ) -> TransitionSignal:
     """Compute TransitionSignal from raw logits and grammar mask.
 
@@ -230,6 +231,9 @@ def compute_transition_signal(
         sum_fn: Sums elements of a sequence.
         log_fn: Computes element-wise log of a sequence.
         vocab_size: Total vocabulary size.
+        sampled_token_id: ID of the actually sampled token. If
+            provided, token_log_prob is the log prob of that token.
+            If None, falls back to max log prob.
 
     Returns:
         TransitionSignal with computed metrics.
@@ -248,8 +252,13 @@ def compute_transition_signal(
     ]
     token_entropy = -float(sum_fn(p_log_p))
 
-    # token_log_prob: max log prob (most likely token)
-    token_log_prob = float(max(lp for lp in log_probs if lp != float("-inf")))
+    # token_log_prob: log prob of the sampled token
+    if sampled_token_id is not None:
+        token_log_prob = float(log_probs[sampled_token_id])
+    else:
+        # Fallback: max log prob
+        finite = [lp for lp in log_probs if lp != float("-inf")]
+        token_log_prob = float(max(finite)) if finite else float("-inf")
 
     # grammar_freedom: fraction of vocab that is grammar-valid
     grammar_freedom = float(sum_fn(grammar_valid_mask)) / vocab_size
