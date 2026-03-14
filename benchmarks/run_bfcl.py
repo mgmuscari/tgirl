@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -75,9 +76,13 @@ def parse_args() -> argparse.Namespace:
         help="Model name for BFCL evaluation (default: tgirl-grammar)",
     )
     parser.add_argument(
-        "--evaluate",
-        action="store_true",
-        help="Run BFCL AST evaluation after generation",
+        "--transition-policy",
+        type=str,
+        default="delimiter",
+        help=(
+            "Transition policy: 'delimiter' (default), 'immediate', "
+            "or 'budget:N' (e.g., budget:3)"
+        ),
     )
     return parser.parse_args()
 
@@ -113,11 +118,61 @@ def register_model_config(model_name: str) -> None:
         log.info("registered_model_config", model_name=model_name)
 
 
+def make_transition_policy(policy_str: str, tokenizer_decode: Any = None) -> Any:
+    """Parse a transition policy string into a policy object.
+
+    Args:
+        policy_str: One of 'delimiter', 'immediate', or 'budget:N'.
+        tokenizer_decode: Required for 'delimiter' policy.
+
+    Returns:
+        A TransitionPolicy instance.
+    """
+    from tgirl.state_machine import (
+        BudgetTransitionPolicy,
+        DelimiterTransitionPolicy,
+        ImmediateTransitionPolicy,
+    )
+
+    if policy_str == "delimiter":
+        if tokenizer_decode is None:
+            msg = "delimiter policy requires tokenizer_decode"
+            raise ValueError(msg)
+        return DelimiterTransitionPolicy(
+            delimiter="<tool>",
+            tokenizer_decode=tokenizer_decode,
+        )
+    elif policy_str == "immediate":
+        return ImmediateTransitionPolicy()
+    elif policy_str.startswith("budget:"):
+        try:
+            budget = int(policy_str.split(":", 1)[1])
+        except (ValueError, IndexError):
+            msg = (
+                f"Invalid budget policy: {policy_str!r}. "
+                "Use 'budget:N' where N is an integer."
+            )
+            raise ValueError(msg) from None
+        return BudgetTransitionPolicy(budget=budget)
+    else:
+        msg = (
+            f"Unknown transition policy: {policy_str!r}. "
+            "Use 'delimiter', 'immediate', or 'budget:N'."
+        )
+        raise ValueError(msg)
+
+
 def run_benchmark(args: argparse.Namespace) -> None:
     """Run the BFCL benchmark pipeline."""
     from mlx_lm import load as mlx_load
 
-    from tgirl.bfcl import load_test_data, register_bfcl_tools, sexpr_to_bfcl
+    from tgirl.bfcl import (
+        load_ground_truth,
+        load_test_data,
+        register_bfcl_tools,
+        sexpr_to_bfcl,
+        sexpr_to_bfcl_dict,
+    )
     from tgirl.cache import CacheStats, make_mlx_forward_fn
     from tgirl.format import ChatTemplateFormatter
     from tgirl.outlines_adapter import (
@@ -147,7 +202,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
     mlx_grammar_factory = make_outlines_grammar_factory_mlx(hf_tokenizer)
     formatter = ChatTemplateFormatter(hf_tokenizer)
 
-    # --- 3. Session config ---
+    # --- 3. Session config + transition policy ---
+    transition_policy = make_transition_policy(
+        args.transition_policy,
+        tokenizer_decode=hf_tokenizer.decode,
+    )
+    log.info("transition_policy", policy=args.transition_policy)
+
     session_config = SessionConfig(
         max_tool_cycles=1,
         freeform_max_tokens=512,
@@ -155,7 +216,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         session_timeout=30.0,
     )
     session_hooks = [GrammarTemperatureHook(base_temperature=0.5)]
-    transport_config = TransportConfig(bypass_ratio=0.5)
+    transport_config = TransportConfig(valid_ratio_threshold=0.5)
     rerank_config = RerankConfig(max_tokens=16, temperature=0.3)
 
     # --- 4. Register model config for BFCL checker ---
@@ -172,12 +233,29 @@ def run_benchmark(args: argparse.Namespace) -> None:
     result_dir = Path(args.result_dir) / args.model_name
     result_dir.mkdir(parents=True, exist_ok=True)
     result_path = result_dir / f"BFCL_v4_{args.category}_result.json"
+    telemetry_path = result_dir / f"BFCL_v4_{args.category}_telemetry.jsonl"
 
-    # --- 7. Run inference ---
+    # --- 7. Load ground truth for evaluation ---
+    ground_truth_entries = load_ground_truth(args.category)
+    ground_truth_by_id = {e["id"]: e["ground_truth"] for e in ground_truth_entries}
+
+    try:
+        from bfcl_eval.eval_checker.ast_eval.ast_checker import ast_checker
+        from bfcl_eval.constants.enums import Language
+
+        has_checker = True
+    except ImportError:
+        has_checker = False
+        log.warning("ast_checker_unavailable", msg="pip install bfcl_eval for accuracy scoring")
+
+    # --- 8. Run inference ---
     results: list[dict[str, str]] = []
+    parsed_outputs: list[list[dict] | None] = []
     total_tokens = 0
     total_ms = 0.0
     errors = 0
+    ast_correct = 0
+    ast_checked = 0
 
     for i, entry in enumerate(entries):
         entry_id = entry["id"]
@@ -202,9 +280,15 @@ def run_benchmark(args: argparse.Namespace) -> None:
             formatter=formatter,
             backend="mlx",
             mlx_grammar_guide_factory=mlx_grammar_factory,
+            transition_policy=transition_policy,
         )
 
         t0 = time.monotonic()
+        bfcl_output = ""
+        bfcl_parsed = None
+        result = None
+        hy_source = ""
+        ast_result_str = ""
         try:
             result = session.run_chat(messages)
             elapsed = (time.monotonic() - t0) * 1000
@@ -212,12 +296,30 @@ def run_benchmark(args: argparse.Namespace) -> None:
             if result.tool_calls:
                 hy_source = result.tool_calls[0].pipeline
                 bfcl_output = sexpr_to_bfcl(hy_source, registry, name_map)
+                bfcl_parsed = sexpr_to_bfcl_dict(hy_source, registry, name_map)
             else:
-                # No tool call — output freeform text (will fail BFCL decode)
                 bfcl_output = result.output_text
 
             total_tokens += result.total_tokens
             total_ms += elapsed
+
+            # AST accuracy check
+            if has_checker and bfcl_parsed is not None and entry_id in ground_truth_by_id:
+                gt = ground_truth_by_id[entry_id]
+                check = ast_checker(
+                    entry["function"], bfcl_parsed, gt,
+                    Language.PYTHON, args.category, args.model_name,
+                )
+                ast_checked += 1
+                if check["valid"]:
+                    ast_correct += 1
+                    ast_result_str = "PASS"
+                else:
+                    ast_result_str = f"FAIL: {check.get('error', ['?'])[0]}"
+            elif bfcl_parsed is None and result.tool_calls:
+                ast_result_str = "NO_TOOL_CALL"
+            elif not result.tool_calls:
+                ast_result_str = "NO_TOOL_CALL"
 
             log.info(
                 "entry_complete",
@@ -227,13 +329,14 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 tokens=result.total_tokens,
                 elapsed_ms=round(elapsed, 1),
                 has_tool_call=bool(result.tool_calls),
+                ast=ast_result_str or "N/A",
                 output=bfcl_output[:80],
             )
         except Exception as e:
             elapsed = (time.monotonic() - t0) * 1000
             total_ms += elapsed
             errors += 1
-            bfcl_output = ""
+            ast_result_str = f"ERROR: {e!s}"
             log.error(
                 "entry_failed",
                 index=i + 1,
@@ -243,6 +346,37 @@ def run_benchmark(args: argparse.Namespace) -> None:
             )
 
         results.append({"id": entry_id, "result": bfcl_output})
+        parsed_outputs.append(bfcl_parsed)
+
+        # --- Write telemetry entry (append mode for crash recovery) ---
+        telemetry_entry: dict[str, Any] = {
+            "id": entry_id,
+            "ast_result": ast_result_str or "N/A",
+            "hy_source": hy_source,
+            "bfcl_output": bfcl_output,
+            "ground_truth": ground_truth_by_id.get(entry_id),
+            "hyperparams": {
+                "base_temperature": session_hooks[0].base_temperature,
+                "scaling_exponent": session_hooks[0].scaling_exponent,
+                "ot_epsilon": transport_config.epsilon,
+                "ot_valid_ratio_threshold": transport_config.valid_ratio_threshold,
+                "ot_max_iterations": transport_config.max_iterations,
+            },
+        }
+        if result is not None and result.telemetry:
+            tel = result.telemetry[0]
+            telemetry_entry.update({
+                "tokens": tel.tokens,
+                "grammar_valid_counts": tel.grammar_valid_counts,
+                "temperatures_applied": tel.temperatures_applied,
+                "wasserstein_distances": tel.wasserstein_distances,
+                "token_log_probs": tel.token_log_probs,
+                "ot_bypass_reasons": tel.ot_bypass_reasons,
+                "ot_iterations": tel.ot_iterations,
+                "freeform_tokens_before": tel.freeform_tokens_before,
+            })
+        with open(telemetry_path, "a") as tf:
+            tf.write(json.dumps(telemetry_entry) + "\n")
 
     # --- 8. Write results ---
     with open(result_path, "w") as f:
@@ -251,40 +385,30 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     log.info("results_written", path=str(result_path), count=len(results))
 
-    # --- 9. Report ---
+    # --- 10. Report ---
     n = len(entries)
+    tool_call_count = sum(1 for p in parsed_outputs if p is not None)
     print("\n" + "=" * 70)
     print(f"  tgirl BFCL benchmark — {args.category}")
     print(f"  Model: {args.model}")
+    print(f"  Transition policy:  {args.transition_policy}")
     print("=" * 70)
     print(f"  Entries processed:  {n}")
+    print(f"  Tool calls made:    {tool_call_count}/{n} ({round(100*tool_call_count/n) if n else 0}%)")
     print(f"  Errors:             {errors}")
+    if ast_checked > 0:
+        print(f"  AST accuracy:       {ast_correct}/{ast_checked} ({round(100*ast_correct/ast_checked)}%)")
     print(f"  Total tokens:       {total_tokens}")
     print(f"  Total wall time:    {round(total_ms)}ms")
     if n > 0:
         print(f"  Avg per entry:      {round(total_ms / n)}ms")
     print(f"  Results at:         {result_path}")
+    print(f"  Telemetry at:       {telemetry_path}")
     print(f"  Cache hits:         {cache_stats.hits}")
     print(f"  Cache misses:       {cache_stats.misses}")
     print(f"  Cache resets:       {cache_stats.resets}")
     print(f"  Tokens saved:       {cache_stats.tokens_saved}")
     print("=" * 70)
-
-    # --- 10. Optional: run BFCL AST checker ---
-    if args.evaluate:
-        try:
-            from bfcl_eval.eval_checker.ast_eval.ast_checker import ast_checker
-
-            log.info("running_ast_checker", category=args.category)
-            ast_checker(args.model_name, str(result_path), args.category)
-        except ImportError as e:
-            log.warning(
-                "checker_skipped",
-                reason="bfcl_eval not fully installed",
-                error=str(e),
-            )
-        except Exception as e:
-            log.error("checker_failed", error=str(e))
 
 
 def main() -> None:

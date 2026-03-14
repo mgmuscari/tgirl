@@ -633,6 +633,47 @@ class TestSamplingSessionTransitionPolicy:
         assert len(result.tool_calls) == 1
 
 
+class TestMakeTransitionPolicy:
+    """Test the BFCL benchmark policy parser."""
+
+    def test_delimiter_policy(self) -> None:
+        from benchmarks.run_bfcl import make_transition_policy
+        from tgirl.state_machine import DelimiterTransitionPolicy
+
+        def decode(ids: list[int]) -> str:
+            return ""
+
+        policy = make_transition_policy("delimiter", tokenizer_decode=decode)
+        assert isinstance(policy, DelimiterTransitionPolicy)
+
+    def test_immediate_policy(self) -> None:
+        from benchmarks.run_bfcl import make_transition_policy
+        from tgirl.state_machine import ImmediateTransitionPolicy
+
+        policy = make_transition_policy("immediate")
+        assert isinstance(policy, ImmediateTransitionPolicy)
+
+    def test_budget_policy(self) -> None:
+        from benchmarks.run_bfcl import make_transition_policy
+        from tgirl.state_machine import BudgetTransitionPolicy
+
+        policy = make_transition_policy("budget:5")
+        assert isinstance(policy, BudgetTransitionPolicy)
+        assert policy._budget == 5
+
+    def test_invalid_policy_raises(self) -> None:
+        from benchmarks.run_bfcl import make_transition_policy
+
+        with pytest.raises(ValueError, match="Unknown transition policy"):
+            make_transition_policy("nonexistent")
+
+    def test_invalid_budget_raises(self) -> None:
+        from benchmarks.run_bfcl import make_transition_policy
+
+        with pytest.raises(ValueError, match="Invalid budget policy"):
+            make_transition_policy("budget:abc")
+
+
 class TestStateMachineModuleConstraints:
     """Verify state_machine.py has zero torch/mlx imports."""
 
