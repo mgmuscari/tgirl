@@ -553,7 +553,10 @@ class SamplingSession:
         total_tokens = 0
         cycle_count = 0
 
-        from tgirl.state_machine import SessionState, TransitionSignal
+        from tgirl.state_machine import (
+            SessionState,
+            compute_transition_signal,
+        )
 
         # Reset transition policy for fresh run
         if hasattr(self._transition_policy, "reset"):
@@ -634,14 +637,60 @@ class SamplingSession:
                 token_history.append(token_id)
                 total_tokens += 1
 
-                # Evaluate transition policy
-                signal = TransitionSignal(
-                    token_position=freeform_pos,
-                    grammar_mask_overlap=0.0,
-                    token_entropy=0.0,
-                    token_log_prob=0.0,
-                    grammar_freedom=0.0,
-                )
+                # Compute transition signal from raw logits
+                if self._is_mlx:
+                    import mlx.core as mx
+
+                    vocab_sz = raw_logits.shape[0]
+                    # No grammar mask in freeform — use zeros
+                    empty_mask = mx.zeros((vocab_sz,))
+
+                    def _mlx_softmax(x):
+                        t = mx.array(x) if not isinstance(x, mx.array) else x
+                        r = mx.softmax(t, axis=-1)
+                        return [float(v) for v in r]
+
+                    def _mlx_sum(x):
+                        return sum(x)
+
+                    def _mlx_log(x):
+                        import math
+                        return [math.log(v) if v > 0 else float("-inf") for v in x]
+
+                    signal = compute_transition_signal(
+                        token_position=freeform_pos,
+                        logits=[float(v) for v in raw_logits],
+                        grammar_valid_mask=[float(v) for v in empty_mask],
+                        softmax_fn=_mlx_softmax,
+                        sum_fn=_mlx_sum,
+                        log_fn=_mlx_log,
+                        vocab_size=vocab_sz,
+                    )
+                else:
+                    vocab_sz = raw_logits.shape[0]
+                    empty_mask = torch.zeros(vocab_sz)
+
+                    def _torch_softmax(x):
+                        t = x if isinstance(x, torch.Tensor) else torch.tensor(x)
+                        r = torch.softmax(t, dim=-1)
+                        return r.tolist()
+
+                    def _torch_sum(x):
+                        return sum(x)
+
+                    def _torch_log(x):
+                        import math
+                        return [math.log(v) if v > 0 else float("-inf") for v in x]
+
+                    signal = compute_transition_signal(
+                        token_position=freeform_pos,
+                        logits=raw_logits.tolist(),
+                        grammar_valid_mask=empty_mask.tolist(),
+                        softmax_fn=_torch_softmax,
+                        sum_fn=_torch_sum,
+                        log_fn=_torch_log,
+                        vocab_size=vocab_sz,
+                    )
                 decision = self._transition_policy.evaluate(
                     SessionState.FREEFORM,
                     signal,

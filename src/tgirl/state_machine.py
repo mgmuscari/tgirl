@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
@@ -203,6 +203,64 @@ class ImmediateTransitionPolicy:
             reason="immediate transition",
             confidence=1.0,
         )
+
+
+# --- Signal Computation ---
+
+
+def compute_transition_signal(
+    token_position: int,
+    logits: Any,
+    grammar_valid_mask: Any,
+    softmax_fn: Callable,
+    sum_fn: Callable,
+    log_fn: Callable,
+    vocab_size: int,
+) -> TransitionSignal:
+    """Compute TransitionSignal from raw logits and grammar mask.
+
+    Framework-agnostic: all operations are done via the provided
+    callables (softmax_fn, sum_fn, log_fn). No framework imports.
+
+    Args:
+        token_position: Current token position in the sequence.
+        logits: Raw logit values (framework-dependent type).
+        grammar_valid_mask: Binary mask of grammar-valid tokens.
+        softmax_fn: Computes softmax probabilities from logits.
+        sum_fn: Sums elements of a sequence.
+        log_fn: Computes element-wise log of a sequence.
+        vocab_size: Total vocabulary size.
+
+    Returns:
+        TransitionSignal with computed metrics.
+    """
+    probs = softmax_fn(logits)
+    log_probs = log_fn(probs)
+
+    # grammar_mask_overlap: probability mass on grammar-valid tokens
+    weighted = [p * m for p, m in zip(probs, grammar_valid_mask)]
+    grammar_mask_overlap = float(sum_fn(weighted))
+
+    # token_entropy: -sum(p * log(p))
+    p_log_p = [
+        p * lp if lp != float("-inf") else 0.0
+        for p, lp in zip(probs, log_probs)
+    ]
+    token_entropy = -float(sum_fn(p_log_p))
+
+    # token_log_prob: max log prob (most likely token)
+    token_log_prob = float(max(lp for lp in log_probs if lp != float("-inf")))
+
+    # grammar_freedom: fraction of vocab that is grammar-valid
+    grammar_freedom = float(sum_fn(grammar_valid_mask)) / vocab_size
+
+    return TransitionSignal(
+        token_position=token_position,
+        grammar_mask_overlap=grammar_mask_overlap,
+        token_entropy=token_entropy,
+        token_log_prob=token_log_prob,
+        grammar_freedom=grammar_freedom,
+    )
 
 
 # --- Backtracking Infrastructure ---

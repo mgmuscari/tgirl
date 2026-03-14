@@ -1125,6 +1125,155 @@ class TestMakeTransitionPolicy:
             make_transition_policy("budget:abc")
 
 
+class TestComputeTransitionSignal:
+    """compute_transition_signal computes framework-agnostic signal from raw logits."""
+
+    def test_returns_transition_signal(self) -> None:
+        """Returns a TransitionSignal with correct type."""
+        from tgirl.state_machine import TransitionSignal, compute_transition_signal
+
+        # Use plain Python lists as stand-in for framework tensors
+        logits = [1.0, 2.0, 3.0, 4.0]
+        grammar_valid_mask = [1.0, 0.0, 1.0, 0.0]
+
+        import math
+
+        def softmax_fn(x):
+            max_x = max(x)
+            exps = [math.exp(v - max_x) for v in x]
+            s = sum(exps)
+            return [e / s for e in exps]
+
+        def sum_fn(x):
+            return sum(x)
+
+        def log_fn(x):
+            return [math.log(v) if v > 0 else float("-inf") for v in x]
+
+        signal = compute_transition_signal(
+            token_position=5,
+            logits=logits,
+            grammar_valid_mask=grammar_valid_mask,
+            softmax_fn=softmax_fn,
+            sum_fn=sum_fn,
+            log_fn=log_fn,
+            vocab_size=4,
+        )
+        assert isinstance(signal, TransitionSignal)
+        assert signal.token_position == 5
+
+    def test_grammar_mask_overlap_computed(self) -> None:
+        """grammar_mask_overlap = sum(softmax(logits) * grammar_valid_mask)."""
+        from tgirl.state_machine import compute_transition_signal
+
+        import math
+
+        # Uniform logits, half of tokens valid
+        logits = [0.0, 0.0, 0.0, 0.0]
+        grammar_valid_mask = [1.0, 1.0, 0.0, 0.0]
+
+        def softmax_fn(x):
+            max_x = max(x)
+            exps = [math.exp(v - max_x) for v in x]
+            s = sum(exps)
+            return [e / s for e in exps]
+
+        def sum_fn(x):
+            return sum(x)
+
+        def log_fn(x):
+            return [math.log(v) if v > 0 else float("-inf") for v in x]
+
+        signal = compute_transition_signal(
+            token_position=0,
+            logits=logits,
+            grammar_valid_mask=grammar_valid_mask,
+            softmax_fn=softmax_fn,
+            sum_fn=sum_fn,
+            log_fn=log_fn,
+            vocab_size=4,
+        )
+        # Uniform over 4 tokens, 2 valid: overlap = 0.5
+        assert abs(signal.grammar_mask_overlap - 0.5) < 1e-6
+
+    def test_grammar_freedom_computed(self) -> None:
+        """grammar_freedom = sum(grammar_valid_mask) / vocab_size."""
+        from tgirl.state_machine import compute_transition_signal
+
+        import math
+
+        logits = [0.0, 0.0, 0.0, 0.0, 0.0]
+        grammar_valid_mask = [1.0, 0.0, 1.0, 0.0, 1.0]
+
+        def softmax_fn(x):
+            max_x = max(x)
+            exps = [math.exp(v - max_x) for v in x]
+            s = sum(exps)
+            return [e / s for e in exps]
+
+        def sum_fn(x):
+            return sum(x)
+
+        def log_fn(x):
+            return [math.log(v) if v > 0 else float("-inf") for v in x]
+
+        signal = compute_transition_signal(
+            token_position=0,
+            logits=logits,
+            grammar_valid_mask=grammar_valid_mask,
+            softmax_fn=softmax_fn,
+            sum_fn=sum_fn,
+            log_fn=log_fn,
+            vocab_size=5,
+        )
+        # 3 valid out of 5
+        assert abs(signal.grammar_freedom - 0.6) < 1e-6
+
+    def test_token_entropy_computed(self) -> None:
+        """token_entropy = -sum(p * log(p)) over the distribution."""
+        from tgirl.state_machine import compute_transition_signal
+
+        import math
+
+        # Uniform distribution over 4 tokens -> entropy = log(4)
+        logits = [0.0, 0.0, 0.0, 0.0]
+        grammar_valid_mask = [1.0, 1.0, 1.0, 1.0]
+
+        def softmax_fn(x):
+            max_x = max(x)
+            exps = [math.exp(v - max_x) for v in x]
+            s = sum(exps)
+            return [e / s for e in exps]
+
+        def sum_fn(x):
+            return sum(x)
+
+        def log_fn(x):
+            return [math.log(v) if v > 0 else float("-inf") for v in x]
+
+        signal = compute_transition_signal(
+            token_position=0,
+            logits=logits,
+            grammar_valid_mask=grammar_valid_mask,
+            softmax_fn=softmax_fn,
+            sum_fn=sum_fn,
+            log_fn=log_fn,
+            vocab_size=4,
+        )
+        expected_entropy = math.log(4)  # ~1.386
+        assert abs(signal.token_entropy - expected_entropy) < 1e-5
+
+    def test_zero_torch_mlx_in_function(self) -> None:
+        """compute_transition_signal itself has no torch/mlx imports."""
+        import inspect
+
+        from tgirl.state_machine import compute_transition_signal
+
+        source = inspect.getsource(compute_transition_signal)
+        assert "torch" not in source
+        assert "mlx" not in source
+
+
 class TestStateMachineModuleConstraints:
     """Verify state_machine.py has zero torch/mlx imports."""
 
