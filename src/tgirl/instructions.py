@@ -102,31 +102,55 @@ def generate_tool_doc(tool: ToolDefinition) -> str:
     return "\n".join(lines)
 
 
-def generate_system_prompt(snapshot: RegistrySnapshot) -> str:
+def generate_system_prompt(
+    snapshot: RegistrySnapshot,
+    tool_open: str | None = None,
+    tool_close: str | None = None,
+) -> str:
     """Generate a complete system prompt from a registry snapshot.
 
     Produces structured instructions including:
     - S-expression syntax explanation
     - Tool signatures with parameter names and types
     - Tool descriptions
+    - Delimiter protocol (when tool_open/tool_close are provided)
 
     Args:
         snapshot: Immutable registry snapshot.
+        tool_open: Opening delimiter for tool calls (e.g. ``<tool>``).
+            When provided, the prompt instructs the model to wrap
+            tool calls in these delimiters.
+        tool_close: Closing delimiter for tool calls (e.g. ``</tool>``).
 
     Returns:
         Complete system prompt string.
     """
     sections = [
-        "You call tools using s-expressions. "
+        "You are a tool-calling assistant. You call tools using "
+        "s-expressions wrapped in delimiters."
+        if tool_open
+        else "You call tools using s-expressions. "
         "Reply with ONLY one s-expression, nothing else.",
         "",
         "## Syntax",
         "  (tool_name arg1 arg2 ...)",
         "  Strings are double-quoted. Integers are bare numbers.",
         "",
-        "## Available Tools",
-        "",
     ]
+
+    if tool_open and tool_close:
+        sections.extend([
+            "## Tool Call Format",
+            f"  Wrap every tool call in {tool_open}...{tool_close} delimiters:",
+            f"  {tool_open}(tool_name arg1 arg2){tool_close}",
+            "",
+            "  When you want to call a tool, output the delimiter, then the "
+            "s-expression, then the closing delimiter. You may include "
+            "natural language before the tool call.",
+            "",
+        ])
+
+    sections.extend(["## Available Tools", ""])
 
     for tool in snapshot.tools:
         sections.append(generate_tool_doc(tool))

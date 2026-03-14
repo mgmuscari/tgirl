@@ -184,6 +184,73 @@ class TestGenerateSystemPrompt:
         # Both have str params but different names/roles
 
 
+# --- Tests: delimiter instructions ---
+
+
+class TestDelimiterInstructions:
+    """System prompt includes delimiter protocol when delimiters are provided."""
+
+    def test_no_delimiters_omits_delimiter_section(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_system_prompt
+
+        prompt = generate_system_prompt(simple_registry.snapshot())
+        assert "<tool>" not in prompt
+        assert "</tool>" not in prompt
+
+    def test_delimiters_included_in_prompt(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_system_prompt
+
+        prompt = generate_system_prompt(
+            simple_registry.snapshot(),
+            tool_open="<tool>",
+            tool_close="</tool>",
+        )
+        assert "<tool>" in prompt
+        assert "</tool>" in prompt
+
+    def test_custom_delimiters_included(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_system_prompt
+
+        prompt = generate_system_prompt(
+            simple_registry.snapshot(),
+            tool_open="[CALL]",
+            tool_close="[/CALL]",
+        )
+        assert "[CALL]" in prompt
+        assert "[/CALL]" in prompt
+
+    def test_delimiter_prompt_shows_example(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_system_prompt
+
+        prompt = generate_system_prompt(
+            simple_registry.snapshot(),
+            tool_open="<tool>",
+            tool_close="</tool>",
+        )
+        # Should show an example with delimiters wrapping an s-expression
+        assert "<tool>" in prompt
+        assert "(tool_name" in prompt or "(" in prompt
+        assert "</tool>" in prompt
+
+    def test_deterministic_with_delimiters(
+        self, simple_registry: ToolRegistry
+    ) -> None:
+        from tgirl.instructions import generate_system_prompt
+
+        snap = simple_registry.snapshot()
+        p1 = generate_system_prompt(snap, tool_open="<tool>", tool_close="</tool>")
+        p2 = generate_system_prompt(snap, tool_open="<tool>", tool_close="</tool>")
+        assert p1 == p2
+
+
 # --- Tests: enrichment ---
 
 

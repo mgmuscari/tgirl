@@ -451,7 +451,11 @@ class SamplingSession:
         snapshot = self._registry.snapshot(
             cost_budget=self._config.session_cost_budget
         )
-        system_prompt = generate_system_prompt(snapshot)
+        system_prompt = generate_system_prompt(
+            snapshot,
+            tool_open=self._config.tool_open_delimiter,
+            tool_close=self._config.tool_close_delimiter,
+        )
 
         # Store last user message content for routing context
         for msg_item in reversed(messages):
