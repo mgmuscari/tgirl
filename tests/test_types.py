@@ -288,3 +288,114 @@ class TestRegistrySnapshot:
             snap.quotas["tool_a"] = 999  # type: ignore[index]
         with pytest.raises(TypeError):
             snap.quotas["new_tool"] = 1  # type: ignore[index]
+
+
+class TestRerankConfig:
+    def test_rerank_config_defaults(self) -> None:
+        from tgirl.types import RerankConfig
+
+        cfg = RerankConfig()
+        assert cfg.max_tokens == 16
+        assert cfg.temperature == 0.3
+        assert cfg.top_k == 1
+        assert cfg.enabled is True
+
+    def test_rerank_config_is_frozen(self) -> None:
+        from tgirl.types import RerankConfig
+
+        cfg = RerankConfig()
+        with pytest.raises(ValidationError):
+            cfg.max_tokens = 32  # type: ignore[misc]
+
+    def test_rerank_config_custom_values(self) -> None:
+        from tgirl.types import RerankConfig
+
+        cfg = RerankConfig(max_tokens=8, temperature=0.5, top_k=2, enabled=False)
+        assert cfg.max_tokens == 8
+        assert cfg.temperature == 0.5
+        assert cfg.top_k == 2
+        assert cfg.enabled is False
+
+
+class TestRerankResult:
+    def test_rerank_result_constructs(self) -> None:
+        from tgirl.types import RerankResult
+
+        result = RerankResult(
+            selected_tools=("get_field",),
+            routing_tokens=3,
+            routing_latency_ms=12.5,
+            routing_grammar_text='start: tool_choice\ntool_choice: "get_field"\n',
+        )
+        assert result.selected_tools == ("get_field",)
+        assert result.routing_tokens == 3
+        assert result.routing_latency_ms == 12.5
+
+    def test_rerank_result_is_frozen(self) -> None:
+        from tgirl.types import RerankResult
+
+        result = RerankResult(
+            selected_tools=("get_field",),
+            routing_tokens=3,
+            routing_latency_ms=12.5,
+            routing_grammar_text='start: tool_choice\ntool_choice: "get_field"\n',
+        )
+        with pytest.raises(ValidationError):
+            result.routing_tokens = 10  # type: ignore[misc]
+
+
+class TestTelemetryRecordRerank:
+    def test_telemetry_record_rerank_fields_default_none(self) -> None:
+        from tgirl.types import TelemetryRecord
+
+        record = TelemetryRecord(
+            pipeline_id="test",
+            tokens=[1, 2],
+            grammar_valid_counts=[10, 5],
+            temperatures_applied=[0.3, 0.3],
+            wasserstein_distances=[0.1, 0.2],
+            top_p_applied=[-1.0, -1.0],
+            token_log_probs=[-0.5, -0.3],
+            grammar_generation_ms=5.0,
+            ot_computation_total_ms=2.0,
+            ot_bypassed_count=0,
+            hy_source="(tool 1)",
+            cycle_number=1,
+            freeform_tokens_before=10,
+            wall_time_ms=100.0,
+            total_tokens=12,
+            model_id="test-model",
+            registry_snapshot_hash="abc123",
+        )
+        assert record.rerank_selected_tool is None
+        assert record.rerank_routing_tokens is None
+        assert record.rerank_latency_ms is None
+
+    def test_telemetry_record_rerank_fields_populated(self) -> None:
+        from tgirl.types import TelemetryRecord
+
+        record = TelemetryRecord(
+            pipeline_id="test",
+            tokens=[1, 2],
+            grammar_valid_counts=[10, 5],
+            temperatures_applied=[0.3, 0.3],
+            wasserstein_distances=[0.1, 0.2],
+            top_p_applied=[-1.0, -1.0],
+            token_log_probs=[-0.5, -0.3],
+            grammar_generation_ms=5.0,
+            ot_computation_total_ms=2.0,
+            ot_bypassed_count=0,
+            hy_source="(tool 1)",
+            cycle_number=1,
+            freeform_tokens_before=10,
+            wall_time_ms=100.0,
+            total_tokens=12,
+            model_id="test-model",
+            registry_snapshot_hash="abc123",
+            rerank_selected_tool="get_field",
+            rerank_routing_tokens=3,
+            rerank_latency_ms=12.5,
+        )
+        assert record.rerank_selected_tool == "get_field"
+        assert record.rerank_routing_tokens == 3
+        assert record.rerank_latency_ms == 12.5

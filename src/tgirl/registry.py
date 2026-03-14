@@ -28,6 +28,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._callables: dict[str, Callable[..., Any]] = {}
+        self._type_grammars: dict[str, str] = {}
 
     def tool(
         self,
@@ -143,13 +144,90 @@ class ToolRegistry:
             if td.quota is not None:
                 quotas[name] = td.quota
 
+        # Collect type grammars referenced by included tools
+        referenced_tags = set()
+        for td in tools:
+            for param_name, tag in td.param_tags:
+                referenced_tags.add(tag)
+
+        type_grammars = tuple(
+            (tag, rule) for tag, rule in sorted(self._type_grammars.items())
+            if tag in referenced_tags
+        )
+
         return RegistrySnapshot(
             tools=tuple(tools),
             quotas=quotas,
             cost_remaining=cost_budget,
             scopes=frozenset(scopes) if scopes is not None else frozenset(),
             timestamp=time.time(),
+            type_grammars=type_grammars,
         )
+
+    def register_type(self, tag: str, grammar_rule: str) -> None:
+        """Register a semantic type with a grammar rule.
+
+        Semantic types create distinct non-terminals in the generated
+        grammar. When a parameter is tagged with a registered type,
+        the grammar uses the type's rule instead of the default
+        terminal (e.g., ESCAPED_STRING).
+
+        Args:
+            tag: The semantic type name (e.g., "JsonObject", "FieldName").
+            grammar_rule: Lark EBNF rule body for this type.
+
+        Raises:
+            ValueError: If the tag is already registered.
+        """
+        if tag in self._type_grammars:
+            msg = f"Type '{tag}' is already registered"
+            raise ValueError(msg)
+        self._type_grammars[tag] = grammar_rule
+
+    def enrich(
+        self,
+        name: str,
+        *,
+        param_tags: dict[str, str] | None = None,
+        examples: list[str] | None = None,
+    ) -> None:
+        """Add semantic metadata to a registered tool.
+
+        Enrichment is additive — it adds type tags and usage examples
+        without changing the tool's type signature or behavior.
+
+        Args:
+            name: Name of the registered tool.
+            param_tags: Mapping of parameter name to semantic type tag.
+            examples: Usage examples as s-expression strings.
+
+        Raises:
+            KeyError: If the tool is not registered.
+            ValueError: If a param_tags key doesn't match any parameter.
+        """
+        if name not in self._tools:
+            raise KeyError(name)
+
+        tool = self._tools[name]
+        updates: dict[str, object] = {}
+
+        if param_tags:
+            param_names = {p.name for p in tool.parameters}
+            unknown = set(param_tags) - param_names
+            if unknown:
+                bad = next(iter(unknown))
+                msg = f"{bad}"
+                raise ValueError(msg)
+
+            merged = dict(tool.param_tags)
+            merged.update(param_tags)
+            updates["param_tags"] = tuple(merged.items())
+
+        if examples:
+            updates["examples"] = tuple(examples)
+
+        if updates:
+            self._tools[name] = tool.model_copy(update=updates)
 
     def get(self, name: str) -> ToolDefinition:
         """Get a tool definition by name.

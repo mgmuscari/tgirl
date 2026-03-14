@@ -2,6 +2,10 @@
 
 from annotated_types import Ge, Gt, Le, Lt, MultipleOf
 
+from tgirl.format import (
+    ChatTemplateFormatter,
+    PlainFormatter,
+)
 from tgirl.compile import (
     CompileConfig,
     InsufficientResources,
@@ -20,6 +24,7 @@ from tgirl.grammar import (
     generate as generate_grammar,
 )
 from tgirl.registry import ToolRegistry
+from tgirl.rerank import ToolRouter
 from tgirl.sample import (
     ConstrainedGenerationResult,
     DelimiterDetector,
@@ -41,6 +46,7 @@ from tgirl.transport import (
 )
 from tgirl.types import (
     AnnotatedType,
+    PromptFormatter,
     AnyType,
     ConstraintRepr,
     DictType,
@@ -55,6 +61,8 @@ from tgirl.types import (
     PipelineError,
     PrimitiveType,
     RegistrySnapshot,
+    RerankConfig,
+    RerankResult,
     SessionConfig,
     TelemetryRecord,
     ToolDefinition,
@@ -66,6 +74,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AnnotatedType",
+    "ChatTemplateFormatter",
     "CompileConfig",
     "ConstrainedGenerationResult",
     "AnyType",
@@ -94,8 +103,12 @@ __all__ = [
     "ParameterDef",
     "PipelineError",
     "PipelineResult",
+    "PlainFormatter",
     "PrimitiveType",
+    "PromptFormatter",
     "RegistrySnapshot",
+    "RerankConfig",
+    "RerankResult",
     "SamplingResult",
     "SamplingSession",
     "SessionConfig",
@@ -103,6 +116,7 @@ __all__ = [
     "ToolCallRecord",
     "ToolDefinition",
     "ToolRegistry",
+    "ToolRouter",
     "TransportConfig",
     "TransportResult",
     "apply_penalties",

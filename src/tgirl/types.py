@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 
 from pydantic import (
     BaseModel,
@@ -167,6 +167,8 @@ class ToolDefinition(BaseModel):
     timeout: float | None = None
     cacheable: bool = False
     description: str = ""
+    param_tags: tuple[tuple[str, str], ...] = ()
+    examples: tuple[str, ...] = ()
 
 
 # --- Registry Snapshot ---
@@ -184,20 +186,17 @@ class RegistrySnapshot(BaseModel):
     cost_remaining: float | None
     scopes: frozenset[str]
     timestamp: float
+    type_grammars: tuple[tuple[str, str], ...] = ()
 
     @model_validator(mode="after")
     def _wrap_quotas(self) -> RegistrySnapshot:
         if not isinstance(self.quotas, MappingProxyType):
-            object.__setattr__(
-                self, "quotas", MappingProxyType(dict(self.quotas))
-            )
+            object.__setattr__(self, "quotas", MappingProxyType(dict(self.quotas)))
         return self
 
     @field_serializer("quotas")
     @classmethod
-    def _serialize_quotas(
-        cls, v: Mapping[str, int]
-    ) -> dict[str, int]:
+    def _serialize_quotas(cls, v: Mapping[str, int]) -> dict[str, int]:
         return dict(v)
 
 
@@ -242,6 +241,32 @@ class TelemetryRecord(BaseModel):
     total_tokens: int
     model_id: str
     registry_snapshot_hash: str
+    rerank_selected_tool: str | None = None
+    rerank_routing_tokens: int | None = None
+    rerank_latency_ms: float | None = None
+
+
+# --- Reranking ---
+
+
+class RerankConfig(BaseModel):
+    """Configuration for grammar-constrained tool re-ranking."""
+
+    model_config = ConfigDict(frozen=True)
+    max_tokens: int = 16
+    temperature: float = 0.3
+    top_k: int = 1
+    enabled: bool = True
+
+
+class RerankResult(BaseModel):
+    """Result of a re-ranking pass."""
+
+    model_config = ConfigDict(frozen=True)
+    selected_tools: tuple[str, ...]
+    routing_tokens: int
+    routing_latency_ms: float
+    routing_grammar_text: str
 
 
 # --- Model Intervention ---
@@ -287,6 +312,16 @@ class SessionConfig(BaseModel):
     tool_close_delimiter: str = "</tool>"
     result_open_delimiter: str = "<tool_result>"
     result_close_delimiter: str = "</tool_result>"
+
+
+# --- Prompt Formatting ---
+
+
+@runtime_checkable
+class PromptFormatter(Protocol):
+    """Protocol for formatting chat messages into model input strings."""
+
+    def format_messages(self, messages: list[dict[str, str]]) -> str: ...
 
 
 # Rebuild forward refs for recursive types

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from tgirl.registry import ToolRegistry
+    from tgirl.types import PromptFormatter
 
 import structlog
 import torch
@@ -24,6 +25,7 @@ from tgirl.types import (
     ModelIntervention,
     PipelineError,
     RegistrySnapshot,
+    RerankConfig,
     SessionConfig,
     TelemetryRecord,
 )
@@ -302,9 +304,7 @@ def run_constrained_generation(
         temperatures_applied.append(
             merged.temperature if merged.temperature is not None else -1.0
         )
-        top_p_applied.append(
-            merged.top_p if merged.top_p is not None else -1.0
-        )
+        top_p_applied.append(merged.top_p if merged.top_p is not None else -1.0)
 
         # 7. Sample token
         probs = torch.softmax(shaped, dim=-1)
@@ -323,9 +323,7 @@ def run_constrained_generation(
 
         # Record log prob
         log_prob = (
-            torch.log(probs[token_id]).item()
-            if probs[token_id] > 0
-            else float("-inf")
+            torch.log(probs[token_id]).item() if probs[token_id] > 0 else float("-inf")
         )
         token_log_probs.append(log_prob)
 
@@ -396,7 +394,11 @@ class SamplingSession:
         config: SessionConfig | None = None,
         hooks: list[InferenceHook] | None = None,
         transport_config: TransportConfig | None = None,
+        rerank_config: RerankConfig | None = None,
+        formatter: PromptFormatter | None = None,
     ) -> None:
+        from tgirl.rerank import ToolRouter
+
         self._registry = registry
         self._forward_fn = forward_fn
         self._decode = tokenizer_decode
@@ -407,9 +409,79 @@ class SamplingSession:
         self._hooks = hooks or []
         self._transport_config = transport_config or TransportConfig()
         self._consumed_quotas: dict[str, int] = {}
+        self._rerank_config = rerank_config
+        self._formatter = formatter
+        self._last_user_content: str | None = None
+        self._router = (
+            ToolRouter(
+                grammar_guide_factory=grammar_guide_factory,
+                forward_fn=forward_fn,
+                tokenizer_decode=tokenizer_decode,
+                embeddings=embeddings,
+                config=rerank_config,
+            )
+            if rerank_config is not None
+            else None
+        )
+
+    def run_chat(self, messages: list[dict[str, str]]) -> SamplingResult:
+        """Format messages and run the dual-mode sampling loop.
+
+        Generates a system prompt from the registry snapshot, prepends it,
+        formats via the configured PromptFormatter, encodes, and delegates
+        to run(). Callers should not include their own system message —
+        run_chat() always prepends the registry-generated system prompt.
+
+        Args:
+            messages: Chat messages (role/content dicts). Should not
+                include a system message; one will be generated automatically.
+
+        Returns:
+            SamplingResult from the sampling loop.
+
+        Raises:
+            ValueError: If no formatter is configured.
+        """
+        if self._formatter is None:
+            msg = "run_chat() requires a formatter — pass formatter= to SamplingSession"
+            raise ValueError(msg)
+
+        from tgirl.instructions import generate_system_prompt
+
+        snapshot = self._registry.snapshot(
+            cost_budget=self._config.session_cost_budget
+        )
+        system_prompt = generate_system_prompt(
+            snapshot,
+            tool_open=self._config.tool_open_delimiter,
+            tool_close=self._config.tool_close_delimiter,
+        )
+
+        # Store last user message content for routing context
+        for msg_item in reversed(messages):
+            if msg_item.get("role") == "user":
+                self._last_user_content = msg_item["content"]
+                break
+
+        # Prepend system message
+        full_messages = [{"role": "system", "content": system_prompt}] + list(messages)
+
+        # Format and encode
+        formatted = self._formatter.format_messages(full_messages)
+        prompt_tokens = self._encode(formatted)
+
+        return self.run(prompt_tokens)
 
     def run(self, prompt_tokens: list[int]) -> SamplingResult:
-        """Run the full dual-mode sampling loop."""
+        """Run the full dual-mode sampling loop.
+
+        Note: _last_user_content is consumed and cleared here. It is only
+        valid when set by run_chat() immediately before this call.
+        """
+        # Capture and clear routing state to prevent stale leaks
+        last_user_content = self._last_user_content
+        self._last_user_content = None
+
         # Deferred imports to break circular dependency at module level
         from tgirl.compile import run_pipeline
         from tgirl.grammar import generate as generate_grammar
@@ -474,6 +546,46 @@ class SamplingSession:
 
             # Generate grammar from snapshot with reduced quotas
             snapshot = self._snapshot_with_remaining_quotas()
+
+            # Optional re-ranking pass
+            rerank_active = (
+                self._router is not None
+                and self._rerank_config
+                and self._rerank_config.enabled
+            )
+            if rerank_active:
+                # Build routing context tokens
+                if self._formatter is not None and last_user_content is not None:
+                    from tgirl.instructions import generate_routing_prompt
+
+                    routing_prompt = generate_routing_prompt(snapshot)
+                    routing_messages = [
+                        {"role": "system", "content": routing_prompt},
+                        {"role": "user", "content": last_user_content},
+                    ]
+                    routing_context = self._encode(
+                        self._formatter.format_messages(routing_messages)
+                    )
+                else:
+                    routing_context = token_history
+
+                rerank_result = self._router.route(
+                    snapshot=snapshot,
+                    context_tokens=routing_context,
+                    transport_config=self._transport_config,
+                )
+                total_tokens += rerank_result.routing_tokens
+                # Restrict the EXISTING quota-adjusted snapshot
+                selected = frozenset(rerank_result.selected_tools)
+                snapshot = RegistrySnapshot(
+                    tools=tuple(t for t in snapshot.tools if t.name in selected),
+                    quotas={k: v for k, v in snapshot.quotas.items() if k in selected},
+                    cost_remaining=snapshot.cost_remaining,
+                    scopes=snapshot.scopes,
+                    timestamp=snapshot.timestamp,
+                    type_grammars=snapshot.type_grammars,
+                )
+
             grammar_output = generate_grammar(snapshot)
             grammar_state = self._grammar_guide_factory(grammar_output.text)
 
@@ -494,20 +606,14 @@ class SamplingSession:
 
             # Count tool invocations
             tool_names = set(self._registry.names())
-            invocations = self._count_tool_invocations(
-                gen_result.hy_source, tool_names
-            )
+            invocations = self._count_tool_invocations(gen_result.hy_source, tool_names)
 
             # Update consumed quotas
             for name, count in invocations.items():
-                self._consumed_quotas[name] = (
-                    self._consumed_quotas.get(name, 0) + count
-                )
+                self._consumed_quotas[name] = self._consumed_quotas.get(name, 0) + count
 
             # Execute the pipeline
-            pipeline_result = run_pipeline(
-                gen_result.hy_source, self._registry
-            )
+            pipeline_result = run_pipeline(gen_result.hy_source, self._registry)
 
             error = None
             result_val = None
@@ -528,9 +634,10 @@ class SamplingSession:
             # Build TelemetryRecord for this cycle (B2 fix)
             cycle_wall_ms = (time.monotonic() - start_time) * 1000
             import hashlib
-            snap_hash = hashlib.sha256(
-                snapshot.model_dump_json().encode()
-            ).hexdigest()[:16]
+
+            snap_hash = hashlib.sha256(snapshot.model_dump_json().encode()).hexdigest()[
+                :16
+            ]
             telemetry_records.append(
                 TelemetryRecord(
                     pipeline_id=f"cycle-{cycle_count}",
@@ -552,6 +659,15 @@ class SamplingSession:
                     total_tokens=total_tokens,
                     model_id="unknown",
                     registry_snapshot_hash=snap_hash,
+                    rerank_selected_tool=(
+                        rerank_result.selected_tools[0] if rerank_active else None
+                    ),
+                    rerank_routing_tokens=(
+                        rerank_result.routing_tokens if rerank_active else None
+                    ),
+                    rerank_latency_ms=(
+                        rerank_result.routing_latency_ms if rerank_active else None
+                    ),
                 )
             )
 
@@ -585,9 +701,7 @@ class SamplingSession:
         snapshot, making them inexpressible in the grammar for subsequent
         cycles (TGIRL.md 3.3 safety by construction).
         """
-        base = self._registry.snapshot(
-            cost_budget=self._config.session_cost_budget
-        )
+        base = self._registry.snapshot(cost_budget=self._config.session_cost_budget)
         remaining_quotas = {
             name: max(0, limit - self._consumed_quotas.get(name, 0))
             for name, limit in base.quotas.items()

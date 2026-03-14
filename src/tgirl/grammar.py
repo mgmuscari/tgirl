@@ -147,13 +147,9 @@ def _type_to_rule(
         val_name = f"{rule_name}_val"
         key_prods = _type_to_rule(type_repr.key, key_name, config)
         val_prods = _type_to_rule(type_repr.value, val_name, config)
-        pair = f'{key_name} SPACE {val_name}'
+        pair = f"{key_name} SPACE {val_name}"
         rule = f'"{{" ({pair} (SPACE {pair})*)? "}}"'
-        return (
-            [Production(name=rule_name, rule=rule)]
-            + key_prods
-            + val_prods
-        )
+        return [Production(name=rule_name, rule=rule)] + key_prods + val_prods
 
     if isinstance(type_repr, LiteralType):
         parts = [_literal_value_to_grammar(v) for v in type_repr.values]
@@ -197,7 +193,7 @@ def _type_to_rule(
                 optional_parts.append(pair)
         all_parts = required_parts + optional_parts
         if all_parts:
-            body = ' SPACE '.join(all_parts)
+            body = " SPACE ".join(all_parts)
             rule = f'"{{" {body} "}}"'
         else:
             rule = '"{"  "}"'
@@ -208,10 +204,7 @@ def _type_to_rule(
             return _type_to_rule(type_repr.base, rule_name, config)
 
         # Check for enumerable integer range
-        if (
-            isinstance(type_repr.base, PrimitiveType)
-            and type_repr.base.kind == "int"
-        ):
+        if isinstance(type_repr.base, PrimitiveType) and type_repr.base.kind == "int":
             lo: int | None = None
             hi: int | None = None
             for c in type_repr.constraints:
@@ -239,21 +232,17 @@ def _type_to_rule(
         return _type_to_rule(type_repr.base, rule_name, config)
 
     if isinstance(type_repr, AnyType):
-        rule = (
-            'ESCAPED_STRING | SIGNED_INT | SIGNED_FLOAT'
-            ' | "true" | "false" | "nil"'
-        )
+        rule = 'ESCAPED_STRING | SIGNED_INT | SIGNED_FLOAT | "true" | "false" | "nil"'
         return [Production(name=rule_name, rule=rule)]
 
     msg = f"Unknown TypeRepr: {type_repr}"  # pragma: no cover
     raise TypeError(msg)  # pragma: no cover
 
 
-
-
 def _tool_to_rules(
     tool: ToolDefinition,
     config: GrammarConfig,
+    type_grammars: Mapping[str, str] | None = None,
 ) -> list[Production]:
     """Convert a ToolDefinition to grammar productions.
 
@@ -261,14 +250,20 @@ def _tool_to_rules(
     required params first in fixed order, then optional params
     as a nested optional chain.
 
+    When a parameter has a semantic type tag with a registered grammar
+    rule, the tagged rule is used instead of the default type rule.
+
     Args:
         tool: The tool definition.
         config: Grammar generation configuration.
+        type_grammars: Mapping of semantic type tags to Lark EBNF rules.
 
     Returns:
         List of Production objects for this tool.
     """
     prods: list[Production] = []
+    tag_map = dict(tool.param_tags)
+    tg = type_grammars or {}
 
     # Split required and optional parameters
     required = [p for p in tool.parameters if not p.has_default]
@@ -277,9 +272,17 @@ def _tool_to_rules(
     # Generate type productions for each parameter
     param_type_names: list[str] = []
     for param in tool.parameters:
-        type_name = f"param_{tool.name}_{param.name}"
-        param_type_names.append(type_name)
-        prods.extend(_type_to_rule(param.type_repr, type_name, config))
+        tag = tag_map.get(param.name)
+        if tag and tag in tg:
+            # Use the semantic type's shared rule name
+            rule_name = f"stype_{tag.lower()}"
+            param_type_names.append(rule_name)
+            # The actual rule definition is emitted once (deduped later)
+            prods.append(Production(name=rule_name, rule=tg[tag]))
+        else:
+            type_name = f"param_{tool.name}_{param.name}"
+            param_type_names.append(type_name)
+            prods.extend(_type_to_rule(param.type_repr, type_name, config))
 
     if not tool.parameters:
         # No parameters: (tool_name)
@@ -296,10 +299,10 @@ def _tool_to_rules(
     if opt_count > 0:
         # Start with the last optional param
         last_opt_idx = req_count + opt_count - 1
-        chain = f'SPACE {param_type_names[last_opt_idx]}'
+        chain = f"SPACE {param_type_names[last_opt_idx]}"
         # Wrap remaining optionals from inside out
         for i in range(last_opt_idx - 1, req_count - 1, -1):
-            chain = f'SPACE {param_type_names[i]} ({chain})?'
+            chain = f"SPACE {param_type_names[i]} ({chain})?"
     else:
         chain = None
 
@@ -308,12 +311,10 @@ def _tool_to_rules(
 
     if chain is not None:
         args = (
-            ' SPACE '.join(parts) + f' ({chain})?'
-            if req_count > 0
-            else f'({chain})?'
+            " SPACE ".join(parts) + f" ({chain})?" if req_count > 0 else f"({chain})?"
         )
     else:
-        args = ' SPACE '.join(parts)
+        args = " SPACE ".join(parts)
 
     if req_count > 0:
         rule = f'"(" "{tool.name}" SPACE {args} ")"'
@@ -324,10 +325,9 @@ def _tool_to_rules(
     return prods
 
 
-
 def _load_templates() -> jinja2.Environment:
     """Load Jinja2 templates from the templates package."""
-    templates_path = importlib.resources.files('tgirl.templates')
+    templates_path = importlib.resources.files("tgirl.templates")
     loader = jinja2.FileSystemLoader(str(templates_path))
     return jinja2.Environment(loader=loader, keep_trailing_newline=True)
 
@@ -352,8 +352,10 @@ def _render_grammar(
     type_prods: list[Production] = []
     tool_call_names: list[str] = []
 
+    tg = dict(snapshot.type_grammars)
+
     for tool in snapshot.tools:
-        rules = _tool_to_rules(tool, config)
+        rules = _tool_to_rules(tool, config, type_grammars=tg)
         # First production is the call_<name> rule
         tool_call_names.append(rules[0].name)
         tool_prods.append(rules[0])
@@ -369,14 +371,30 @@ def _render_grammar(
             seen.add(p.name)
             deduped_type_prods.append(p)
 
-    tool_alternatives = ' | '.join(tool_call_names) if tool_call_names else ''
+    tool_alternatives = " | ".join(tool_call_names) if tool_call_names else ""
 
-    template = env.get_template('base.cfg.j2')
+    template = env.get_template("base.cfg.j2")
     return template.render(
         tool_alternatives=tool_alternatives,
         tool_productions=tool_prods,
         type_productions=deduped_type_prods,
     )
+
+
+def generate_routing_grammar(snapshot: RegistrySnapshot) -> str:
+    """Generate a minimal grammar that accepts only tool names.
+
+    The grammar is a simple alternation of string literals:
+        start: tool_choice
+        tool_choice: "get_field" | "set_field" | ...
+
+    Returns Lark EBNF text (not a GrammarOutput -- no productions or hash needed).
+    """
+    if not snapshot.tools:
+        msg = "Cannot generate routing grammar for empty snapshot"
+        raise ValueError(msg)
+    alternatives = " | ".join(f'"{tool.name}"' for tool in snapshot.tools)
+    return f"start: tool_choice\ntool_choice: {alternatives}\n"
 
 
 def generate(
@@ -395,9 +413,10 @@ def generate(
     cfg = config or GrammarConfig()
 
     # Collect all productions
+    tg = dict(snapshot.type_grammars)
     all_prods: list[Production] = []
     for tool in snapshot.tools:
-        all_prods.extend(_tool_to_rules(tool, cfg))
+        all_prods.extend(_tool_to_rules(tool, cfg, type_grammars=tg))
 
     # Also collect type productions from return types
     for tool in snapshot.tools:
@@ -444,12 +463,8 @@ def diff(a: GrammarOutput, b: GrammarOutput) -> GrammarDiff:
     a_names = set(a_map)
     b_names = set(b_map)
 
-    added = tuple(
-        b_map[n] for n in sorted(b_names - a_names)
-    )
-    removed = tuple(
-        a_map[n] for n in sorted(a_names - b_names)
-    )
+    added = tuple(b_map[n] for n in sorted(b_names - a_names))
+    removed = tuple(a_map[n] for n in sorted(a_names - b_names))
     changed = tuple(
         (a_map[n], b_map[n])
         for n in sorted(a_names & b_names)
