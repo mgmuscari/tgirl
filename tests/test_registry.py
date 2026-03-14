@@ -501,3 +501,58 @@ class TestRegisterFromSchema:
         snap = registry.snapshot()
         assert len(snap.tools) == 1
         assert snap.tools[0].name == "snap_tool"
+
+    def test_register_from_schema_duplicate_raises(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Duplicate registration raises ValueError."""
+        schema_params = {
+            "type": "dict",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        registry.register_from_schema(
+            name="dup", parameters=schema_params, description=""
+        )
+        with pytest.raises(ValueError, match="already registered"):
+            registry.register_from_schema(
+                name="dup", parameters=schema_params, description=""
+            )
+
+    def test_register_from_schema_dict_type(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Dict type without properties maps to DictType."""
+        schema_params = {
+            "type": "dict",
+            "properties": {
+                "data": {"type": "dict"},
+            },
+            "required": ["data"],
+        }
+        registry.register_from_schema(
+            name="dict_func", parameters=schema_params, description=""
+        )
+        td = registry.get("dict_func")
+        assert td.parameters[0].type_repr == DictType(
+            key=PrimitiveType(kind="str"), value=AnyType()
+        )
+
+    def test_register_from_schema_tuple_type(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Tuple type maps to ListType(element=AnyType)."""
+        schema_params = {
+            "type": "dict",
+            "properties": {
+                "coords": {"type": "tuple"},
+            },
+            "required": ["coords"],
+        }
+        registry.register_from_schema(
+            name="tuple_func", parameters=schema_params, description=""
+        )
+        td = registry.get("tuple_func")
+        assert td.parameters[0].type_repr == ListType(
+            element=AnyType()
+        )

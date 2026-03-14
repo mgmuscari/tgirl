@@ -184,7 +184,7 @@ class ToolRegistry:
                 name=param_name,
                 type_repr=type_repr,
                 has_default=not is_required,
-                default=None if not is_required else None,
+                default=None,
             )
             if is_required:
                 required_params.append(param)
