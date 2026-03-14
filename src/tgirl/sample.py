@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from tgirl.registry import ToolRegistry
+    from tgirl.state_machine import TransitionPolicy
     from tgirl.types import PromptFormatter
 
 import structlog
@@ -435,7 +436,7 @@ class SamplingSession:
         formatter: PromptFormatter | None = None,
         backend: Literal["torch", "mlx", "auto"] = "auto",
         mlx_grammar_guide_factory: Callable | None = None,
-        transition_policy: Any | None = None,
+        transition_policy: TransitionPolicy | None = None,
     ) -> None:
         from tgirl.rerank import ToolRouter
         from tgirl.state_machine import DelimiterTransitionPolicy

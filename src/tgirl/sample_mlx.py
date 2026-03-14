@@ -211,6 +211,8 @@ def run_constrained_generation_mlx(
     token_log_probs: list[float] = []
     ot_computation_total_ms = 0.0
     ot_bypassed_count = 0
+    ot_bypass_reasons: list[str | None] = []
+    ot_iterations: list[int] = []
 
     vocab_size = embeddings.shape[0]
 
@@ -258,6 +260,8 @@ def run_constrained_generation_mlx(
         ot_elapsed_ms = (time.monotonic() - ot_start) * 1000
         ot_computation_total_ms += ot_elapsed_ms
         wasserstein_distances.append(ot_result.wasserstein_distance)
+        ot_bypass_reasons.append(ot_result.bypass_reason)
+        ot_iterations.append(ot_result.iterations)
         if ot_result.bypassed:
             ot_bypassed_count += 1
         _t5 = time.monotonic()
@@ -340,5 +344,7 @@ def run_constrained_generation_mlx(
         token_log_probs=token_log_probs,
         ot_computation_total_ms=ot_computation_total_ms,
         ot_bypassed_count=ot_bypassed_count,
+        ot_bypass_reasons=ot_bypass_reasons,
+        ot_iterations=ot_iterations,
         grammar_generation_ms=elapsed_ms,
     )
