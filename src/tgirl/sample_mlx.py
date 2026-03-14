@@ -52,6 +52,34 @@ class InferenceHookMlx(Protocol):
     ) -> ModelIntervention: ...
 
 
+class BacktrackSteeringHookMlx:
+    """MLX-native pre-OT hook that applies negative logit bias on dead-end tokens.
+
+    Mirror of BacktrackSteeringHook from sample.py but conforms to
+    InferenceHookMlx protocol (receives valid_mask: mx.array).
+    """
+
+    def __init__(
+        self,
+        dead_end_tokens: frozenset[int],
+        bias_strength: float = -100.0,
+    ) -> None:
+        self.dead_end_tokens = dead_end_tokens
+        self.bias_strength = bias_strength
+
+    def pre_forward(
+        self,
+        position: int,
+        valid_mask: mx.array,
+        token_history: list[int],
+        logits: mx.array,
+    ) -> ModelIntervention:
+        if not self.dead_end_tokens:
+            return ModelIntervention()
+        bias = {tid: self.bias_strength for tid in self.dead_end_tokens}
+        return ModelIntervention(logit_bias=bias)
+
+
 class GrammarTemperatureHookMlx:
     """MLX-native grammar-implied temperature scheduling.
 

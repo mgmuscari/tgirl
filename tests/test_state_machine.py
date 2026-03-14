@@ -878,6 +878,65 @@ class TestBacktrackSteeringHook:
         assert isinstance(hook, InferenceHook)
 
 
+class TestBacktrackSteeringHookMlx:
+    """BacktrackSteeringHookMlx applies negative logit bias via MLX."""
+
+    def test_no_dead_ends_returns_no_bias(self) -> None:
+        import mlx.core as mx
+
+        from tgirl.sample_mlx import BacktrackSteeringHookMlx
+
+        hook = BacktrackSteeringHookMlx(dead_end_tokens=frozenset())
+        logits = mx.array([1.0, 2.0, 3.0])
+        valid_mask = mx.ones((3,))
+
+        result = hook.pre_forward(0, valid_mask, [], logits)
+        assert result.logit_bias is None
+
+    def test_dead_end_tokens_get_negative_bias(self) -> None:
+        import mlx.core as mx
+
+        from tgirl.sample_mlx import BacktrackSteeringHookMlx
+
+        hook = BacktrackSteeringHookMlx(
+            dead_end_tokens=frozenset({1, 2}),
+            bias_strength=-100.0,
+        )
+        logits = mx.array([1.0, 2.0, 3.0])
+        valid_mask = mx.ones((3,))
+
+        result = hook.pre_forward(0, valid_mask, [], logits)
+        assert result.logit_bias is not None
+        assert result.logit_bias[1] == -100.0
+        assert result.logit_bias[2] == -100.0
+        assert 0 not in result.logit_bias
+
+    def test_conforms_to_inference_hook_mlx_protocol(self) -> None:
+        from tgirl.sample_mlx import (
+            BacktrackSteeringHookMlx,
+            InferenceHookMlx,
+        )
+
+        hook = BacktrackSteeringHookMlx(dead_end_tokens=frozenset())
+        assert isinstance(hook, InferenceHookMlx)
+
+    def test_custom_bias_strength(self) -> None:
+        import mlx.core as mx
+
+        from tgirl.sample_mlx import BacktrackSteeringHookMlx
+
+        hook = BacktrackSteeringHookMlx(
+            dead_end_tokens=frozenset({0}),
+            bias_strength=-50.0,
+        )
+        logits = mx.array([1.0, 2.0])
+        valid_mask = mx.ones((2,))
+
+        result = hook.pre_forward(0, valid_mask, [], logits)
+        assert result.logit_bias is not None
+        assert result.logit_bias[0] == -50.0
+
+
 class TestConfidenceTransitionPolicy:
     """ConfidenceTransitionPolicy uses Markov chain on model signals."""
 
