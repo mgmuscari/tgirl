@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
 import structlog
 import torch
 
@@ -71,6 +72,15 @@ class LLGuidanceGrammarState:
         elif tokenizer_vocab_size < self._llg_vocab_size:
             mask = mask[:tokenizer_vocab_size]
         return mask
+
+    def get_valid_mask_np(self, tokenizer_vocab_size: int) -> np.ndarray:
+        """Return a boolean mask of valid next tokens as numpy array.
+
+        More efficient than get_valid_mask().numpy() when the consumer
+        needs numpy (e.g., for conversion to mx.array in the MLX path).
+        """
+        mask_torch = self.get_valid_mask(tokenizer_vocab_size)
+        return mask_torch.numpy()
 
     def is_accepting(self) -> bool:
         """Check if the grammar is in an accepting/final state."""

@@ -195,6 +195,26 @@ class TestFactory:
         assert mask.sum().item() < gpt2_tokenizer.vocab_size
 
 
+class TestGetValidMaskNp:
+    """get_valid_mask_np returns correct numpy array."""
+
+    def test_returns_ndarray(self, grammar_factory, gpt2_tokenizer):
+        import numpy as np
+
+        state = grammar_factory(SIMPLE_GRAMMAR)
+        mask = state.get_valid_mask_np(gpt2_tokenizer.vocab_size)
+        assert isinstance(mask, np.ndarray)
+        assert mask.dtype == np.bool_
+
+    def test_matches_torch_mask(self, grammar_factory, gpt2_tokenizer):
+        import numpy as np
+
+        state = grammar_factory(SIMPLE_GRAMMAR)
+        mask_torch = state.get_valid_mask(gpt2_tokenizer.vocab_size)
+        mask_np = state.get_valid_mask_np(gpt2_tokenizer.vocab_size)
+        np.testing.assert_array_equal(mask_np, mask_torch.numpy())
+
+
 class TestWithRealTgirlGrammar:
     """Integration: generate grammar from registry, use with adapter."""
 
