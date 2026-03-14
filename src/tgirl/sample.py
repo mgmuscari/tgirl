@@ -276,6 +276,7 @@ def run_constrained_generation(
     max_tokens: int = 512,
     context_tokens: list[int] | None = None,
     confidence_monitor: Any | None = None,
+    grammar_guide_factory: Callable[[str], GrammarState] | None = None,
     grammar_text: str | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
@@ -401,15 +402,31 @@ def run_constrained_generation(
                 and confidence_monitor.backtracks_remaining > 0
                 and last_checkpoint is not None
             ):
+                # Divergent token is the one chosen at checkpoint
+                cp_pos = last_checkpoint.position
+                divergent_token = (
+                    tokens[cp_pos] if cp_pos < len(tokens) else token_id
+                )
+                # Track best-so-far before backtracking
+                mean_lp = (
+                    sum(token_log_probs) / len(token_log_probs)
+                    if token_log_probs
+                    else float("-inf")
+                )
+                last_checkpoint = last_checkpoint.with_attempt(
+                    tokens=tuple(tokens), mean_log_prob=mean_lp
+                )
                 event = BacktrackEvent(
-                    checkpoint_position=last_checkpoint.position,
+                    checkpoint_position=cp_pos,
                     trigger_position=position,
                     trigger_log_prob=log_prob,
-                    dead_end_tokens_added=frozenset({token_id}),
+                    dead_end_tokens_added=frozenset(
+                        {divergent_token}
+                    ),
                 )
                 backtrack_events.append(event)
                 last_checkpoint = last_checkpoint.with_added_dead_end(
-                    token_id
+                    divergent_token
                 )
                 confidence_monitor.record_backtrack()
                 backtrack_requested = True

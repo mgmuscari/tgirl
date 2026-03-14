@@ -1198,6 +1198,210 @@ class TestBacktrackDispatchTorch:
         assert result.backtrack_requested is True
         assert result.backtrack_checkpoint is not None
 
+    def test_backtrack_uses_divergent_token_at_checkpoint(self) -> None:
+        """Dead-end token is the one chosen at checkpoint position."""
+        import torch
+
+        from tgirl.sample import run_constrained_generation
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+        from tgirl.transport import TransportConfig
+
+        # All tokens valid, high freedom -> checkpoint created
+        class AllValidGS:
+            def __init__(self):
+                self._advances = 0
+
+            def get_valid_mask(self, vocab_size: int) -> torch.Tensor:
+                return torch.ones(vocab_size, dtype=torch.bool)
+
+            def is_accepting(self) -> bool:
+                return self._advances >= 50
+
+            def advance(self, token_id: int) -> None:
+                self._advances += 1
+
+        gs = AllValidGS()
+        embeddings = torch.eye(10)
+
+        # Near-uniform logits -> log_prob will be ~log(0.1) = -2.3
+        def forward_fn(ctx):
+            return torch.zeros(10)
+
+        monitor = ConstrainedConfidenceMonitor(
+            log_prob_threshold=-1.0,  # -2.3 < -1.0 -> backtrack
+            window_size=2,
+            freedom_threshold=3,
+            max_backtracks=1,
+        )
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "x",
+            embeddings=embeddings,
+            hooks=[],
+            transport_config=TransportConfig(),
+            max_tokens=20,
+            confidence_monitor=monitor,
+            grammar_text="(test)",
+        )
+        assert result.backtrack_requested is True
+        cp = result.backtrack_checkpoint
+        assert cp is not None
+        # Divergent token should be in dead_end_tokens
+        assert len(cp.dead_end_tokens) > 0
+        # The event should record the checkpoint position
+        assert len(result.backtrack_events) == 1
+        event = result.backtrack_events[0]
+        assert event.checkpoint_position == cp.position
+
+    def test_backtrack_calls_with_attempt(self) -> None:
+        """with_attempt is called to track best-so-far on backtrack."""
+        import torch
+
+        from tgirl.sample import run_constrained_generation
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+        from tgirl.transport import TransportConfig
+
+        class AllValidGS:
+            def __init__(self):
+                self._advances = 0
+
+            def get_valid_mask(self, vocab_size: int) -> torch.Tensor:
+                return torch.ones(vocab_size, dtype=torch.bool)
+
+            def is_accepting(self) -> bool:
+                return self._advances >= 50
+
+            def advance(self, token_id: int) -> None:
+                self._advances += 1
+
+        gs = AllValidGS()
+        embeddings = torch.eye(10)
+
+        def forward_fn(ctx):
+            return torch.zeros(10)
+
+        monitor = ConstrainedConfidenceMonitor(
+            log_prob_threshold=-1.0,
+            window_size=2,
+            freedom_threshold=3,
+            max_backtracks=1,
+        )
+
+        result = run_constrained_generation(
+            grammar_state=gs,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "x",
+            embeddings=embeddings,
+            hooks=[],
+            transport_config=TransportConfig(),
+            max_tokens=20,
+            confidence_monitor=monitor,
+            grammar_text="(test)",
+        )
+        cp = result.backtrack_checkpoint
+        assert cp is not None
+        # with_attempt should have been called -> attempts >= 1
+        assert cp.attempts >= 1
+        # best_tokens should be populated
+        assert len(cp.best_tokens) > 0
+
+
+class TestBacktrackDispatchMlx:
+    """Backtrack dispatch in run_constrained_generation_mlx."""
+
+    def test_no_backtrack_without_monitor_mlx(self) -> None:
+        """Without a confidence monitor, no backtrack occurs."""
+        import mlx.core as mx
+
+        from tgirl.sample_mlx import run_constrained_generation_mlx
+        from tgirl.transport import TransportConfig
+
+        class MockGS:
+            def __init__(self):
+                self._advances = 0
+
+            def get_valid_mask_mx(self, vocab_size: int) -> mx.array:
+                return mx.ones((vocab_size,))
+
+            def is_accepting(self) -> bool:
+                return self._advances >= 3
+
+            def advance(self, token_id: int) -> None:
+                self._advances += 1
+
+        gs = MockGS()
+        embeddings = mx.eye(10)
+
+        def forward_fn(ctx):
+            logits = mx.zeros((10,))
+            logits = logits.at[1].add(10.0)
+            return logits
+
+        result = run_constrained_generation_mlx(
+            grammar_state=gs,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "x",
+            embeddings=embeddings,
+            hooks=[],
+            transport_config=TransportConfig(),
+            max_tokens=10,
+        )
+        assert result.backtrack_requested is False
+        assert result.backtrack_checkpoint is None
+
+    def test_backtrack_triggered_mlx(self) -> None:
+        """MLX path triggers backtrack with confidence monitor."""
+        import mlx.core as mx
+
+        from tgirl.sample_mlx import run_constrained_generation_mlx
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+        from tgirl.transport import TransportConfig
+
+        class HighFreedomGS:
+            def __init__(self):
+                self._advances = 0
+
+            def get_valid_mask_mx(self, vocab_size: int) -> mx.array:
+                return mx.ones((vocab_size,))
+
+            def is_accepting(self) -> bool:
+                return self._advances >= 50
+
+            def advance(self, token_id: int) -> None:
+                self._advances += 1
+
+        gs = HighFreedomGS()
+        embeddings = mx.eye(10)
+
+        def forward_fn(ctx):
+            return mx.zeros((10,))
+
+        monitor = ConstrainedConfidenceMonitor(
+            log_prob_threshold=-0.5,
+            window_size=2,
+            freedom_threshold=3,
+            max_backtracks=1,
+        )
+
+        result = run_constrained_generation_mlx(
+            grammar_state=gs,
+            forward_fn=forward_fn,
+            tokenizer_decode=lambda ids: "x",
+            embeddings=embeddings,
+            hooks=[],
+            transport_config=TransportConfig(),
+            max_tokens=20,
+            confidence_monitor=monitor,
+            grammar_text="(test)",
+        )
+        assert result.backtrack_requested is True
+        assert result.backtrack_checkpoint is not None
+        assert len(result.backtrack_events) > 0
+        # with_attempt should have been called
+        assert result.backtrack_checkpoint.attempts >= 1
+
 
 class TestConfidenceTransitionPolicy:
     """ConfidenceTransitionPolicy uses Markov chain on model signals."""

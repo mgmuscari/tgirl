@@ -223,12 +223,21 @@ def run_constrained_generation_mlx(
     transport_config: TransportConfig,
     max_tokens: int = 512,
     context_tokens: list[int] | None = None,
+    confidence_monitor: object | None = None,
+    grammar_guide_factory: Callable | None = None,
+    grammar_text: str | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
     Fully MLX-native loop. Zero torch, zero numpy in computation.
     Only Python scalar extraction: int() on token ID.
+
+    If confidence_monitor is provided, tracks log probs and checkpoints
+    at high-freedom positions. When confidence drops below threshold,
+    returns early with backtrack_requested=True and the checkpoint.
     """
+    from tgirl.state_machine import BacktrackEvent, Checkpoint
+
     start_time = time.monotonic()
     tokens: list[int] = []
     token_history = list(context_tokens) if context_tokens else []
@@ -241,8 +250,11 @@ def run_constrained_generation_mlx(
     ot_bypassed_count = 0
     ot_bypass_reasons: list[str | None] = []
     ot_iterations: list[int] = []
+    backtrack_events: list[BacktrackEvent] = []
 
     vocab_size = embeddings.shape[0]
+    last_checkpoint: Checkpoint | None = None
+    backtrack_requested = False
 
     # Detect grammar state type once
     has_mlx_mask = hasattr(grammar_state, "get_valid_mask_mx")
@@ -264,6 +276,22 @@ def run_constrained_generation_mlx(
         valid_count = int(mx.sum(valid_mask).item())
         grammar_valid_counts.append(valid_count)
         _t2 = time.monotonic()
+
+        # Checkpoint if monitor says so
+        if (
+            confidence_monitor is not None
+            and grammar_text is not None
+            and confidence_monitor.should_checkpoint(valid_count)
+        ):
+            last_checkpoint = Checkpoint(
+                position=position,
+                tokens_so_far=tuple(tokens),
+                context_tokens=tuple(
+                    context_tokens if context_tokens else []
+                ),
+                grammar_text=grammar_text,
+                dead_end_tokens=frozenset(),
+            )
 
         # 3. Hooks — pure MLX, receive mx.array + pre-computed mask
         if hooks:
@@ -335,6 +363,48 @@ def run_constrained_generation_mlx(
         token_log_probs.append(log_prob)
         _t8 = time.monotonic()
 
+        # Confidence monitoring and backtrack check
+        if confidence_monitor is not None:
+            confidence_monitor.record_log_prob(log_prob)
+            if (
+                confidence_monitor.should_backtrack()
+                and confidence_monitor.backtracks_remaining > 0
+                and last_checkpoint is not None
+            ):
+                # Divergent token is the one chosen at checkpoint
+                cp_pos = last_checkpoint.position
+                divergent_token = (
+                    tokens[cp_pos]
+                    if cp_pos < len(tokens)
+                    else token_id
+                )
+                # Track best-so-far before backtracking
+                mean_lp = (
+                    sum(token_log_probs) / len(token_log_probs)
+                    if token_log_probs
+                    else float("-inf")
+                )
+                last_checkpoint = last_checkpoint.with_attempt(
+                    tokens=tuple(tokens), mean_log_prob=mean_lp
+                )
+                event = BacktrackEvent(
+                    checkpoint_position=cp_pos,
+                    trigger_position=position,
+                    trigger_log_prob=log_prob,
+                    dead_end_tokens_added=frozenset(
+                        {divergent_token}
+                    ),
+                )
+                backtrack_events.append(event)
+                last_checkpoint = (
+                    last_checkpoint.with_added_dead_end(
+                        divergent_token
+                    )
+                )
+                confidence_monitor.record_backtrack()
+                backtrack_requested = True
+                break
+
         # 8. Advance grammar
         grammar_state.advance(token_id)
         _t9 = time.monotonic()
@@ -375,4 +445,9 @@ def run_constrained_generation_mlx(
         ot_bypass_reasons=ot_bypass_reasons,
         ot_iterations=ot_iterations,
         grammar_generation_ms=elapsed_ms,
+        backtrack_requested=backtrack_requested,
+        backtrack_checkpoint=(
+            last_checkpoint if backtrack_requested else None
+        ),
+        backtrack_events=backtrack_events,
     )
