@@ -41,6 +41,7 @@ MODEL_ID = "mlx-community/Qwen3.5-0.8B-MLX-4bit"
 
 
 def main() -> int:
+    from tgirl.cache import CacheStats, make_mlx_forward_fn
     from tgirl.format import ChatTemplateFormatter
     from tgirl.registry import ToolRegistry
     from tgirl.sample import GrammarTemperatureHook, SamplingSession
@@ -104,12 +105,8 @@ def main() -> int:
 
     log.info("model_loaded", vocab_size=embeddings.shape[0])
 
-    def forward_fn(token_ids: list[int]) -> torch.Tensor:
-        input_ids = mx.array([token_ids])
-        logits = mlx_model(input_ids)
-        last = logits[0, -1, :].astype(mx.float32)
-        mx.eval(last)
-        return torch.from_numpy(np.array(last, copy=False))
+    cache_stats = CacheStats()
+    forward_fn = make_mlx_forward_fn(mlx_model, stats=cache_stats)
 
     # --- 3. Grammar factory + formatter ---
     from tgirl.outlines_adapter import make_outlines_grammar_factory
@@ -236,6 +233,10 @@ def main() -> int:
     print(f"  {'Total tokens:':50s} {total_tokens}")
     print(f"  {'Total wall time:':50s} {round(total_ms)}ms")
     print(f"  {'Avg per request:':50s} {round(total_ms / n)}ms")
+    print(f"  {'Cache hits:':50s} {cache_stats.hits}")
+    print(f"  {'Cache misses:':50s} {cache_stats.misses}")
+    print(f"  {'Cache resets:':50s} {cache_stats.resets}")
+    print(f"  {'Tokens saved by cache:':50s} {cache_stats.tokens_saved}")
     print("=" * 90)
 
     return 0
