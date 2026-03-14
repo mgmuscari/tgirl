@@ -633,6 +633,193 @@ class TestSamplingSessionTransitionPolicy:
         assert len(result.tool_calls) == 1
 
 
+class TestCheckpoint:
+    """Checkpoint tracks state for backtracking."""
+
+    def test_construction(self) -> None:
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=5,
+            tokens_so_far=(1, 2, 3, 4, 5),
+            context_tokens=(100, 101, 102),
+            grammar_text="(tool_call)",
+            dead_end_tokens=frozenset(),
+        )
+        assert cp.position == 5
+        assert cp.tokens_so_far == (1, 2, 3, 4, 5)
+        assert cp.context_tokens == (100, 101, 102)
+        assert cp.grammar_text == "(tool_call)"
+        assert cp.dead_end_tokens == frozenset()
+
+    def test_is_frozen(self) -> None:
+        from pydantic import ValidationError
+
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=5,
+            tokens_so_far=(1, 2, 3),
+            context_tokens=(100,),
+            grammar_text="x",
+            dead_end_tokens=frozenset(),
+        )
+        with pytest.raises(ValidationError):
+            cp.position = 10  # type: ignore[misc]
+
+    def test_dead_end_tokens_is_frozenset(self) -> None:
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=0,
+            tokens_so_far=(),
+            context_tokens=(),
+            grammar_text="",
+            dead_end_tokens=frozenset({42, 99}),
+        )
+        assert isinstance(cp.dead_end_tokens, frozenset)
+        assert 42 in cp.dead_end_tokens
+
+    def test_with_added_dead_end(self) -> None:
+        from tgirl.state_machine import Checkpoint
+
+        cp = Checkpoint(
+            position=0,
+            tokens_so_far=(),
+            context_tokens=(),
+            grammar_text="",
+            dead_end_tokens=frozenset({42}),
+        )
+        cp2 = cp.with_added_dead_end(99)
+        assert cp2.dead_end_tokens == frozenset({42, 99})
+        # Original unchanged
+        assert cp.dead_end_tokens == frozenset({42})
+
+
+class TestBacktrackEvent:
+    """BacktrackEvent records a single backtrack occurrence."""
+
+    def test_construction(self) -> None:
+        from tgirl.state_machine import BacktrackEvent
+
+        event = BacktrackEvent(
+            checkpoint_position=5,
+            trigger_position=10,
+            trigger_log_prob=-2.5,
+            dead_end_tokens_added=frozenset({42}),
+        )
+        assert event.checkpoint_position == 5
+        assert event.trigger_position == 10
+        assert event.trigger_log_prob == -2.5
+        assert event.dead_end_tokens_added == frozenset({42})
+
+    def test_is_frozen(self) -> None:
+        from pydantic import ValidationError
+
+        from tgirl.state_machine import BacktrackEvent
+
+        event = BacktrackEvent(
+            checkpoint_position=0,
+            trigger_position=1,
+            trigger_log_prob=-1.0,
+            dead_end_tokens_added=frozenset(),
+        )
+        with pytest.raises(ValidationError):
+            event.checkpoint_position = 5  # type: ignore[misc]
+
+
+class TestConstrainedConfidenceMonitor:
+    """ConstrainedConfidenceMonitor tracks confidence during constrained gen."""
+
+    def test_construction_defaults(self) -> None:
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+
+        monitor = ConstrainedConfidenceMonitor()
+        assert monitor.log_prob_threshold < 0
+        assert monitor.window_size > 0
+        assert monitor.freedom_threshold > 0
+        assert monitor.max_backtracks > 0
+
+    def test_custom_params(self) -> None:
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+
+        monitor = ConstrainedConfidenceMonitor(
+            log_prob_threshold=-1.5,
+            window_size=5,
+            freedom_threshold=10,
+            max_backtracks=2,
+        )
+        assert monitor.log_prob_threshold == -1.5
+        assert monitor.window_size == 5
+        assert monitor.freedom_threshold == 10
+        assert monitor.max_backtracks == 2
+
+    def test_should_checkpoint_at_high_freedom(self) -> None:
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+
+        monitor = ConstrainedConfidenceMonitor(freedom_threshold=5)
+        assert monitor.should_checkpoint(grammar_valid_count=10) is True
+        assert monitor.should_checkpoint(grammar_valid_count=3) is False
+
+    def test_should_backtrack_below_threshold(self) -> None:
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+
+        monitor = ConstrainedConfidenceMonitor(
+            log_prob_threshold=-1.0,
+            window_size=3,
+        )
+        # Feed log probs that decline below threshold
+        monitor.record_log_prob(-0.5)  # good
+        monitor.record_log_prob(-0.8)  # ok
+        monitor.record_log_prob(-1.5)  # bad
+        # Window mean: (-0.5 + -0.8 + -1.5) / 3 = -0.933... above -1.0
+        assert monitor.should_backtrack() is False
+
+        # Another bad one pushes window below threshold
+        monitor.record_log_prob(-2.0)
+        # Window of last 3: (-0.8 + -1.5 + -2.0) / 3 = -1.433 < -1.0
+        assert monitor.should_backtrack() is True
+
+    def test_reset_clears_state(self) -> None:
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+
+        monitor = ConstrainedConfidenceMonitor(
+            log_prob_threshold=-0.5,
+            window_size=2,
+        )
+        monitor.record_log_prob(-5.0)
+        monitor.record_log_prob(-5.0)
+        assert monitor.should_backtrack() is True
+
+        monitor.reset()
+        assert monitor.should_backtrack() is False
+
+    def test_backtrack_count_tracking(self) -> None:
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+
+        monitor = ConstrainedConfidenceMonitor(max_backtracks=2)
+        assert monitor.backtracks_remaining == 2
+        monitor.record_backtrack()
+        assert monitor.backtracks_remaining == 1
+        monitor.record_backtrack()
+        assert monitor.backtracks_remaining == 0
+
+    def test_exhaustion_detection(self) -> None:
+        from tgirl.state_machine import ConstrainedConfidenceMonitor
+
+        monitor = ConstrainedConfidenceMonitor(
+            freedom_threshold=5,
+            max_backtracks=1,
+        )
+        # Check sealed: dead_end_tokens > 50% of valid count
+        assert monitor.is_checkpoint_sealed(
+            dead_end_count=6, valid_count=10
+        ) is True
+        assert monitor.is_checkpoint_sealed(
+            dead_end_count=4, valid_count=10
+        ) is False
+
+
 class TestMakeTransitionPolicy:
     """Test the BFCL benchmark policy parser."""
 

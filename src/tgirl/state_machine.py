@@ -203,3 +203,101 @@ class ImmediateTransitionPolicy:
             reason="immediate transition",
             confidence=1.0,
         )
+
+
+# --- Backtracking Infrastructure ---
+
+
+class Checkpoint(BaseModel):
+    """Saved state at a high-freedom position for potential backtracking."""
+
+    model_config = ConfigDict(frozen=True)
+
+    position: int
+    tokens_so_far: tuple[int, ...]
+    context_tokens: tuple[int, ...]
+    grammar_text: str
+    dead_end_tokens: frozenset[int]
+
+    def with_added_dead_end(self, token_id: int) -> Checkpoint:
+        """Return a new Checkpoint with an additional dead-end token."""
+        return Checkpoint(
+            position=self.position,
+            tokens_so_far=self.tokens_so_far,
+            context_tokens=self.context_tokens,
+            grammar_text=self.grammar_text,
+            dead_end_tokens=self.dead_end_tokens | {token_id},
+        )
+
+
+class BacktrackEvent(BaseModel):
+    """Record of a single backtrack occurrence."""
+
+    model_config = ConfigDict(frozen=True)
+
+    checkpoint_position: int
+    trigger_position: int
+    trigger_log_prob: float
+    dead_end_tokens_added: frozenset[int]
+
+
+class ConstrainedConfidenceMonitor:
+    """Monitors confidence during constrained generation.
+
+    Tracks log probs at high-freedom positions and signals
+    when backtracking should occur.
+    """
+
+    def __init__(
+        self,
+        log_prob_threshold: float = -1.0,
+        window_size: int = 3,
+        freedom_threshold: int = 5,
+        max_backtracks: int = 3,
+        exhaustion_fraction: float = 0.5,
+    ) -> None:
+        self.log_prob_threshold = log_prob_threshold
+        self.window_size = window_size
+        self.freedom_threshold = freedom_threshold
+        self.max_backtracks = max_backtracks
+        self.exhaustion_fraction = exhaustion_fraction
+        self._log_probs: list[float] = []
+        self._backtrack_count = 0
+
+    def should_checkpoint(self, grammar_valid_count: int) -> bool:
+        """Whether to create a checkpoint at this position."""
+        return grammar_valid_count >= self.freedom_threshold
+
+    def record_log_prob(self, log_prob: float) -> None:
+        """Record a log prob observation."""
+        self._log_probs.append(log_prob)
+
+    def should_backtrack(self) -> bool:
+        """Whether confidence has declined enough to trigger backtrack."""
+        if len(self._log_probs) < self.window_size:
+            return False
+        window = self._log_probs[-self.window_size :]
+        mean_log_prob = sum(window) / len(window)
+        return mean_log_prob < self.log_prob_threshold
+
+    def record_backtrack(self) -> None:
+        """Record that a backtrack occurred."""
+        self._backtrack_count += 1
+
+    @property
+    def backtracks_remaining(self) -> int:
+        """Number of backtracks still allowed."""
+        return max(0, self.max_backtracks - self._backtrack_count)
+
+    def is_checkpoint_sealed(
+        self, dead_end_count: int, valid_count: int
+    ) -> bool:
+        """Whether a checkpoint is sealed (too many dead ends)."""
+        if valid_count == 0:
+            return True
+        return dead_end_count / valid_count > self.exhaustion_fraction
+
+    def reset(self) -> None:
+        """Reset monitor state for a new constrained generation pass."""
+        self._log_probs.clear()
+        self._backtrack_count = 0
