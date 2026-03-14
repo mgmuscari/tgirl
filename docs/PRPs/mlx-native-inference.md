@@ -47,9 +47,9 @@ Port all functions from `transport.py` to MLX equivalents, maintaining zero coup
 - `_compute_cost_submatrix_mlx(embeddings: mx.array, invalid_indices, valid_indices) -> mx.array` -- cosine distance via normalized matmul
 - `_sinkhorn_log_domain_mlx(cost, source, target, epsilon, max_iter, threshold) -> (plan, wasserstein, iters)` -- log-domain Sinkhorn with `mx.logsumexp`
 - `_apply_transport_plan_mlx(plan, valid_indices, original_logits, vocab_size) -> mx.array`
-- `redistribute_logits_mlx(logits: mx.array, valid_mask: mx.array, embeddings: mx.array, config=None) -> TransportResult` -- public API, returns `TransportResult` with `mx.array` logits field
+- `redistribute_logits_mlx(logits: mx.array, valid_mask: mx.array, embeddings: mx.array, config=None) -> TransportResultMlx` -- public API, returns MLX-native result type
 
-Reuse `TransportConfig` and `TransportResult` from `transport.py` (import only those types -- they're plain data, no torch dependency). `TransportResult.logits` is typed as `torch.Tensor` but at runtime will hold `mx.array` in the MLX path -- this is acceptable since consumers use duck-typed indexing.
+Define `TransportResultMlx(NamedTuple)` in `transport_mlx.py` with `logits: mx.array` instead of `torch.Tensor`. This avoids importing `TransportResult` from `transport.py`, which would transitively import torch at module level and defeat the zero-coupling goal. `TransportConfig` is safe to import -- it's a Pydantic model with no torch dependency (only pydantic BaseModel). `TransportResultMlx` mirrors `TransportResult` field-for-field except `logits` is typed `mx.array`.
 
 Lazy `import mlx.core as mx` at module top (the module is only imported on Apple Silicon).
 
@@ -61,7 +61,7 @@ Lazy `import mlx.core as mx` at module top (the module is only imported on Apple
 - `test_sinkhorn_convergence_mlx`: plan marginals match source/target within tolerance
 - `test_sinkhorn_matches_torch`: MLX and torch Sinkhorn produce plans within 1e-4 on identical inputs (cross-validation)
 - `test_redistribute_full_path_mlx`: end-to-end redistribution produces valid logits
-- `test_zero_coupling`: module imports only `TransportConfig`/`TransportResult` from tgirl, nothing else
+- `test_zero_coupling`: module imports only `TransportConfig` from tgirl, nothing else (no torch transitive import)
 
 **Validation:**
 ```bash
@@ -84,7 +84,9 @@ Port `apply_penalties`, `apply_shaping`, and `run_constrained_generation` from `
 
 Grammar mask conversion: call `grammar_state.get_valid_mask(vocab_size)` which returns `torch.Tensor`, then `mx.array(mask.numpy())` to get `mx.array`. This is one torch->numpy->mx hop per token but it's a bool vector, not a float computation.
 
-Hook interface: `InferenceHook.pre_forward` receives `logits: torch.Tensor` in the current protocol. For the MLX path, we convert `mx.array` logits to torch only for the hook call, since hooks are user-provided and may depend on torch. The hook returns `ModelIntervention` (plain data), so no conversion needed on the output. If this conversion is too expensive, we can add an `InferenceHookMlx` protocol later.
+Hook interface: `InferenceHook.pre_forward` receives `logits: torch.Tensor` in the current protocol. For the MLX path, we convert `mx.array` logits to torch only for the hook call, since hooks are user-provided and may depend on torch. The hook returns `ModelIntervention` (plain data), so no conversion needed on the output.
+
+**Important:** `GrammarTemperatureHook.pre_forward` (`sample.py:83-97`) internally calls `grammar_state.get_valid_mask(vocab_size)`, which produces a `torch.Tensor`. This means the MLX constrained loop will see the grammar mask fetched twice per token — once by `run_constrained_generation_mlx` (converted to `mx.array`), and once by the hook itself (stays torch). To avoid this double-conversion overhead, `run_constrained_generation_mlx` should pass the already-computed `mx.array` valid mask to hooks via an extended hook interface, or provide a `GrammarTemperatureHookMlx` that accepts `mx.array` logits and valid mask directly. The simplest v1 approach: `run_constrained_generation_mlx` pre-computes the valid mask once, converts it to both `mx.array` (for OT/sampling) and caches the torch version (for hook calls). The hook's internal `get_valid_mask` call is then redundant but harmless — it returns the same torch tensor from llguidance's internal state. If profiling shows this is a bottleneck, introduce `InferenceHookMlx` protocol in a follow-up.
 
 **Tests:**
 - `test_apply_penalties_mlx_repetition`: repetition penalty modifies correct positions
@@ -115,9 +117,9 @@ Change `make_mlx_forward_fn` to return raw `mx.array` logits instead of converti
 - Remove `mx_eval` call -- let MLX handle lazy graph materialization naturally. Only call `mx_eval` if the consumer needs the values immediately (the sampling loop will call it when sampling)
 - Update type hint: `Callable[[list[int]], Any]` since return type is now backend-specific
 
-Also add `make_mlx_forward_fn_torch` (the current behavior) as a compatibility wrapper for users who need torch output, or just keep the old signature under a flag. Decision: rename current function to `make_mlx_forward_fn_torch` and make `make_mlx_forward_fn` return mx.array. This way existing imports break loudly rather than silently returning wrong types.
+Rename the current torch-returning function to `make_mlx_forward_fn_torch` (preserves existing behavior for downstream users who depend on `torch.Tensor` output). The new `make_mlx_forward_fn` returns `mx.array` natively. Both are exported from `__init__.py`. This breaks existing imports loudly (NameError on the old name if they don't update) rather than silently returning wrong types. The `SamplingSession` dispatch handles both return types transparently.
 
-Actually simpler: keep `make_mlx_forward_fn` returning `mx.array` (new behavior), and users who need torch can wrap it themselves. The `SamplingSession` dispatch handles both.
+Migration path: callers using `make_mlx_forward_fn` who pass it to `SamplingSession` need no changes (session auto-detects). Callers who directly consume the `torch.Tensor` return should switch to `make_mlx_forward_fn_torch`.
 
 **Tests:**
 - Update existing `TestMakeMlxForwardFn` tests to expect `mx.array` output instead of `torch.Tensor`
@@ -153,7 +155,7 @@ Add backend detection and dispatch to `SamplingSession`:
 
 5. Embeddings: if `_is_mlx` and embeddings are `torch.Tensor`, convert once: `mx.array(embeddings.numpy())`. Store as `self._embeddings_mlx`.
 
-6. Reranking: `ToolRouter.route()` calls `run_constrained_generation` -- add parallel `_route_mlx` or pass backend flag.
+6. Reranking: `SamplingSession` passes `backend` flag to `ToolRouter` (see Task 4b).
 
 **Tests:**
 - `test_session_torch_backend`: existing behavior unchanged
@@ -165,6 +167,28 @@ Add backend detection and dispatch to `SamplingSession`:
 ```bash
 pytest tests/test_sample.py -v
 pytest tests/test_sample_mlx.py -v
+```
+
+### Task 4b: MLX-native reranking in ToolRouter
+
+**Files:** `src/tgirl/rerank.py` (MODIFY), `tests/test_rerank.py` (MODIFY)
+
+**Approach:**
+`ToolRouter.route()` (`rerank.py:120`) calls `run_constrained_generation` and stores `self._embeddings` as `torch.Tensor`. This is a full constrained generation pass that needs the MLX path for consistency. Changes:
+
+1. Add `backend: Literal["torch", "mlx"] = "torch"` parameter to `ToolRouter.__init__`.
+2. Store embeddings in both formats: `self._embeddings` (torch, existing) and `self._embeddings_mlx` (mx.array, lazy-converted on first MLX route call).
+3. In `route()`, dispatch to `run_constrained_generation_mlx` when `self._backend == "mlx"`, passing `self._embeddings_mlx`.
+4. `SamplingSession` passes its detected backend to `ToolRouter` at construction time.
+
+**Tests:**
+- `test_router_torch_path_unchanged`: existing routing tests still pass
+- `test_router_mlx_path`: routing with MLX forward_fn and mx.array embeddings
+- `test_router_mlx_embeddings_lazy_conversion`: torch embeddings converted to mx.array only on first MLX route call
+
+**Validation:**
+```bash
+pytest tests/test_rerank.py -v
 ```
 
 ### Task 5: Update `outlines_adapter.py` -- numpy mask accessor
@@ -213,8 +237,9 @@ PYTHONUNBUFFERED=1 python -u benchmarks/run_bfcl.py \
 
 **Approach:**
 Export new public APIs:
-- `from tgirl.transport_mlx import redistribute_logits_mlx`
+- `from tgirl.transport_mlx import redistribute_logits_mlx, TransportResultMlx`
 - `from tgirl.sample_mlx import apply_penalties_mlx, apply_shaping_mlx, run_constrained_generation_mlx`
+- `from tgirl.cache import make_mlx_forward_fn_torch` (compatibility alias for torch-returning wrapper)
 
 Guard with try/except ImportError since mlx is optional.
 
@@ -255,6 +280,6 @@ All new code is in new modules (`transport_mlx.py`, `sample_mlx.py`). The torch 
 - **`mx.random.categorical` API**: Takes logits (not probabilities). Need to verify it handles -inf logits correctly (masked positions). If not, manual sampling via `mx.softmax` + cumulative sum + `mx.random.uniform` comparison.
 - **`mx.logsumexp` availability**: Assumed available in MLX. If not, implement as `mx.log(mx.sum(mx.exp(x), axis=...))` with max-subtraction for stability.
 - **llguidance numpy support**: Assumed llguidance's `apply_token_bitmask_inplace` only works with torch tensors. If it supports numpy, Task 5 simplifies significantly.
-- **`TransportResult` type mismatch**: The `logits` field is typed `torch.Tensor` but will hold `mx.array` in the MLX path. This violates the type annotation but works at runtime due to duck typing. May need a `TransportResultMlx` or generic `TransportResult[T]` if mypy strictness is required.
-- **Hook compatibility**: `InferenceHook.pre_forward` receives `logits: torch.Tensor`. The MLX path converts for hooks. If users have no hooks (common), this conversion is skipped. Need to verify the `GrammarTemperatureHook` works with the conversion path.
+- **`TransportResult` type mismatch**: RESOLVED — `TransportResultMlx(NamedTuple)` defined in `transport_mlx.py` with `logits: mx.array`. Only `TransportConfig` is imported from `transport.py` (no torch transitive dependency). Consumers in the MLX path use `TransportResultMlx`; the torch path continues using `TransportResult`.
+- **Hook compatibility**: PARTIALLY RESOLVED — `GrammarTemperatureHook` calls `grammar_state.get_valid_mask()` internally, causing a redundant torch mask computation in the MLX path. The v1 approach caches both mx and torch masks per token. If profiling shows this is a bottleneck, introduce `InferenceHookMlx` protocol that receives `mx.array` logits and pre-computed mask.
 - **Reranking in MLX path**: `ToolRouter.route()` calls `run_constrained_generation`. For full MLX path, this needs to call `run_constrained_generation_mlx` instead. The router currently stores embeddings as torch -- needs MLX embeddings for the MLX path.
