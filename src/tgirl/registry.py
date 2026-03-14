@@ -10,11 +10,55 @@ import structlog
 
 from tgirl._type_extract import extract_parameters
 from tgirl.types import (
+    AnyType,
+    DictType,
+    ListType,
+    LiteralType,
+    ParameterDef,
+    PrimitiveType,
     RegistrySnapshot,
     ToolDefinition,
+    TypeRepr,
 )
 
 logger = structlog.get_logger()
+
+_JSON_SCHEMA_TYPE_MAP: dict[str, TypeRepr] = {
+    "string": PrimitiveType(kind="str"),
+    "integer": PrimitiveType(kind="int"),
+    "number": PrimitiveType(kind="float"),
+    "float": PrimitiveType(kind="float"),
+    "boolean": PrimitiveType(kind="bool"),
+    "any": AnyType(),
+}
+
+
+def _schema_type_to_repr(prop_schema: dict[str, Any]) -> TypeRepr:
+    """Convert a JSON schema property definition to a TypeRepr."""
+    # Check for enum first — overrides type
+    if "enum" in prop_schema:
+        return LiteralType(values=tuple(prop_schema["enum"]))
+
+    schema_type = prop_schema.get("type", "any")
+
+    if schema_type in _JSON_SCHEMA_TYPE_MAP:
+        return _JSON_SCHEMA_TYPE_MAP[schema_type]
+
+    if schema_type == "array":
+        items = prop_schema.get("items")
+        if items:
+            return ListType(element=_schema_type_to_repr(items))
+        return ListType(element=AnyType())
+
+    if schema_type == "dict":
+        return DictType(
+            key=PrimitiveType(kind="str"), value=AnyType()
+        )
+
+    if schema_type == "tuple":
+        return ListType(element=AnyType())
+
+    return AnyType()
 
 
 class ToolRegistry:
@@ -102,6 +146,68 @@ class ToolRegistry:
             return func
 
         return decorator
+
+    def register_from_schema(
+        self,
+        name: str,
+        parameters: dict[str, Any],
+        description: str = "",
+        *,
+        return_type: TypeRepr | None = None,
+    ) -> None:
+        """Register a tool from a JSON schema definition.
+
+        Args:
+            name: Tool name (pre-sanitized by caller).
+            parameters: JSON schema object with 'properties' and 'required'.
+            description: Human-readable description.
+            return_type: Return type. Defaults to AnyType.
+
+        Raises:
+            ValueError: If a tool with the same name is already registered.
+        """
+        if name in self._tools:
+            msg = f"Tool '{name}' is already registered"
+            raise ValueError(msg)
+
+        properties = parameters.get("properties", {})
+        required_names = set(parameters.get("required", []))
+
+        # Build required params first, then optional (preserves ordering)
+        required_params: list[ParameterDef] = []
+        optional_params: list[ParameterDef] = []
+
+        for param_name, prop_schema in properties.items():
+            type_repr = _schema_type_to_repr(prop_schema)
+            is_required = param_name in required_names
+            param = ParameterDef(
+                name=param_name,
+                type_repr=type_repr,
+                has_default=not is_required,
+                default=None if not is_required else None,
+            )
+            if is_required:
+                required_params.append(param)
+            else:
+                optional_params.append(param)
+
+        params = tuple(required_params + optional_params)
+
+        tool_def = ToolDefinition(
+            name=name,
+            parameters=params,
+            return_type=return_type or AnyType(),
+            description=description,
+        )
+
+        self._tools[name] = tool_def
+        self._callables[name] = lambda **kwargs: None
+
+        logger.debug(
+            "tool_registered_from_schema",
+            name=name,
+            params=len(params),
+        )
 
     def snapshot(
         self,
