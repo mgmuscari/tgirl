@@ -10,14 +10,14 @@
 | Phase | PRP Spec | Status | Commits |
 |-------|----------|--------|---------|
 | 1A | `state_machine.py` types: SessionState, TransitionSignal, TransitionDecision, TransitionPolicy, DelimiterTransitionPolicy | Implemented as specified | 3a43c22 |
-| 1B | `SamplingSession.__init__` gains `transition_policy` param, `run()` dispatches through policy | Implemented as specified, backwards compatible | 7c0a60e |
+| 1B | `SamplingSession.__init__` gains `transition_policy` param, `run()` dispatches through policy | Implemented as specified, backwards compatible. Fix commit for MLX path + type annotation. | 7c0a60e, 88eafa2 |
 | 2A | BudgetTransitionPolicy, ImmediateTransitionPolicy | Implemented as specified | c005f45 |
 | 2B | `--transition-policy` CLI flag for BFCL benchmark | Implemented as specified | af14171 |
 | 3A | Checkpoint, BacktrackEvent, ConstrainedConfidenceMonitor types | Implemented as specified | 861a4f8 |
 | 3B | BacktrackSteeringHook, TelemetryRecord extension | Implemented as specified | 1acbd56 |
 | 4 | ConfidenceTransitionPolicy, CompositeTransitionPolicy | Implemented as specified | 4986278 |
 
-All 4 phases delivered across 7 atomic commits. 668 tests passing (47 new + 621 existing).
+All 4 phases delivered across 8 atomic commits (7 feature + 1 fix). 668 tests passing (47 new + 621 existing).
 
 ## Issues Found
 
@@ -56,11 +56,18 @@ All 4 phases delivered across 7 atomic commits. 668 tests passing (47 new + 621 
 **Details:** The hook applies its logit bias unconditionally at every position, not just at the checkpoint position where backtracking was triggered.
 **Resolution:** By design — the hook is meant to be instantiated fresh for each backtrack attempt with position-specific dead-end tokens. The caller controls when/where it's active.
 
-### 6. Reviewer false positives on existing code
+### 6. MLX path missing ConstrainedGenerationResult fields (RESOLVED)
+**Category:** Logic
+**Severity:** Blocking
+**Location:** `src/tgirl/sample_mlx.py` (run_constrained_generation_mlx)
+**Details:** Phase 1B added `ot_bypass_reasons` and `ot_iterations` as required fields to ConstrainedGenerationResult, but the MLX path in sample_mlx.py was not updated in the committed code. The fields existed in the proposer's working tree (from pre-existing dirty state) but were never committed — causing a discrepancy between working tree verification and actual committed code.
+**Resolution:** Fixed in commit 88eafa2. Proposer also improved type annotation from `Any | None` to `TransitionPolicy | None` via TYPE_CHECKING import.
+
+### 7. Reviewer false positive on sexpr_to_bfcl_dict
 **Category:** Process
 **Severity:** Nit
-**Details:** Code reviewer flagged two issues as BLOCKING that were actually pre-existing and correct: (a) sample_mlx.py already provides ot_bypass_reasons/ot_iterations, (b) sexpr_to_bfcl_dict exists in tgirl/bfcl.py at line 182. Team lead verified both were false positives — 668 tests pass cleanly.
-**Resolution:** Resolved by team lead verification.
+**Details:** Code reviewer flagged `sexpr_to_bfcl_dict` import as non-existent, but the function exists at `tgirl/bfcl.py:182` and was pre-existing.
+**Resolution:** Verified as false positive by team lead.
 
 ## Deferred Spec Items (Non-blocking Follow-up)
 
