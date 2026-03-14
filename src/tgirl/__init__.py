@@ -2,6 +2,11 @@
 
 from annotated_types import Ge, Gt, Le, Lt, MultipleOf
 
+from tgirl.cache import (
+    CacheStats,
+    make_hf_forward_fn,
+    make_mlx_forward_fn,
+)
 from tgirl.compile import (
     CompileConfig,
     InsufficientResources,
@@ -74,6 +79,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AnnotatedType",
+    "CacheStats",
     "ChatTemplateFormatter",
     "CompileConfig",
     "ConstrainedGenerationResult",
@@ -122,6 +128,8 @@ __all__ = [
     "apply_penalties",
     "apply_shaping",
     "generate_grammar",
+    "make_hf_forward_fn",
+    "make_mlx_forward_fn",
     "merge_interventions",
     "redistribute_logits",
     "run_constrained_generation",
