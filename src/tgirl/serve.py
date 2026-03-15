@@ -398,14 +398,14 @@ def create_app(
 
             # Override transport epsilon
             if request.ot_epsilon is not None:
-                from tgirl.transport import TransportConfig as TC
+                from tgirl.transport import TransportConfig
 
                 if transport_config is not None:
                     req_transport_config = transport_config.model_copy(
                         update={"epsilon": request.ot_epsilon}
                     )
                 else:
-                    req_transport_config = TC(epsilon=request.ot_epsilon)
+                    req_transport_config = TransportConfig(epsilon=request.ot_epsilon)
 
             # Override base temperature via hook
             if request.base_temperature is not None:
