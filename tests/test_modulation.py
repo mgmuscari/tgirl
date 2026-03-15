@@ -51,16 +51,25 @@ class TestConditionSource:
         result = condition_source(0.2, cfg, 0.0)
         assert abs(result - 0.8) < 1e-6
 
-    def test_rectify_clamps_negative_to_zero(self) -> None:
-        # With invert, 0.8 -> 0.2 after invert... but normalized first.
-        # Actually rectify applies after normalization and invert.
-        # A value that normalizes to a negative is already clamped by the
-        # max(0, min(1, ...)) step. Rectify is a no-op when value is already
-        # non-negative after clamping. Test with a value that would be
-        # negative before clamping.
-        cfg = SourceConditionerConfig(range_min=0.0, range_max=1.0, rectify=True)
-        result = condition_source(0.5, cfg, 0.0)
-        assert result >= 0.0
+    def test_rectify_is_noop_after_clamp(self) -> None:
+        """Rectify is effectively a no-op after normalize+clamp to [0,1].
+
+        Normalization clamps to [0, 1] before rectify runs, so rectify
+        never sees a negative value. This test documents that behavior:
+        the result is identical with and without rectify for all inputs.
+        If the conditioning pipeline changes (e.g., rectify moves before
+        clamp), this test will catch the behavioral change.
+        """
+        cfg_with = SourceConditionerConfig(
+            range_min=0.0, range_max=1.0, rectify=True,
+        )
+        cfg_without = SourceConditionerConfig(
+            range_min=0.0, range_max=1.0, rectify=False,
+        )
+        for raw in (-0.5, 0.0, 0.5, 1.0, 1.5):
+            r_with = condition_source(raw, cfg_with, 0.0)
+            r_without = condition_source(raw, cfg_without, 0.0)
+            assert abs(r_with - r_without) < 1e-10
 
     def test_slew_rate_smoothing(self) -> None:
         cfg = SourceConditionerConfig(range_min=0.0, range_max=1.0, slew_rate=0.5)
@@ -175,43 +184,46 @@ class TestPhaseDetection:
     def test_nested_expression_sequence(self) -> None:
         """Nested expression (tool1 (tool2 arg) ) produces correct phases.
 
-        Inner ')' does NOT trigger release because depth > 1.
+        Exercises the full ADSR cycle including:
+        - attack on depth increase
+        - decay after freedom collapses (with hysteresis)
+        - inner close paren triggers release (depth 2->1, depth <= 1)
+        - outer close paren triggers release (depth 1->0)
         """
         state = self._make_state(prev_smoothed=[0.0] * 11)
 
-        # Opening '(' — depth 0 -> 1
+        # Opening '(' — depth 0 -> 1: attack
         state.advance_phase(freedom=0.8, depth=1)
         assert state.phase == "attack"
 
-        # tool1 tokens — freedom collapses as grammar constrains
+        # tool1 tokens — freedom still high, stays attack
         state.advance_phase(freedom=0.7, depth=1)
-        assert state.phase == "attack"  # peak tracking
+        assert state.phase == "attack"
 
         # Freedom drops below 30% of peak (0.8) = 0.24
+        # Hysteresis requires 2 consecutive tokens + min_phase_duration
         state.advance_phase(freedom=0.2, depth=1)
-        # May still be attack due to hysteresis
         state.advance_phase(freedom=0.2, depth=1)
         state.advance_phase(freedom=0.2, depth=1)
-        # After enough tokens, should transition to decay then sustain
+        # After enough low-freedom tokens, should transition to decay
+        assert state.phase in ("attack", "decay")
 
-        # Inner '(' — depth 1 -> 2
+        # Inner '(' — depth 1 -> 2: immediate attack
         state.advance_phase(freedom=0.6, depth=2)
-        assert state.phase == "attack"  # New nesting = new attack
+        assert state.phase == "attack"
 
-        # Inner tokens
+        # Inner tokens — freedom collapses at inner nesting
         state.advance_phase(freedom=0.5, depth=2)
         state.advance_phase(freedom=0.15, depth=2)
         state.advance_phase(freedom=0.15, depth=2)
         state.advance_phase(freedom=0.15, depth=2)
 
-        # Inner ')' — depth 2 -> 1 (depth > 1 at new value, no release)
-        # Actually depth goes from 2 to 1, and 1 <= 1, so this SHOULD be release
-        # But prev_depth was 2 and new depth is 1, depth <= 1 is true
-        # Wait — the condition is depth < prev_depth AND depth <= 1
-        # prev_depth=2, new_depth=1, 1 < 2 AND 1 <= 1 => release
-        # This is correct per the spec: release fires approaching root
+        # Inner ')' — depth 2 -> 1: release fires because
+        # depth decreased (2 > 1) AND new depth <= 1 (1 <= 1)
+        state.advance_phase(freedom=0.5, depth=1)
+        assert state.phase == "release"
 
-        # Outer ')' — depth 1 -> 0
+        # Outer ')' — depth 1 -> 0: release again
         state.advance_phase(freedom=0.9, depth=0)
         assert state.phase == "release"
 
