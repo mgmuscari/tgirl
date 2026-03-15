@@ -409,15 +409,15 @@ class TestModMatrixHookMlx:
         hook = _make_hook()
         logits = mx.random.normal((100,))
         valid_mask = mx.ones((100,), dtype=mx.bool_)
-        # Create a cycling history: [5,6,5,6]
-        history = [5, 6, 5, 6]
-        result = hook.pre_forward(4, valid_mask, history, logits)
-        # cycle_detected should activate and produce logit_bias
-        if result.logit_bias is not None:
-            # Cycle tokens should have negative bias
-            for tid in (5, 6):
-                if tid in result.logit_bias:
-                    assert result.logit_bias[tid] < 0.0
+        # Cycle of period 2: [5,6] repeated 3 times (6 tokens)
+        # detect_cycle needs n >= 2*k, k=2 needs n >= 4
+        history = [5, 6, 5, 6, 5, 6]
+        result = hook.pre_forward(6, valid_mask, history, logits)
+        # cycle_detected source activates the cycle row (-30.0 rep bias)
+        # which pushes rep_bias below base, triggering logit_bias
+        assert result.logit_bias is not None, (
+            "Cycle detection should produce logit_bias"
+        )
 
     def test_reset_clears_state(self) -> None:
         hook = _make_hook()
@@ -445,32 +445,38 @@ class TestModMatrixHookMlx:
         assert 0.1 <= result.temperature <= 1.5
 
     def test_opener_penalty_at_budget_limit(self) -> None:
-        """Opener penalty activates when depth + position nears budget."""
+        """Opener penalty activates when depth is high."""
         hook = _make_hook(max_tokens=20)
-        # Set depth high so remaining budget is tight
+        # depth=15 -> normalized depth = 15/10 = 1.5 (clamped to 1.0)
+        # depth row col 4 = -20.0 -> opener_bias = 0.0 + 1.0 * -20.0 = -20.0
+        # -20.0 < -1.0 -> logit_bias assigned to all opener_ids
         hook._state.depth = 15
         logits = mx.random.normal((100,))
         valid_mask = mx.ones((100,), dtype=mx.bool_)
         result = hook.pre_forward(15, valid_mask, [], logits)
-        # With depth=15, opener_bias_val should be very negative
-        # from the depth row: depth * -20.0 (after conditioning)
-        if result.logit_bias is not None:
-            for tid in hook._opener_ids:
-                if tid in result.logit_bias:
-                    assert result.logit_bias[tid] < 0.0
+        assert result.logit_bias is not None, (
+            "Deep nesting should produce opener logit_bias"
+        )
+        for tid in hook._opener_ids:
+            assert tid in result.logit_bias
+            assert result.logit_bias[tid] < 0.0
 
     def test_rep_penalty_behavioral_equivalence(self) -> None:
-        """Window-based counting matches RepetitionPenaltyHook behavior."""
+        """Window-based counting penalizes repeated tokens at suffix."""
         hook = _make_hook()
         logits = mx.random.normal((100,))
         valid_mask = mx.ones((100,), dtype=mx.bool_)
-        # History with token 42 appearing 4 times in 8-token window
-        history = [42, 42, 42, 42, 1, 2, 3, 4]
-        result = hook.pre_forward(8, valid_mask, history, logits)
-        # The mod matrix should activate repetition bias
-        # Check that logit_bias has a penalty for token 42
-        if result.logit_bias is not None and 42 in result.logit_bias:
-            assert result.logit_bias[42] < 0.0
+        # Token 42 repeated at suffix creates cycle (period 1)
+        # detect_cycle checks suffix: tokens[-1:] == tokens[-2:-1]
+        # Cycle activates -30.0 rep bias, pushing below base_rep_bias
+        # Then window counting triggers logit_bias for tokens > 2 repeats
+        history = [1, 2, 42, 42, 42, 42]
+        result = hook.pre_forward(6, valid_mask, history, logits)
+        assert result.logit_bias is not None, (
+            "Cycling repeated tokens should produce logit_bias"
+        )
+        assert 42 in result.logit_bias
+        assert result.logit_bias[42] < 0.0
 
 
 # === Task 4: ModMatrixHook (torch variant) ===

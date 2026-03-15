@@ -206,7 +206,7 @@ class RepetitionPenaltyHookMlx:
         token_history: list[int],
         logits: mx.array,
     ) -> ModelIntervention:
-        from tgirl.sample import _detect_cycle
+        from tgirl.sample import detect_cycle
 
         penalized: dict[int, float] = {}
 
@@ -220,7 +220,7 @@ class RepetitionPenaltyHookMlx:
                 penalized[tid] = self.bias * (count - self.max_repeats)
 
         # 2. Cycle detection: penalize all tokens in a detected cycle
-        cycle_len = _detect_cycle(token_history, self.max_period)
+        cycle_len = detect_cycle(token_history, self.max_period)
         if cycle_len is not None and self.cycle_bias != 0.0:
             cycle_tokens = set(token_history[-cycle_len:])
             for tid in cycle_tokens:

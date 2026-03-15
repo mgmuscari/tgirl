@@ -139,7 +139,7 @@ def _is_mod_matrix_hook(hook: object) -> bool:
     return type(hook).__name__ == "ModMatrixHook"
 
 
-def _detect_cycle(tokens: list[int], max_period: int = 16) -> int | None:
+def detect_cycle(tokens: list[int], max_period: int = 16) -> int | None:
     """Detect repeating cycle in token suffix.
 
     Checks if the last 2k tokens consist of the same k-length sequence
@@ -256,7 +256,7 @@ class RepetitionPenaltyHook:
                 penalized[tid] = self.bias * (count - self.max_repeats)
 
         # 2. Cycle detection: penalize all tokens in a detected cycle
-        cycle_len = _detect_cycle(token_history, self.max_period)
+        cycle_len = detect_cycle(token_history, self.max_period)
         if cycle_len is not None and self.cycle_bias != 0.0:
             cycle_tokens = set(token_history[-cycle_len:])
             for tid in cycle_tokens:

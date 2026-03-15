@@ -284,7 +284,7 @@ class ModMatrixHookMlx:
         """Compute modulated parameters via matrix multiply."""
         import mlx.core as mx
 
-        from tgirl.sample import _detect_cycle
+        from tgirl.sample import detect_cycle
 
         vocab_size = logits.shape[0]
         cfg = self._config
@@ -306,7 +306,7 @@ class ModMatrixHookMlx:
         # 3. Cycle detection
         cycle = (
             1.0
-            if _detect_cycle(token_history) is not None
+            if detect_cycle(token_history) is not None
             else 0.0
         )
 
@@ -486,7 +486,7 @@ class ModMatrixHook:
         """Compute modulated parameters via torch matmul."""
         import torch as _torch
 
-        from tgirl.sample import _detect_cycle
+        from tgirl.sample import detect_cycle
 
         vocab_size = logits.shape[0]
         cfg = self._config
@@ -521,7 +521,7 @@ class ModMatrixHook:
         # 3. Cycle detection
         cycle = (
             1.0
-            if _detect_cycle(token_history) is not None
+            if detect_cycle(token_history) is not None
             else 0.0
         )
 
