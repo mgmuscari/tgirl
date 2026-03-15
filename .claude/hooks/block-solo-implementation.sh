@@ -41,9 +41,16 @@ case "$BRANCH" in
   *) exit 0 ;;
 esac
 
-# Allow team agents (proposer) — they're spawned via claude-teammate-wrapper.sh
-# which sets this env var to signal they're not the team lead
+# Allow team agents — detected via env var (set by claude-teammate-wrapper.sh)
+# or by checking if an active execute team exists for this branch
 if [ "${PUSH_HANDS_TEAM_AGENT:-}" = "1" ]; then
+  exit 0
+fi
+
+# Also allow if an active execute team exists (spawned agents don't get env var)
+SLUG="${BRANCH#feature/}"
+TEAM_CONFIG="$HOME/.claude/teams/execute-${SLUG}/config.json"
+if [ -f "$TEAM_CONFIG" ]; then
   exit 0
 fi
 

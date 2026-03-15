@@ -195,4 +195,6 @@ Three hooks in `.claude/hooks/` enforce the methodology:
 
 2026-03-09: `~/.claude/teams/` directory detection is unreliable for checking active teams → `block-solo-implementation.sh` uses tier + branch + file path checks instead
 
+2026-03-14: Spawned team agents don't get `PUSH_HANDS_TEAM_AGENT=1` env var (they're not launched through `claude-teammate-wrapper.sh`) → `block-solo-implementation.sh` now also checks for `~/.claude/teams/execute-{slug}/config.json` to detect active execute teams
+
 2026-03-14: **All tensor/matrix math must use the accelerated library for the context (MLX or PyTorch). Never use Python list comprehensions on tensor data.** `[float(v) for v in mx_array]` on 248k elements takes 8.3 seconds; `mx_array.tolist()` takes 6ms — a 1,400x difference. Conversion between linalg libraries (e.g., mx→torch, torch→numpy) must be avoided unless there is absolutely no alternative; exhaust the library's own API and documentation before resorting to cross-library conversion.
