@@ -340,12 +340,257 @@ This telemetry enables post-hoc analysis: did the envelope shape correlate with 
 
 ---
 
-## 9. Implementation Sequence
+## 9. Modulation Matrix
 
-1. **`EnvelopeState` + phase detection** — pure logic, no framework deps. Test with unit tests on synthetic sequences.
-2. **`envelope_*` curve functions** — pure math. Test that each produces expected values at phase boundaries.
-3. **`apply_ride` modulation** — pure math. Test that confidence perturbation scales correctly.
-4. **`ADSREnvelopeHookMlx`** — integrates phase detection, curves, and ride. Replaces `GrammarTemperatureHook` and `NestingDepthHook`.
+### From Patch Cables to Matrix Multiplication
+
+The ADSR envelope in sections 3-5 describes a hardwired signal path — each phase sets specific parameter values. This is a Minimoog: powerful, but the routing is fixed.
+
+A modulation matrix replaces the hardwired connections with a configurable routing table. Any source can modulate any destination with an arbitrary gain. The matrix *is* the envelope — ADSR phase indicators are just 4 of the 11 source signals. The envelope curves emerge from the matrix weights, not from code.
+
+### Signal Chain
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     SIGNAL CHAIN                             │
+│                                                              │
+│  Raw Signals ──→ Preprocessing ──→ Source Vector             │
+│                  (normalize,        shape: (n_sources,)      │
+│                   rectify,                                   │
+│                   temporal filter)        │                   │
+│                                          ↓                   │
+│                                    ┌───────────┐             │
+│                                    │ Mod Matrix │             │
+│                                    │ (n_src,    │             │
+│                                    │  n_dest)   │             │
+│                                    └─────┬─────┘             │
+│                                          ↓                   │
+│  Base Values ──→ (+) ←── Modulation Vector                   │
+│                   │       shape: (n_destinations,)            │
+│                   ↓                                          │
+│            Output Conditioning                               │
+│            (clamp to valid ranges)                            │
+│                   ↓                                          │
+│            Final Parameters ──→ ModelIntervention             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Source Signals — The CV/Gate Bus
+
+In modular synthesis, there are two kinds of signals:
+
+- **CV (Control Voltage)** — continuous, time-varying: `grammar_freedom`, `token_entropy`, `token_log_prob`, `grammar_mask_overlap`, `nesting_depth`, `position_normalized`
+- **Gate** — discrete triggers: `phase_attack`, `phase_decay`, `phase_sustain`, `phase_release`, `cycle_detected`
+
+Both live on the same bus and route through the same matrix. A gate signal with matrix weight 0.5 on the temperature column means "when this phase is active, add 0.5 to the temperature modulation." A CV signal with the same weight means "continuously modulate temperature proportional to this signal."
+
+**Source preprocessing** — signals have different ranges and dynamics. Before the matrix multiply, each source is conditioned:
+
+```python
+@dataclass
+class SourceConditioner:
+    """Per-source preprocessing: normalize, rectify, smooth."""
+    range_min: float        # input minimum (for normalization)
+    range_max: float        # input maximum
+    rectify: bool = False   # half-wave rectify (clamp negative to 0)
+    invert: bool = False    # flip polarity
+    slew_rate: float = 1.0  # EMA alpha for temporal smoothing (1.0 = no smoothing)
+```
+
+**Normalization** maps all sources to [0, 1] (unipolar) or [-1, 1] (bipolar) before routing:
+
+```python
+def condition_source(raw: float, cfg: SourceConditioner, prev_smoothed: float) -> float:
+    # Normalize to [0, 1]
+    normalized = (raw - cfg.range_min) / (cfg.range_max - cfg.range_min)
+    normalized = max(0.0, min(1.0, normalized))
+
+    # Polarity
+    if cfg.invert:
+        normalized = 1.0 - normalized
+
+    # Rectify (useful for "only modulate when confidence is BELOW baseline")
+    if cfg.rectify:
+        normalized = max(0.0, normalized)
+
+    # Temporal smoothing (first-order IIR low-pass / slew limiter)
+    smoothed = cfg.slew_rate * normalized + (1.0 - cfg.slew_rate) * prev_smoothed
+    return smoothed
+```
+
+The slew rate limiter is critical. Without it, `token_log_prob` (which can jump from -0.01 to -2.0 in one token) causes jerky parameter changes. With `slew_rate=0.3`, the smoothed signal takes ~5 tokens to converge to the new value — a portamento effect that prevents overcorrection.
+
+### Source Vector Definition
+
+```python
+sources = mx.array([
+    # Continuous CV signals (normalized to [0, 1])
+    grammar_freedom,              #  0: fraction of vocab valid
+    normalized_entropy,           #  1: entropy / log(vocab_size), [0, 1]
+    normalized_confidence,        #  2: (log_prob - min) / (max - min), [0, 1]
+    grammar_mask_overlap,         #  3: prob mass on valid tokens
+    normalized_depth,             #  4: depth / max_expected_depth
+    position_normalized,          #  5: position / max_tokens
+
+    # Gate signals (0 or 1, one-hot phase)
+    phase_attack,                 #  6: 1 during attack phase
+    phase_decay,                  #  7: 1 during decay phase
+    phase_sustain,                #  8: 1 during sustain phase
+    phase_release,                #  9: 1 during release phase
+
+    # Event gates
+    cycle_detected,               # 10: 1 when suffix cycle found
+])
+# shape: (11,)
+```
+
+### Destination Vector Definition
+
+```python
+destinations = mx.array([
+    temperature_mod,              #  0: added to base_temperature
+    top_p_mod,                    #  1: added to base_top_p
+    repetition_bias_mod,          #  2: added to base_rep_bias
+    transport_epsilon_mod,        #  3: added to base_epsilon
+    opener_bias_mod,              #  4: bias for paren-opening tokens
+    backtrack_threshold_mod,      #  5: added to backtrack sensitivity
+    presence_penalty_mod,         #  6: added to base_presence_penalty
+])
+# shape: (7,)
+```
+
+### The Matrix
+
+```python
+mod_matrix = mx.array([...])  # shape: (11, 7)
+```
+
+**Computation per token:**
+
+```python
+# Condition all sources
+source_vector = mx.array([
+    condition_source(raw_i, conditioner_i, prev_smoothed_i)
+    for i, raw_i in enumerate(raw_sources)
+])  # In practice, vectorized as native mx ops
+
+# Route through matrix
+modulations = source_vector @ mod_matrix  # shape: (7,)
+
+# Apply to base values
+final_temperature = clamp(base_temperature + modulations[0], 0.0, 2.0)
+final_top_p = clamp(base_top_p + modulations[1], 0.1, 1.0)
+final_rep_bias = clamp(base_rep_bias + modulations[2], -100.0, 0.0)
+final_epsilon = clamp(base_epsilon + modulations[3], 0.01, 1.0)
+# ... etc
+```
+
+77 multiply-adds for the matrix, plus source conditioning. Total compute: ~200 FLOPs per token. The forward pass is 9 billion FLOPs. The mod matrix is invisible in the profile.
+
+### ADSR as Matrix Weights
+
+The ADSR envelope from section 3 is a specific matrix configuration:
+
+```
+                    temp   top_p  rep    eps    open   back   pres
+                    mod    mod    bias   mod    bias   thresh mod
+grammar_freedom  [  0.3    0.2    0.0    0.0    0.0    0.0    0.0  ]
+entropy          [  0.1    0.1    0.0    0.0    0.0   -0.2    0.0  ]
+confidence       [  0.0    0.0    0.0    0.0    0.0   -0.3    0.0  ]
+mask_overlap     [  0.0    0.0    0.0   -0.1    0.0    0.0    0.0  ]
+depth            [  0.0    0.0    0.0    0.0   -20.0   0.0    0.0  ]
+position         [  0.0    0.0    0.0    0.0    0.0    0.0    0.0  ]
+phase_attack     [  0.3    0.35   10.0  -0.05   0.0    0.0    0.0  ]
+phase_decay      [  0.0    0.2    5.0    0.0    0.0   -0.1    0.0  ]
+phase_sustain    [ -0.15  -0.1  -10.0   0.1    0.0    0.0    0.0  ]
+phase_release    [ -0.05   0.3   10.0  -0.05  -50.0   0.0    0.0  ]
+cycle_detected   [  0.0    0.0  -30.0   0.0    0.0    0.0    0.0  ]
+```
+
+Reading column 0 (temperature modulation): attack adds +0.3, sustain adds -0.15, grammar_freedom adds +0.3 (scaled by freedom value), entropy adds +0.1. The net temperature at any token is `base + sources @ column_0`.
+
+Reading row 10 (cycle_detected): when a cycle is detected, repetition bias gets -30.0 (aggressive penalty). Nothing else changes. The cycle signal routes to exactly one destination.
+
+### Nonlinear Preprocessing
+
+A pure linear matrix can't express "only modulate when confidence is *below* baseline." That requires a rectifier. The source conditioning stage handles this:
+
+```python
+# Source 2: confidence
+# Conditioned with rectify=True, invert=True
+# Raw: log_prob ∈ (-inf, 0], higher = more confident
+# After normalization: 0 = max confidence, 1 = min confidence
+# After rectification: 0 when confident, positive when uncertain
+# This means: uncertainty routes through the matrix, confidence doesn't
+```
+
+For more complex nonlinearities (e.g., "temperature should respond to confidence quadratically"), apply the nonlinearity in preprocessing, then let the matrix handle the linear routing.
+
+### Temporal Dynamics — The Missing Dimension
+
+The raw signals are instantaneous. But good modulation needs memory:
+
+**Slew rate limiting (portamento)** — First-order IIR low-pass filter on each source. Prevents jerky parameter changes. `slew_rate=0.3` means the smoothed signal takes ~5 tokens to converge. Applied per-source in the conditioning stage.
+
+**Sample-and-hold** — Latch a value at a specific event (e.g., "remember the entropy at attack onset, hold it through decay"). Implemented by adding a latched source:
+
+```python
+if phase == "attack" and prev_phase != "attack":
+    attack_onset_entropy = current_entropy  # latch
+# attack_onset_entropy is a source in the vector, constant until next attack
+```
+
+**Envelope generators** — The ADSR phase indicators *are* envelope generators. A more sophisticated approach: instead of binary gates, use shaped ramps. Attack phase = ramp from 0→1 over N tokens. Decay = exponential decay from 1→sustain_level. This gives smooth phase transitions instead of hard switches.
+
+```python
+# Instead of:
+phase_attack = 1.0 if phase == "attack" else 0.0
+
+# Use:
+phase_attack = exp(-phase_position * decay_rate) if phase == "attack" else 0.0
+phase_sustain = 1.0 - exp(-phase_position * rise_rate) if phase == "sustain" else 0.0
+```
+
+Now the phase "signals" are smooth curves, and the matrix produces smooth parameter trajectories even at phase boundaries. No discontinuities in the control signal.
+
+### Feedback Paths
+
+In FM synthesis, one oscillator modulates another's frequency, creating feedback loops that produce complex timbres. Can destinations feed back as sources?
+
+**Previous-token temperature as source** — Implements a slew rate limiter on the *output* (temperature can't change faster than X per token). But this creates a dependency cycle in the signal chain. Solution: use the *previous token's* output as a source for the *current token's* computation. One-sample delay breaks the cycle.
+
+```python
+sources[11] = prev_temperature_output  # feedback source
+# Now the matrix can learn: "temperature should resist rapid changes"
+# by routing prev_temperature positively to current temperature
+```
+
+This is exactly how a resonant filter works — feedback creates self-reinforcing patterns. In our case, feedback creates parameter *inertia*, which is desirable: the system shouldn't oscillate between high and low temperature from token to token.
+
+### Matrix Optimization
+
+The matrix is 77 parameters. Small enough to:
+
+**Hand-tune** — The ADSR mapping above is human-interpretable. Each cell has a clear meaning: "how much does source X affect destination Y."
+
+**Grid search** — Run BFCL with different matrix configurations, measure AST accuracy. 77 params is tractable for Bayesian optimization (Optuna, etc.).
+
+**Gradient-free optimization** — CMA-ES or similar evolutionary strategy. Population of matrices, evaluate each on a BFCL subset, evolve toward higher accuracy.
+
+**Gradient-based optimization** — The matrix is differentiable. If we can define a differentiable loss (e.g., log-prob of correct tokens under the shaped distribution), we can backprop through the matrix. The forward pass (matrix multiply + clamp) is trivially differentiable. The challenge is defining "correct" — we'd need oracle token sequences.
+
+**Transfer across models** — The source signals (freedom, entropy, confidence) are model-agnostic. A matrix optimized on the 0.8B model might transfer to the 9B model. The Platonic Representation Hypothesis suggests the *relationship* between confidence and correct behavior is shared across models, even if the absolute values differ. The source conditioning (normalization) handles the scale differences.
+
+---
+
+## 10. Implementation Sequence
+
+1. **Source conditioning + vector construction** — pure MLX. `SourceConditioner` dataclass, slew rate filter, normalization. Test with synthetic signal sequences.
+2. **Phase detection** — pure logic, no framework deps. Produces gate signals from depth + freedom.
+3. **Matrix multiply + output conditioning** — `sources @ mod_matrix`, clamping to valid ranges. Trivial MLX.
+4. **`ModMatrixHookMlx`** — the unified hook. Replaces `GrammarTemperatureHook`, `NestingDepthHook`, and partially `RepetitionPenaltyHook`. Implements `advance()`, `reset()`, `pre_forward()`.
 5. **`transport_epsilon` on `ModelIntervention`** — one new field. Sampling loop reads it.
-6. **Telemetry integration** — add `EnvelopeTelemetry` to per-token recording.
-7. **Benchmarking** — BFCL before/after comparison. The ADSR hypothesis: phase-aware parameters improve accuracy on entries where the 0.8B model fails due to wrong argument values (sustain phase improvements) or wrong tool selection (attack/decay phase improvements).
+6. **Default matrix** — hand-tuned ADSR-equivalent matrix as the starting point.
+7. **Telemetry** — per-token source vector, modulation vector, phase. Enables post-hoc analysis.
+8. **Matrix optimization** — Optuna/CMA-ES on BFCL subset. Find the matrix that maximizes AST accuracy.
+9. **Cross-model transfer** — test the optimized matrix on different model sizes.
