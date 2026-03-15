@@ -120,6 +120,19 @@ class EnvelopeState:
         self.prev_freedom = freedom
 
 
+@dataclass(frozen=True)
+class EnvelopeTelemetry:
+    """Per-token envelope telemetry record."""
+
+    phase: str
+    phase_position: int
+    depth: int
+    source_vector: list[float]  # 11 conditioned values
+    modulation_vector: list[float]  # 7 output values
+    final_temperature: float
+    final_epsilon: float
+
+
 def condition_source(
     raw: float,
     cfg: SourceConditionerConfig,
@@ -230,6 +243,7 @@ class ModMatrixHookMlx:
         self._config = config
         self._max_tokens = max_tokens
         self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+        self.last_telemetry: EnvelopeTelemetry | None = None
 
         # Build mod matrix as mx.array from flat config
         rows, cols = config.matrix_shape
@@ -254,6 +268,7 @@ class ModMatrixHookMlx:
     def reset(self) -> None:
         """Reset state for new constrained generation pass."""
         self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+        self.last_telemetry = None
 
     def advance(self, token_id: int) -> None:
         """Update depth after token sampled."""
@@ -386,6 +401,20 @@ class ModMatrixHookMlx:
                     logit_bias[tid] = max(
                         existing + bias, -100.0
                     )
+
+        # 9. Record telemetry
+        mod_vec = [
+            float(modulations[i].item()) for i in range(7)
+        ]
+        self.last_telemetry = EnvelopeTelemetry(
+            phase=phase,
+            phase_position=self._state.phase_position,
+            depth=self._state.depth,
+            source_vector=list(conditioned),
+            modulation_vector=mod_vec,
+            final_temperature=temperature,
+            final_epsilon=epsilon,
+        )
 
         return ModelIntervention(
             temperature=temperature,

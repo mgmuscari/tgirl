@@ -7,6 +7,7 @@ envelope configuration, and the unified ModMatrixHook.
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import mlx.core as mx
 import torch
@@ -16,13 +17,13 @@ from tgirl.modulation import (
     DEFAULT_MATRIX_FLAT,
     EnvelopeConfig,
     EnvelopeState,
+    EnvelopeTelemetry,
     ModMatrixHook,
     ModMatrixHookMlx,
     SourceConditionerConfig,
     condition_source,
 )
 from tgirl.types import ModelIntervention
-
 
 # === Task 1: Source conditioning ===
 
@@ -100,7 +101,9 @@ class TestPhaseDetection:
 
     def test_attack_on_depth_increase(self) -> None:
         """Attack fires immediately when depth increases."""
-        state = self._make_state(phase="sustain", depth=1, prev_depth=1, phase_position=5)
+        state = self._make_state(
+            phase="sustain", depth=1, prev_depth=1, phase_position=5,
+        )
         result = state.detect_phase(freedom=0.5, depth=2)
         assert result == "attack"
 
@@ -120,13 +123,17 @@ class TestPhaseDetection:
 
     def test_release_immediate_when_depth_lte_1(self) -> None:
         """Release fires immediately when depth decreases AND depth <= 1."""
-        state = self._make_state(phase="sustain", depth=2, prev_depth=2, phase_position=5)
+        state = self._make_state(
+            phase="sustain", depth=2, prev_depth=2, phase_position=5,
+        )
         result = state.detect_phase(freedom=0.5, depth=1)
         assert result == "release"
 
     def test_no_release_when_depth_gt_1(self) -> None:
         """Depth decrease with depth > 1 does NOT trigger release."""
-        state = self._make_state(phase="sustain", depth=4, prev_depth=4, phase_position=5)
+        state = self._make_state(
+            phase="sustain", depth=4, prev_depth=4, phase_position=5,
+        )
         result = state.detect_phase(freedom=0.5, depth=3)
         assert result != "release"
 
@@ -543,3 +550,67 @@ class TestTransportEpsilon:
         result = hook.pre_forward(0, valid_mask, [], logits)
         assert result.transport_epsilon is not None
         assert result.transport_epsilon > 0.0
+
+
+# === Task 7: Telemetry integration ===
+
+
+class TestEnvelopeTelemetry:
+    """Tests for EnvelopeTelemetry dataclass."""
+
+    def test_telemetry_records_fields(self) -> None:
+        t = EnvelopeTelemetry(
+            phase="attack",
+            phase_position=0,
+            depth=1,
+            source_vector=[0.5] * 11,
+            modulation_vector=[0.1] * 7,
+            final_temperature=0.3,
+            final_epsilon=0.1,
+        )
+        assert t.phase == "attack"
+        assert t.depth == 1
+        assert len(t.source_vector) == 11
+        assert len(t.modulation_vector) == 7
+
+    def test_telemetry_json_serializable(self) -> None:
+        t = EnvelopeTelemetry(
+            phase="sustain",
+            phase_position=5,
+            depth=2,
+            source_vector=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 0.0, 1.0, 0.0, 0.0],
+            modulation_vector=[0.3, 0.9, -20.0, 0.1, 0.0, 0.0, 0.0],
+            final_temperature=0.45,
+            final_epsilon=0.08,
+        )
+        import dataclasses
+
+        d = dataclasses.asdict(t)
+        serialized = json.dumps(d)
+        deserialized = json.loads(serialized)
+        assert deserialized["phase"] == "sustain"
+        assert deserialized["depth"] == 2
+
+    def test_hook_produces_telemetry(self) -> None:
+        """ModMatrixHookMlx stores last telemetry after pre_forward."""
+        hook = _make_hook()
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        hook.pre_forward(0, valid_mask, [], logits)
+        assert hook.last_telemetry is not None
+        assert isinstance(hook.last_telemetry, EnvelopeTelemetry)
+        assert hook.last_telemetry.phase in (
+            "attack", "decay", "sustain", "release",
+        )
+
+    def test_telemetry_list_matches_token_count(self) -> None:
+        """Multiple pre_forward calls produce matching telemetry."""
+        hook = _make_hook()
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        telemetry_list = []
+        for i in range(5):
+            hook.pre_forward(i, valid_mask, list(range(i)), logits)
+            telemetry_list.append(hook.last_telemetry)
+        assert len(telemetry_list) == 5
+        assert all(t is not None for t in telemetry_list)
