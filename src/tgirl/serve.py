@@ -20,6 +20,11 @@ from tgirl.format import ChatTemplateFormatter
 from tgirl.registry import ToolRegistry
 from tgirl.types import PromptFormatter, SessionConfig
 
+try:
+    from fastapi import WebSocket as _FastAPIWebSocket  # noqa: F401
+except ImportError:
+    _FastAPIWebSocket = None  # type: ignore[assignment,misc]
+
 logger = structlog.get_logger()
 
 
@@ -440,5 +445,55 @@ def create_app(
     @app.get("/telemetry")
     async def get_telemetry(limit: int = 100) -> list[dict[str, Any]]:
         return telemetry_buffer[-limit:]
+
+    @app.websocket("/stream")
+    async def stream(websocket: _FastAPIWebSocket) -> None:
+        await websocket.accept()
+        try:
+            data = await websocket.receive_json()
+            intent = data.get("intent", "")
+            messages = [{"role": "user", "content": intent}]
+
+            try:
+                result = await asyncio.to_thread(
+                    _run_session_chat,
+                    ctx,
+                    messages,
+                    session_config,
+                    transport_config,
+                    hooks,
+                )
+                await websocket.send_json({
+                    "type": "result",
+                    "output": result.output_text,
+                    "tool_calls": [
+                        {
+                            "pipeline": tc.pipeline,
+                            "result": tc.result,
+                            "error": (
+                                tc.error.message
+                                if tc.error
+                                else None
+                            ),
+                            "cycle_number": tc.cycle_number,
+                            "tool_invocations": tc.tool_invocations,
+                        }
+                        for tc in result.tool_calls
+                    ],
+                    "total_tokens": result.total_tokens,
+                    "total_cycles": result.total_cycles,
+                    "wall_time_ms": result.wall_time_ms,
+                    "quotas_consumed": result.quotas_consumed,
+                })
+            except Exception as e:
+                logger.error("stream_error", error=str(e))
+                await websocket.send_json({
+                    "type": "error",
+                    "error": str(e),
+                })
+        except Exception:
+            pass
+        finally:
+            await websocket.close()
 
     return app

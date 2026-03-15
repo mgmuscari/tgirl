@@ -404,3 +404,66 @@ class TestInfoEndpoints:
         client = TestClient(app)
         resp = client.get("/telemetry?limit=5")
         assert resp.status_code == 200
+
+
+class TestWebSocket:
+    """Tests for /stream WebSocket endpoint."""
+
+    def test_websocket_connection_and_message(self) -> None:
+        """WebSocket accepts connection and returns result."""
+        from tgirl.serve import create_app
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        ctx = _make_mock_ctx(tools=registry)
+        app = create_app(ctx)
+
+        mock_result = MagicMock()
+        mock_result.output_text = "Result: 5"
+        mock_result.tool_calls = []
+        mock_result.total_tokens = 10
+        mock_result.total_cycles = 0
+        mock_result.wall_time_ms = 50.0
+        mock_result.quotas_consumed = {}
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with (
+            patch(
+                "tgirl.serve._run_session_chat",
+                return_value=mock_result,
+            ),
+            client.websocket_connect("/stream") as ws,
+        ):
+            ws.send_json({"intent": "Add 2 and 3"})
+            data = ws.receive_json()
+            assert data["type"] == "result"
+            assert data["output"] == "Result: 5"
+            assert data["total_tokens"] == 10
+
+    def test_websocket_error_handling(self) -> None:
+        """WebSocket handles errors gracefully."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        app = create_app(ctx)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with (
+            patch(
+                "tgirl.serve._run_session_chat",
+                side_effect=RuntimeError("Inference failed"),
+            ),
+            client.websocket_connect("/stream") as ws,
+        ):
+            ws.send_json({"intent": "test"})
+            data = ws.receive_json()
+            assert data["type"] == "error"
+            assert "Inference failed" in data["error"]
