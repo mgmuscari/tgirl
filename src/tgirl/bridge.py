@@ -1,0 +1,264 @@
+"""MCP compatibility layer — tool import/export.
+
+Provides bidirectional bridging between tgirl's ToolRegistry and the
+Model Context Protocol (MCP):
+
+- **Import**: ``import_mcp_tools`` connects to an MCP server and
+  registers its tools into a ToolRegistry.
+- **Export**: ``expose_as_mcp`` / ``create_mcp_server`` expose
+  registry tools as MCP server tools.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import threading
+from typing import Any
+
+import structlog
+
+from tgirl.registry import ToolRegistry
+
+logger = structlog.get_logger()
+
+try:
+    from mcp import StdioServerParameters  # noqa: F401 (used in type checks)
+
+    _HAS_MCP_CLIENT = True
+except ImportError:
+    _HAS_MCP_CLIENT = False
+
+try:
+    from mcp.server import FastMCP  # noqa: F401 (used in expose_as_mcp)
+
+    _HAS_MCP_SERVER = True
+except ImportError:
+    _HAS_MCP_SERVER = False
+
+
+def _sanitize_tool_name(name: str) -> str:
+    """Sanitize an MCP tool name for use as a Python identifier.
+
+    Replaces dots, hyphens, and other non-alphanumeric characters
+    with underscores (same pattern as bfcl.py:register_bfcl_tools).
+    """
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+
+def _extract_call_result_text(result: Any) -> str | None:
+    """Extract text content from an MCP CallToolResult."""
+    if result.isError:
+        texts = []
+        for item in result.content:
+            if hasattr(item, "text"):
+                texts.append(item.text)
+        error_msg = "; ".join(texts) if texts else "MCP tool call failed"
+        msg = f"MCP tool error: {error_msg}"
+        raise RuntimeError(msg)
+
+    for item in result.content:
+        if hasattr(item, "text"):
+            return item.text
+    return None
+
+
+class McpConnection:
+    """Holds an MCP session on a background event loop thread.
+
+    The connection stays alive until close() is called or the
+    McpConnection is used as a context manager and exits.
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        thread: threading.Thread,
+        session: Any,
+        name_map: dict[str, str],
+    ) -> None:
+        self._loop = loop
+        self._thread = thread
+        self._session = session
+        self.name_map = name_map
+        self._closed = False
+
+    def close(self) -> None:
+        """Shut down the MCP session and background thread."""
+        if self._closed:
+            return
+        self._closed = True
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5.0)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def __enter__(self) -> McpConnection:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+async def _create_mcp_session(
+    server_params: Any,
+) -> Any:
+    """Create and initialize an MCP ClientSession.
+
+    This is extracted as a separate function to allow mocking
+    in tests without mocking the entire stdio_client machinery.
+    """
+    raise NotImplementedError(
+        "_create_mcp_session should be mocked in tests "
+        "or called through import_mcp_tools in production"
+    )
+
+
+def _make_sync_wrapper(
+    connection: McpConnection,
+    original_name: str,
+    timeout: float = 30.0,
+) -> Any:
+    """Build a sync callable that bridges to async session.call_tool."""
+
+    def wrapper(**kwargs: Any) -> Any:
+        if connection.closed:
+            msg = "MCP connection is closed"
+            raise RuntimeError(msg)
+        coro = connection._session.call_tool(original_name, kwargs)
+        future = asyncio.run_coroutine_threadsafe(
+            coro, connection._loop
+        )
+        result = future.result(timeout=timeout)
+        return _extract_call_result_text(result)
+
+    return wrapper
+
+
+def import_mcp_tools(
+    registry: ToolRegistry,
+    server_params: Any,
+    scope_prefix: str = "",
+    default_quota: int | None = None,
+) -> McpConnection:
+    """Import tools from an MCP server into a tgirl registry.
+
+    Starts a background thread with an event loop that owns the MCP
+    session. Returns an McpConnection that must be kept alive (or used
+    as a context manager) for tool calls to work.
+
+    The function itself is synchronous -- it blocks until tools are
+    registered, then returns.
+
+    Args:
+        registry: ToolRegistry to register imported tools into.
+        server_params: StdioServerParameters or a command string.
+        scope_prefix: If set, all imported tools get this scope.
+        default_quota: If set, all imported tools get this quota.
+
+    Returns:
+        McpConnection that must be kept alive for tool calls.
+    """
+    if not _HAS_MCP_CLIENT:
+        msg = "mcp package is required for import_mcp_tools"
+        raise ImportError(msg)
+
+    # Parse command string to StdioServerParameters if needed
+    if isinstance(server_params, str):
+        parts = server_params.split()
+        server_params = StdioServerParameters(
+            command=parts[0], args=parts[1:] if len(parts) > 1 else []
+        )
+
+    # Set up background event loop
+    loop = asyncio.new_event_loop()
+    ready_event = threading.Event()
+    session_holder: list[Any] = [None]
+    error_holder: list[Exception | None] = [None]
+
+    async def _run_session() -> None:
+        try:
+            session = await _create_mcp_session(server_params)
+            session_holder[0] = session
+            ready_event.set()
+            # Keep the loop running until stopped
+            while True:
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            error_holder[0] = e
+            ready_event.set()
+
+    def _thread_target() -> None:
+        asyncio.set_event_loop(loop)
+        import contextlib
+
+        with contextlib.suppress(RuntimeError):
+            loop.run_until_complete(_run_session())
+
+    thread = threading.Thread(
+        target=_thread_target, daemon=True, name="mcp-bridge"
+    )
+    thread.start()
+
+    # Wait for session to be ready
+    ready_event.wait(timeout=30.0)
+
+    if error_holder[0] is not None:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        raise error_holder[0]
+
+    session = session_holder[0]
+    if session is None:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        msg = "Failed to create MCP session"
+        raise RuntimeError(msg)
+
+    # List tools from the MCP server
+    future = asyncio.run_coroutine_threadsafe(
+        session.list_tools(), loop
+    )
+    list_result = future.result(timeout=30.0)
+
+    name_map: dict[str, str] = {}
+    conn = McpConnection(
+        loop=loop,
+        thread=thread,
+        session=session,
+        name_map=name_map,
+    )
+
+    for tool in list_result.tools:
+        original_name = tool.name
+        sanitized_name = _sanitize_tool_name(original_name)
+        name_map[sanitized_name] = original_name
+
+        wrapper = _make_sync_wrapper(conn, original_name)
+
+        registry.register_from_schema(
+            name=sanitized_name,
+            parameters=tool.inputSchema,
+            description=tool.description or "",
+            scope=scope_prefix or None,
+            quota=default_quota,
+            callable_fn=wrapper,
+        )
+
+        logger.debug(
+            "mcp_tool_imported",
+            original=original_name,
+            sanitized=sanitized_name,
+            scope=scope_prefix or None,
+            quota=default_quota,
+        )
+
+    logger.info(
+        "mcp_tools_imported",
+        count=len(list_result.tools),
+        server=str(server_params),
+    )
+
+    return conn
