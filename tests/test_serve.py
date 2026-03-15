@@ -44,13 +44,18 @@ class TestLoadInferenceContext:
         from tgirl.serve import load_inference_context
 
         mock_model = MagicMock()
+        # mlx_lm returns a wrapper tokenizer; _build_mlx_context
+        # extracts ._tokenizer for the fast HF tokenizer
+        mock_hf_tokenizer = MagicMock()
+        mock_hf_tokenizer.eos_token_id = 0
+        mock_hf_tokenizer.decode = MagicMock(return_value="test")
+        mock_hf_tokenizer.encode = MagicMock(return_value=[1, 2, 3])
         mock_tokenizer = MagicMock()
-        mock_tokenizer.eos_token_id = 0
-        mock_tokenizer.decode = MagicMock(return_value="test")
-        mock_tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        mock_tokenizer._tokenizer = mock_hf_tokenizer
 
         mock_embed = MagicMock()
-        mock_model.model.embed_tokens.weight = mock_embed
+        mock_model.language_model.model.embed_tokens.weight.astype.return_value = mock_embed
+        mock_embed.shape = (100,)
 
         mock_forward_fn = MagicMock()
         mock_grammar_factory = MagicMock()
