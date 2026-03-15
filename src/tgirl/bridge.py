@@ -12,8 +12,10 @@ Model Context Protocol (MCP):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import threading
+import warnings
 from typing import Any
 
 import structlog
@@ -76,24 +78,49 @@ class McpConnection:
         thread: threading.Thread,
         session: Any,
         name_map: dict[str, str],
+        transport_cm: Any = None,
     ) -> None:
         self._loop = loop
         self._thread = thread
         self._session = session
         self.name_map = name_map
         self._closed = False
+        self._transport_cm = transport_cm
 
     def close(self) -> None:
         """Shut down the MCP session and background thread."""
         if self._closed:
             return
         self._closed = True
+        # Clean up transport context manager if present
+        if self._transport_cm is not None:
+
+            async def _cleanup() -> None:
+                with contextlib.suppress(Exception):
+                    await self._transport_cm.__aexit__(None, None, None)
+
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    _cleanup(), self._loop
+                )
+                future.result(timeout=5.0)
+            except Exception:
+                pass
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5.0)
 
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def __del__(self) -> None:
+        if not self._closed:
+            warnings.warn(
+                "McpConnection was not closed",
+                ResourceWarning,
+                stacklevel=1,
+            )
+            self.close()
 
     def __enter__(self) -> McpConnection:
         return self
@@ -104,16 +131,24 @@ class McpConnection:
 
 async def _create_mcp_session(
     server_params: Any,
-) -> Any:
+) -> tuple[Any, Any]:
     """Create and initialize an MCP ClientSession.
+
+    Opens the stdio_client transport and creates a ClientSession on it.
+    Returns (session, transport_cm) — the caller must keep transport_cm
+    alive and call its __aexit__ on cleanup.
 
     This is extracted as a separate function to allow mocking
     in tests without mocking the entire stdio_client machinery.
     """
-    raise NotImplementedError(
-        "_create_mcp_session should be mocked in tests "
-        "or called through import_mcp_tools in production"
-    )
+    from mcp import ClientSession
+    from mcp.client.stdio import stdio_client
+
+    transport_cm = stdio_client(server_params)
+    read, write = await transport_cm.__aenter__()
+    session = ClientSession(read, write)
+    await session.initialize()
+    return session, transport_cm
 
 
 def _make_sync_wrapper(
@@ -176,24 +211,28 @@ def import_mcp_tools(
     loop = asyncio.new_event_loop()
     ready_event = threading.Event()
     session_holder: list[Any] = [None]
+    transport_holder: list[Any] = [None]
     error_holder: list[Exception | None] = [None]
 
     async def _run_session() -> None:
         try:
-            session = await _create_mcp_session(server_params)
-            session_holder[0] = session
+            result = await _create_mcp_session(server_params)
+            # _create_mcp_session returns (session, transport_cm) in
+            # production, or just a mock session in tests
+            if isinstance(result, tuple):
+                session_holder[0], transport_holder[0] = result
+            else:
+                session_holder[0] = result
             ready_event.set()
             # Keep the loop running until stopped
-            while True:
-                await asyncio.sleep(0.1)
+            stop_event = asyncio.Event()
+            await stop_event.wait()
         except Exception as e:
             error_holder[0] = e
             ready_event.set()
 
     def _thread_target() -> None:
         asyncio.set_event_loop(loop)
-        import contextlib
-
         with contextlib.suppress(RuntimeError):
             loop.run_until_complete(_run_session())
 
@@ -229,6 +268,7 @@ def import_mcp_tools(
         thread=thread,
         session=session,
         name_map=name_map,
+        transport_cm=transport_holder[0],
     )
 
     for tool in list_result.tools:
