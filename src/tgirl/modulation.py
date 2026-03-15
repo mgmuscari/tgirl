@@ -9,7 +9,13 @@ Design: docs/design/adsr-envelope.md
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+
+import mlx.core as mx
+
+from tgirl.sample import _detect_cycle
+from tgirl.types import ModelIntervention
 
 
 @dataclass(frozen=True)
@@ -200,3 +206,186 @@ DEFAULT_CONDITIONERS: tuple[SourceConditionerConfig, ...] = (
     SourceConditionerConfig(),  # 9: phase_release
     SourceConditionerConfig(),  # 10: cycle_detected
 )
+
+
+class ModMatrixHookMlx:
+    """Phase-aware modulation matrix for constrained generation.
+
+    Routes 11 source signals through an (11, 7) matrix to produce
+    7 parameter modulations per token. Replaces GrammarTemperatureHook
+    and NestingDepthHook with a single configurable hook.
+    """
+
+    def __init__(
+        self,
+        config: EnvelopeConfig,
+        tokenizer_decode: Callable[[list[int]], str],
+        vocab_size: int,
+        max_tokens: int = 128,
+    ) -> None:
+        self._config = config
+        self._max_tokens = max_tokens
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+
+        # Build mod matrix as mx.array from flat config
+        rows, cols = config.matrix_shape
+        self._mod_matrix = mx.array(
+            list(config.matrix_flat)
+        ).reshape(rows, cols)
+
+        # Pre-compute per-token paren delta and classify openers
+        # (reuses NestingDepthHookMlx pattern)
+        self._delta: dict[int, int] = {}
+        self._opener_ids: set[int] = set()
+        for tid in range(vocab_size):
+            text = tokenizer_decode([tid])
+            opens = text.count("(")
+            closes = text.count(")")
+            delta = opens - closes
+            if delta != 0:
+                self._delta[tid] = delta
+            if opens > closes:
+                self._opener_ids.add(tid)
+
+    def reset(self) -> None:
+        """Reset state for new constrained generation pass."""
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+
+    def advance(self, token_id: int) -> None:
+        """Update depth after token sampled."""
+        self._state.depth += self._delta.get(token_id, 0)
+        self._state.depth = max(self._state.depth, 0)
+
+    def pre_forward(
+        self,
+        position: int,
+        valid_mask: mx.array,
+        token_history: list[int],
+        logits: mx.array,
+    ) -> ModelIntervention:
+        """Compute modulated parameters via matrix multiply."""
+        vocab_size = logits.shape[0]
+        cfg = self._config
+
+        # 1. Compute raw source signals (MLX ops, scalar extract)
+        freedom = float(mx.sum(valid_mask).item()) / vocab_size
+        probs = mx.softmax(logits, axis=-1)
+        log_probs = mx.log(mx.clip(probs, 1e-30, None))
+        entropy = -float(mx.sum(probs * log_probs).item())
+        overlap = float(
+            mx.sum(probs * valid_mask.astype(mx.float32)).item()
+        )
+        confidence = float(mx.max(log_probs).item())
+
+        # 2. Detect phase
+        self._state.advance_phase(freedom, self._state.depth)
+        phase = self._state.phase
+
+        # 3. Cycle detection
+        cycle = (
+            1.0
+            if _detect_cycle(token_history) is not None
+            else 0.0
+        )
+
+        # 4. Build source vector (conditioned)
+        # n=11 Python scalars — documented deviation, sub-microsecond
+        raw_sources = [
+            freedom,
+            entropy,
+            confidence,
+            overlap,
+            float(self._state.depth),
+            position / self._max_tokens,
+            1.0 if phase == "attack" else 0.0,
+            1.0 if phase == "decay" else 0.0,
+            1.0 if phase == "sustain" else 0.0,
+            1.0 if phase == "release" else 0.0,
+            cycle,
+        ]
+        conditioned = []
+        for i, (raw, scfg) in enumerate(
+            zip(raw_sources, cfg.conditioners, strict=True)
+        ):
+            val = condition_source(
+                raw, scfg, self._state.prev_smoothed[i]
+            )
+            self._state.prev_smoothed[i] = val
+            conditioned.append(val)
+
+        # 5. Matrix multiply (native MLX)
+        source_vec = mx.array(conditioned)
+        modulations = source_vec @ self._mod_matrix  # shape (7,)
+
+        # 6. Apply base values + clamp (7 scalar .item() calls)
+        temperature = max(
+            cfg.temperature_range[0],
+            min(
+                cfg.temperature_range[1],
+                cfg.base_temperature + float(modulations[0].item()),
+            ),
+        )
+        top_p = max(
+            cfg.top_p_range[0],
+            min(
+                cfg.top_p_range[1],
+                cfg.base_top_p + float(modulations[1].item()),
+            ),
+        )
+        rep_bias = max(
+            cfg.repetition_bias_range[0],
+            min(
+                cfg.repetition_bias_range[1],
+                cfg.base_repetition_bias
+                + float(modulations[2].item()),
+            ),
+        )
+        # epsilon computed but stored as instance attr for Task 5
+        # (transport_epsilon field on ModelIntervention)
+        self._last_epsilon = max(
+            cfg.epsilon_range[0],
+            min(
+                cfg.epsilon_range[1],
+                cfg.base_epsilon + float(modulations[3].item()),
+            ),
+        )
+        opener_bias_val = cfg.base_opener_bias + float(
+            modulations[4].item()
+        )
+        # col 5 (backtrack) reserved — not read in v1
+        presence = cfg.base_presence_penalty + float(
+            modulations[6].item()
+        )
+
+        # 7. Build logit_bias for opener penalty
+        logit_bias: dict[int, float] | None = None
+        if opener_bias_val < -1.0:
+            logit_bias = {
+                tid: opener_bias_val
+                for tid in self._opener_ids
+            }
+
+        # 8. Repetition bias via logit_bias on repeated tokens
+        if rep_bias < cfg.base_repetition_bias:
+            recent = token_history[-8:]
+            counts: dict[int, int] = {}
+            for tid in recent:
+                counts[tid] = counts.get(tid, 0) + 1
+            for tid, count in counts.items():
+                if count > 2:
+                    bias = rep_bias * (count - 2)
+                    if logit_bias is None:
+                        logit_bias = {}
+                    existing = logit_bias.get(tid, 0.0)
+                    logit_bias[tid] = max(
+                        existing + bias, -100.0
+                    )
+
+        return ModelIntervention(
+            temperature=temperature,
+            top_p=top_p,
+            logit_bias=logit_bias if logit_bias else None,
+            presence_penalty=(
+                presence if presence != 0.0 else None
+            ),
+        )

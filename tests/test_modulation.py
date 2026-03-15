@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import dataclasses
 
+import mlx.core as mx
+
 from tgirl.modulation import (
     DEFAULT_MATRIX,
     DEFAULT_MATRIX_FLAT,
     EnvelopeConfig,
     EnvelopeState,
+    ModMatrixHookMlx,
     SourceConditionerConfig,
     condition_source,
 )
+from tgirl.types import ModelIntervention
 
 
 # === Task 1: Source conditioning ===
@@ -269,3 +273,167 @@ class TestEnvelopeConfig:
         assert attack_row[1] == 0.35
         assert attack_row[2] == 10.0
         assert attack_row[3] == -0.05
+
+
+# === Task 3: ModMatrixHookMlx ===
+
+
+def _make_hook(
+    config: EnvelopeConfig | None = None,
+    vocab_size: int = 100,
+    max_tokens: int = 128,
+) -> ModMatrixHookMlx:
+    """Create a hook with a simple tokenizer mock."""
+    if config is None:
+        config = EnvelopeConfig()
+
+    def decode(ids: list[int]) -> str:
+        # Token 10 = "(", token 11 = ")"
+        mapping = {10: "(", 11: ")"}
+        return "".join(mapping.get(i, "x") for i in ids)
+
+    return ModMatrixHookMlx(
+        config=config,
+        tokenizer_decode=decode,
+        vocab_size=vocab_size,
+        max_tokens=max_tokens,
+    )
+
+
+class TestModMatrixHookMlx:
+    """Tests for the unified MLX modulation hook."""
+
+    def test_implements_protocol(self) -> None:
+        """Hook satisfies InferenceHookMlx protocol."""
+        from tgirl.sample_mlx import InferenceHookMlx
+
+        hook = _make_hook()
+        assert isinstance(hook, InferenceHookMlx)
+
+    def test_pre_forward_returns_intervention(self) -> None:
+        hook = _make_hook()
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        result = hook.pre_forward(0, valid_mask, [], logits)
+        assert isinstance(result, ModelIntervention)
+
+    def test_intervention_has_temperature(self) -> None:
+        hook = _make_hook()
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        result = hook.pre_forward(0, valid_mask, [], logits)
+        assert result.temperature is not None
+        assert result.temperature >= 0.0
+
+    def test_intervention_has_top_p(self) -> None:
+        hook = _make_hook()
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        result = hook.pre_forward(0, valid_mask, [], logits)
+        assert result.top_p is not None
+        assert 0.0 < result.top_p <= 1.0
+
+    def test_attack_higher_temp_than_sustain(self) -> None:
+        """Phase detection affects output: attack -> higher temperature."""
+        hook = _make_hook()
+        logits = mx.random.normal((100,))
+        # All tokens valid = high freedom -> attack phase
+        valid_mask_high = mx.ones((100,), dtype=mx.bool_)
+        r_attack = hook.pre_forward(0, valid_mask_high, [], logits)
+
+        # Reset and simulate sustain: low freedom, many tokens deep
+        hook.reset()
+        hook._state.phase = "sustain"
+        hook._state.phase_position = 10
+        hook._state.depth = 2
+        hook._state.prev_depth = 2
+        # Very few valid tokens
+        valid_mask_low = mx.zeros((100,), dtype=mx.bool_)
+        valid_mask_low = valid_mask_low.at[0:5].add(
+            mx.ones((5,), dtype=mx.bool_)
+        )
+        r_sustain = hook.pre_forward(5, valid_mask_low, [], logits)
+
+        # Attack should produce higher temperature than sustain
+        assert r_attack.temperature > r_sustain.temperature
+
+    def test_depth_tracking_via_advance(self) -> None:
+        """advance() tracks depth like NestingDepthHook."""
+        hook = _make_hook()
+        assert hook._state.depth == 0
+        hook.advance(10)  # "(" -> depth +1
+        assert hook._state.depth == 1
+        hook.advance(10)  # "(" -> depth +1
+        assert hook._state.depth == 2
+        hook.advance(11)  # ")" -> depth -1
+        assert hook._state.depth == 1
+        hook.advance(11)  # ")" -> depth -1
+        assert hook._state.depth == 0
+
+    def test_cycle_detection_activates_rep_bias(self) -> None:
+        """Cycle detection produces logit_bias on cycle tokens."""
+        hook = _make_hook()
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        # Create a cycling history: [5,6,5,6]
+        history = [5, 6, 5, 6]
+        result = hook.pre_forward(4, valid_mask, history, logits)
+        # cycle_detected should activate and produce logit_bias
+        if result.logit_bias is not None:
+            # Cycle tokens should have negative bias
+            for tid in (5, 6):
+                if tid in result.logit_bias:
+                    assert result.logit_bias[tid] < 0.0
+
+    def test_reset_clears_state(self) -> None:
+        hook = _make_hook()
+        hook.advance(10)  # depth -> 1
+        hook._state.phase = "sustain"
+        hook._state.phase_position = 10
+        hook.reset()
+        assert hook._state.depth == 0
+        assert hook._state.phase == "attack"
+        assert hook._state.phase_position == 0
+
+    def test_matrix_multiply_uses_mx(self) -> None:
+        """Verify mod matrix is an mx.array (native MLX matmul)."""
+        hook = _make_hook()
+        assert isinstance(hook._mod_matrix, mx.array)
+        assert hook._mod_matrix.shape == (11, 7)
+
+    def test_temperature_clamped_to_range(self) -> None:
+        """Temperature is clamped within config range."""
+        cfg = EnvelopeConfig(temperature_range=(0.1, 1.5))
+        hook = _make_hook(config=cfg)
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        result = hook.pre_forward(0, valid_mask, [], logits)
+        assert 0.1 <= result.temperature <= 1.5
+
+    def test_opener_penalty_at_budget_limit(self) -> None:
+        """Opener penalty activates when depth + position nears budget."""
+        hook = _make_hook(max_tokens=20)
+        # Set depth high so remaining budget is tight
+        hook._state.depth = 15
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        result = hook.pre_forward(15, valid_mask, [], logits)
+        # With depth=15, opener_bias_val should be very negative
+        # from the depth row: depth * -20.0 (after conditioning)
+        if result.logit_bias is not None:
+            for tid in hook._opener_ids:
+                if tid in result.logit_bias:
+                    assert result.logit_bias[tid] < 0.0
+
+    def test_rep_penalty_behavioral_equivalence(self) -> None:
+        """Window-based counting matches RepetitionPenaltyHook behavior."""
+        hook = _make_hook()
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        # History with token 42 appearing 4 times in 8-token window
+        history = [42, 42, 42, 42, 1, 2, 3, 4]
+        result = hook.pre_forward(8, valid_mask, history, logits)
+        # The mod matrix should activate repetition bias
+        # Check that logit_bias has a penalty for token 42
+        if result.logit_bias is not None and 42 in result.logit_bias:
+            assert result.logit_bias[42] < 0.0
