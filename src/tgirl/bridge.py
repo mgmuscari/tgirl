@@ -16,6 +16,7 @@ import contextlib
 import re
 import threading
 import warnings
+from collections.abc import Callable
 from typing import Any
 
 import structlog
@@ -310,12 +311,16 @@ def import_mcp_tools(
 def _type_repr_to_schema(type_repr: Any) -> dict[str, Any]:
     """Convert a TypeRepr to a JSON Schema property definition."""
     from tgirl.types import (
+        AnnotatedType,
         AnyType,
         DictType,
+        EnumType,
         ListType,
         LiteralType,
         ModelType,
+        OptionalType,
         PrimitiveType,
+        UnionType,
     )
 
     primitive_map = {
@@ -351,6 +356,18 @@ def _type_repr_to_schema(type_repr: Any) -> dict[str, Any]:
             if req:
                 schema["required"] = req
             return schema
+        case EnumType(values=vals):
+            return {"enum": list(vals)}
+        case OptionalType(inner=inner):
+            return {
+                "anyOf": [_type_repr_to_schema(inner), {"type": "null"}],
+            }
+        case UnionType(members=members):
+            return {
+                "anyOf": [_type_repr_to_schema(m) for m in members],
+            }
+        case AnnotatedType(base=base):
+            return _type_repr_to_schema(base)
         case AnyType():
             return {}
         case _:
@@ -439,6 +456,7 @@ def expose_as_mcp(
     description: str,
     input_schema: dict[str, Any],
     mcp_server: Any,
+    session_factory: Callable[[], Any] | None = None,
 ) -> None:
     """Wrap a tgirl pipeline as a single MCP tool on an existing server.
 
@@ -452,14 +470,75 @@ def expose_as_mcp(
         description: Human-readable description for the MCP tool.
         input_schema: JSON Schema for the tool's input parameters.
         mcp_server: An existing FastMCP server to add the tool to.
+        session_factory: Callable that returns a SamplingSession.
+            When provided, the handler creates a session and runs
+            run_chat() with the tool call kwargs as a user message.
+            When None, the handler returns an informative stub message.
     """
     if not _HAS_MCP_SERVER:
         msg = "mcp.server is required for expose_as_mcp"
         raise ImportError(msg)
 
-    # Create a function with the right signature for FastMCP
+    import inspect
+
+    # Build typed parameters from input_schema for FastMCP compatibility
+    params = []
+    annotations: dict[str, type] = {}
+    schema_props = input_schema.get("properties", {})
+    schema_required = set(input_schema.get("required", []))
+
+    json_type_map = {
+        "string": str,
+        "integer": int,
+        "number": float,
+        "boolean": bool,
+    }
+
+    for prop_name, prop_schema in schema_props.items():
+        python_type = json_type_map.get(prop_schema.get("type", ""), str)
+        if prop_name in schema_required:
+            params.append(
+                inspect.Parameter(
+                    prop_name,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=python_type,
+                )
+            )
+        else:
+            params.append(
+                inspect.Parameter(
+                    prop_name,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=None,
+                    annotation=python_type,
+                )
+            )
+        annotations[prop_name] = python_type
+
+    annotations["return"] = str
+    sig = inspect.Signature(params, return_annotation=str)
+
+    # Capture factory in closure for the handler
+    factory = session_factory
+    name = pipeline_name
+
     async def pipeline_handler(**kwargs: Any) -> str:
-        return f"Pipeline {pipeline_name} called with {kwargs}"
+        if factory is None:
+            return (
+                f"No session_factory configured for pipeline "
+                f"'{name}'. Cannot run inference without "
+                f"a session factory."
+            )
+        session = factory()
+        user_content = (
+            f"Call the '{name}' pipeline with arguments: {kwargs}"
+        )
+        messages = [{"role": "user", "content": user_content}]
+        result = session.run_chat(messages)
+        return result.text
+
+    pipeline_handler.__signature__ = sig  # type: ignore[attr-defined]
+    pipeline_handler.__annotations__ = annotations
 
     # Use add_tool for programmatic registration
     mcp_server.add_tool(
@@ -472,6 +551,7 @@ def expose_as_mcp(
         "mcp_pipeline_exposed",
         name=pipeline_name,
         description=description,
+        has_session_factory=session_factory is not None,
     )
 
 

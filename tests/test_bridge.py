@@ -9,13 +9,18 @@ import pytest
 
 from tgirl.registry import ToolRegistry
 from tgirl.types import (
+    AnnotatedType,
     AnyType,
+    ConstraintRepr,
     DictType,
+    EnumType,
     FieldDef,
     ListType,
     LiteralType,
     ModelType,
+    OptionalType,
     PrimitiveType,
+    UnionType,
 )
 
 
@@ -553,3 +558,208 @@ class TestExposeMcp:
         tools = asyncio.run(_list())
         tool_names = {t.name for t in tools}
         assert "calculator" in tool_names
+
+    def test_expose_as_mcp_runs_pipeline_via_session_factory(self) -> None:
+        """expose_as_mcp handler uses session_factory to run pipeline."""
+        import asyncio
+
+        from mcp.server import FastMCP
+
+        from tgirl.bridge import expose_as_mcp
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def calc(x: int) -> int:
+            return x * 2
+
+        # Mock session with run_chat that returns a result
+        mock_result = MagicMock()
+        mock_result.text = "Pipeline result: 42"
+        mock_session = MagicMock()
+        mock_session.run_chat.return_value = mock_result
+
+        session_factory = MagicMock(return_value=mock_session)
+
+        server = FastMCP("test")
+        expose_as_mcp(
+            registry=registry,
+            pipeline_name="calculator",
+            description="A calculator pipeline",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"},
+                },
+                "required": ["expression"],
+            },
+            mcp_server=server,
+            session_factory=session_factory,
+        )
+
+        # Call the tool through the server
+        async def _call():
+            return await server.call_tool(
+                "calculator", {"expression": "1+1"}
+            )
+
+        result = asyncio.run(_call())
+        # session_factory should have been called
+        session_factory.assert_called_once()
+        # run_chat should have been called with a user message containing kwargs
+        mock_session.run_chat.assert_called_once()
+        call_args = mock_session.run_chat.call_args
+        messages = call_args[0][0]
+        assert any("expression" in str(m) for m in messages)
+        # Result should contain the session's return value
+        if isinstance(result, tuple):
+            content_list = result[0]
+        else:
+            content_list = result
+        texts = [
+            item.text for item in content_list if hasattr(item, "text")
+        ]
+        assert any("Pipeline result: 42" in t for t in texts)
+
+    def test_expose_as_mcp_without_session_factory_returns_stub(self) -> None:
+        """expose_as_mcp without session_factory returns stub message."""
+        import asyncio
+
+        from mcp.server import FastMCP
+
+        from tgirl.bridge import expose_as_mcp
+
+        registry = ToolRegistry()
+
+        server = FastMCP("test")
+        expose_as_mcp(
+            registry=registry,
+            pipeline_name="stub_pipe",
+            description="A stub pipeline",
+            input_schema={
+                "type": "object",
+                "properties": {},
+            },
+            mcp_server=server,
+        )
+
+        async def _call():
+            return await server.call_tool("stub_pipe", {})
+
+        result = asyncio.run(_call())
+        # call_tool returns (content_list, metadata) tuple or just content_list
+        # Extract text from whichever format
+        if isinstance(result, tuple):
+            content_list = result[0]
+        else:
+            content_list = result
+        texts = [
+            item.text
+            for item in content_list
+            if hasattr(item, "text")
+        ]
+        full_text = " ".join(texts).lower()
+        assert "no session_factory" in full_text
+
+
+class TestTypeReprToSchemaGap1:
+    """Tests for _type_repr_to_schema with previously-missing TypeRepr variants."""
+
+    def test_enum_type(self) -> None:
+        """EnumType produces {"enum": [values]}."""
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            EnumType(name="Color", values=("red", "green", "blue"))
+        )
+        assert result == {"enum": ["red", "green", "blue"]}
+
+    def test_optional_type(self) -> None:
+        """OptionalType produces anyOf with inner type and null."""
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            OptionalType(inner=PrimitiveType(kind="str"))
+        )
+        assert result == {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+        }
+
+    def test_optional_type_nested(self) -> None:
+        """OptionalType with a complex inner type."""
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            OptionalType(
+                inner=ListType(element=PrimitiveType(kind="int"))
+            )
+        )
+        assert result == {
+            "anyOf": [
+                {"type": "array", "items": {"type": "integer"}},
+                {"type": "null"},
+            ],
+        }
+
+    def test_union_type(self) -> None:
+        """UnionType produces anyOf with all member schemas."""
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            UnionType(
+                members=(
+                    PrimitiveType(kind="str"),
+                    PrimitiveType(kind="int"),
+                    PrimitiveType(kind="bool"),
+                )
+            )
+        )
+        assert result == {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "integer"},
+                {"type": "boolean"},
+            ],
+        }
+
+    def test_union_type_single_member(self) -> None:
+        """UnionType with one member still uses anyOf."""
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            UnionType(members=(PrimitiveType(kind="float"),))
+        )
+        assert result == {
+            "anyOf": [{"type": "number"}],
+        }
+
+    def test_annotated_type_delegates_to_base(self) -> None:
+        """AnnotatedType delegates to base type, ignoring constraints."""
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            AnnotatedType(
+                base=PrimitiveType(kind="int"),
+                constraints=(
+                    ConstraintRepr(kind="gt", value=0),
+                    ConstraintRepr(kind="lt", value=100),
+                ),
+            )
+        )
+        # Constraints are runtime-only; JSON Schema gets just the base type
+        assert result == {"type": "integer"}
+
+    def test_annotated_type_with_complex_base(self) -> None:
+        """AnnotatedType with a list base type."""
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            AnnotatedType(
+                base=ListType(element=PrimitiveType(kind="str")),
+                constraints=(ConstraintRepr(kind="ge", value=1),),
+            )
+        )
+        assert result == {
+            "type": "array",
+            "items": {"type": "string"},
+        }
