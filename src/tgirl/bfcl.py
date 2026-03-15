@@ -94,11 +94,11 @@ def _hy_node_to_python(node: Any) -> Any:
         }
     if isinstance(node, hy.models.Symbol):
         sym = str(node)
-        if sym == "True":
+        if sym in ("True", "true"):
             return True
-        if sym == "False":
+        if sym in ("False", "false"):
             return False
-        if sym == "None":
+        if sym in ("None", "nil"):
             return None
         return sym
     return node
@@ -177,3 +177,37 @@ def sexpr_to_bfcl(
         call_strs.append(call_str)
 
     return "[" + ", ".join(call_strs) + "]"
+
+
+def sexpr_to_bfcl_dict(
+    hy_source: str,
+    registry: ToolRegistry,
+    name_map: dict[str, str],
+) -> list[dict[str, dict[str, Any]]]:
+    """Convert tgirl s-expression output to BFCL checker format.
+
+    Returns a list of dicts like:
+        [{"func_name": {"param1": val1, "param2": val2}}]
+
+    This is the format expected by bfcl_eval's ast_checker.
+    """
+    expressions = list(hy.read_many(hy_source))
+    calls: list[dict[str, dict[str, Any]]] = []
+
+    for expr in expressions:
+        items = list(expr)
+        func_symbol = str(items[0])
+        args = [_hy_node_to_python(item) for item in items[1:]]
+
+        tool_def = registry.get(func_symbol)
+        params = tool_def.parameters
+
+        kwargs: dict[str, Any] = {}
+        for i, val in enumerate(args):
+            if i < len(params):
+                kwargs[params[i].name] = val
+
+        original_name = name_map.get(func_symbol, func_symbol)
+        calls.append({original_name: kwargs})
+
+    return calls

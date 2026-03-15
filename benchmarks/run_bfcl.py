@@ -202,6 +202,17 @@ def run_benchmark(args: argparse.Namespace) -> None:
     mlx_grammar_factory = make_outlines_grammar_factory_mlx(hf_tokenizer)
     formatter = ChatTemplateFormatter(hf_tokenizer)
 
+    # --- 2b. Collect stop token IDs ---
+    stop_token_ids = []
+    if hf_tokenizer.eos_token_id is not None:
+        stop_token_ids.append(hf_tokenizer.eos_token_id)
+    # Some models have additional stop tokens (e.g., <|im_end|>)
+    for token_str in ["<|im_end|>", "<|endoftext|>"]:
+        ids = hf_tokenizer.encode(token_str, add_special_tokens=False)
+        if len(ids) == 1 and ids[0] not in stop_token_ids:
+            stop_token_ids.append(ids[0])
+    log.info("stop_token_ids", ids=stop_token_ids)
+
     # --- 3. Session config + transition policy ---
     transition_policy = make_transition_policy(
         args.transition_policy,
@@ -210,14 +221,22 @@ def run_benchmark(args: argparse.Namespace) -> None:
     log.info("transition_policy", policy=args.transition_policy)
 
     session_config = SessionConfig(
-        max_tool_cycles=1,
+        max_tool_cycles=10,
         freeform_max_tokens=512,
-        constrained_max_tokens=4096,
+        constrained_max_tokens=128,
         session_timeout=30.0,
     )
-    session_hooks = [GrammarTemperatureHook(base_temperature=0.5)]
+    from tgirl.sample import NestingDepthHook, RepetitionPenaltyHook
+    session_hooks = [
+        GrammarTemperatureHook(base_temperature=0.5),
+        RepetitionPenaltyHook(window=8, max_repeats=2),
+        NestingDepthHook(
+            max_tokens=session_config.constrained_max_tokens,
+            tokenizer_decode=hf_tokenizer.decode,
+            vocab_size=embeddings.shape[0],
+        ),
+    ]
     transport_config = TransportConfig(valid_ratio_threshold=0.5)
-    rerank_config = RerankConfig(max_tokens=16, temperature=0.3)
 
     # --- 4. Register model config for BFCL checker ---
     register_model_config(args.model_name)
@@ -266,6 +285,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
         name_map = register_bfcl_tools(registry, entry["function"])
 
         # Fresh session per entry (prevents quota/state leakage)
+        # Set top_k to number of tools so router can return the full set
+        n_tools = len(entry["function"])
+        rerank_config = RerankConfig(
+            max_tokens=16, temperature=0.3, top_k=n_tools,
+        )
         session = SamplingSession(
             registry=registry,
             forward_fn=forward_fn,
@@ -281,6 +305,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             backend="mlx",
             mlx_grammar_guide_factory=mlx_grammar_factory,
             transition_policy=transition_policy,
+            stop_token_ids=stop_token_ids,
         )
 
         t0 = time.monotonic()
