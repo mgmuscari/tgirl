@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-tgirl (**Transformational Grammar for Inference-Restricting Languages**) is a Python library for local LLM inference with grammar-constrained compositional tool calling. It is not an application or framework — it is a library that other systems import and use.
+tgirl (**Transformational Generator for Inference-Restricting Languages**) is a Python library for local LLM inference with grammar-constrained compositional tool calling. It is not an application or framework — it is a library that other systems import and use.
 
 The library supports two generation modes within a single inference session:
 
@@ -187,3 +187,5 @@ Three hooks in `.claude/hooks/` enforce the methodology:
 2026-03-09: Claude Code `model: inherit` doesn't resolve properly for agent spawns (bug #32368) → Use `model: opus` explicitly in all agent definitions and team spawn calls
 
 2026-03-09: `~/.claude/teams/` directory detection is unreliable for checking active teams → `block-solo-implementation.sh` uses tier + branch + file path checks instead
+
+2026-03-14: **All tensor/matrix math must use the accelerated library for the context (MLX or PyTorch). Never use Python list comprehensions on tensor data.** `[float(v) for v in mx_array]` on 248k elements takes 8.3 seconds; `mx_array.tolist()` takes 6ms — a 1,400x difference. Conversion between linalg libraries (e.g., mx→torch, torch→numpy) must be avoided unless there is absolutely no alternative; exhaust the library's own API and documentation before resorting to cross-library conversion.

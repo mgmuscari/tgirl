@@ -185,6 +185,7 @@ class ToolRegistry:
                 type_repr=type_repr,
                 has_default=not is_required,
                 default=None,
+                description=prop_schema.get("description", ""),
             )
             if is_required:
                 required_params.append(param)

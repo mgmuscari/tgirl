@@ -177,8 +177,8 @@ class TestTypeProductions:
         prods = _type_to_rule(t, "bool_val", GrammarConfig())
         assert len(prods) >= 1
         assert prods[0].name == "bool_val"
-        assert '"true"' in prods[0].rule
-        assert '"false"' in prods[0].rule
+        assert '"True"' in prods[0].rule
+        assert '"False"' in prods[0].rule
 
     def test_primitive_none(self) -> None:
         from tgirl.grammar import GrammarConfig, _type_to_rule
@@ -350,8 +350,8 @@ class TestTypeProductions:
         assert "ESCAPED_STRING" in rule
         assert "SIGNED_INT" in rule
         assert "SIGNED_FLOAT" in rule
-        assert '"true"' in rule
-        assert '"false"' in rule
+        assert '"True"' in rule
+        assert '"False"' in rule
         assert '"nil"' in rule
 
     def test_recursive_list_of_lists(self) -> None:
@@ -1189,6 +1189,164 @@ class TestRoutingGrammar:
         assert '"only_tool"' in grammar_text
         # No pipe since single alternative
         assert "|" not in grammar_text
+
+    def test_routing_grammar_multi_tool_default(self) -> None:
+        """Default top_k=1 produces single-choice grammar (backwards compat)."""
+        import time
+
+        from tgirl.grammar import generate_routing_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tools = tuple(
+            ToolDefinition(
+                name=name,
+                parameters=(
+                    ParameterDef(
+                        name="x", type_repr=PrimitiveType(kind="str")
+                    ),
+                ),
+                return_type=PrimitiveType(kind="str"),
+            )
+            for name in ["alpha", "beta", "gamma"]
+        )
+        snap = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        grammar_text = generate_routing_grammar(snap, top_k=1)
+        # top_k=1: single tool_choice, no repetition
+        assert "tool_list" not in grammar_text
+        assert "tool_choice" in grammar_text
+
+    def test_routing_grammar_multi_tool_list(self) -> None:
+        """top_k > 1 produces space-separated list grammar."""
+        import time
+
+        import lark
+
+        from tgirl.grammar import generate_routing_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tools = tuple(
+            ToolDefinition(
+                name=name,
+                parameters=(
+                    ParameterDef(
+                        name="x", type_repr=PrimitiveType(kind="str")
+                    ),
+                ),
+                return_type=PrimitiveType(kind="str"),
+            )
+            for name in ["alpha", "beta", "gamma"]
+        )
+        snap = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        grammar_text = generate_routing_grammar(snap, top_k=3)
+        # Should have tool_list as start rule
+        assert "tool_list" in grammar_text
+        # Must be valid Lark grammar
+        parser = lark.Lark(grammar_text, parser="lalr")
+        # Single tool should parse
+        parser.parse("alpha")
+        # Multiple space-separated tools should parse
+        parser.parse("alpha beta")
+        parser.parse("alpha beta gamma")
+
+    def test_routing_grammar_multi_tool_caps_repetition(self) -> None:
+        """top_k caps the maximum number of tools in the list."""
+        import time
+
+        import lark
+
+        from tgirl.grammar import generate_routing_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tools = tuple(
+            ToolDefinition(
+                name=name,
+                parameters=(
+                    ParameterDef(
+                        name="x", type_repr=PrimitiveType(kind="str")
+                    ),
+                ),
+                return_type=PrimitiveType(kind="str"),
+            )
+            for name in ["alpha", "beta", "gamma", "delta"]
+        )
+        snap = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        grammar_text = generate_routing_grammar(snap, top_k=2)
+        parser = lark.Lark(grammar_text, parser="lalr")
+        # 1 tool: OK
+        parser.parse("alpha")
+        # 2 tools: OK (top_k=2)
+        parser.parse("alpha beta")
+        # 3 tools: should fail (exceeds top_k=2)
+        with pytest.raises(lark.exceptions.UnexpectedInput):
+            parser.parse("alpha beta gamma")
+
+    def test_routing_grammar_no_top_k_defaults_single(self) -> None:
+        """Omitting top_k defaults to single-choice (backwards compat)."""
+        import time
+
+        from tgirl.grammar import generate_routing_grammar
+        from tgirl.types import (
+            ParameterDef,
+            PrimitiveType,
+            RegistrySnapshot,
+            ToolDefinition,
+        )
+
+        tools = tuple(
+            ToolDefinition(
+                name=name,
+                parameters=(
+                    ParameterDef(
+                        name="x", type_repr=PrimitiveType(kind="str")
+                    ),
+                ),
+                return_type=PrimitiveType(kind="str"),
+            )
+            for name in ["alpha", "beta"]
+        )
+        snap = RegistrySnapshot(
+            tools=tools,
+            quotas={},
+            cost_remaining=None,
+            scopes=frozenset(),
+            timestamp=time.time(),
+        )
+        # No top_k argument — should default to top_k=1
+        grammar_text = generate_routing_grammar(snap)
+        assert "tool_list" not in grammar_text
 
     def test_routing_grammar_deterministic(self) -> None:
         import time

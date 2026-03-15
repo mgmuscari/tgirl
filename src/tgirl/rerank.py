@@ -43,7 +43,7 @@ class ToolRouter:
         # Cache compiled routing grammar states, keyed on sorted tool names.
         # Stores grammar TEXT (not mutable GrammarState objects) to allow
         # fresh GrammarState creation per route() call.
-        self._routing_grammar_cache: dict[tuple[str, ...], str] = {}
+        self._routing_grammar_cache: dict[tuple[str | int, ...], str] = {}
 
     def route(
         self,
@@ -108,12 +108,17 @@ class ToolRouter:
         routing_context_tokens = list(context_tokens)
 
         # Step 4: Get routing grammar text (with caching)
+        top_k = self._config.top_k
         cache_key = tuple(sorted(t.name for t in filtered_tools))
-        if cache_key in self._routing_grammar_cache:
-            routing_grammar_text = self._routing_grammar_cache[cache_key]
+        # Include top_k in cache key so different top_k values don't collide
+        grammar_cache_key = (*cache_key, top_k)
+        if grammar_cache_key in self._routing_grammar_cache:
+            routing_grammar_text = self._routing_grammar_cache[grammar_cache_key]
         else:
-            routing_grammar_text = generate_routing_grammar(filtered_snapshot)
-            self._routing_grammar_cache[cache_key] = routing_grammar_text
+            routing_grammar_text = generate_routing_grammar(
+                filtered_snapshot, top_k=top_k,
+            )
+            self._routing_grammar_cache[grammar_cache_key] = routing_grammar_text
 
         # Step 5: Compile grammar into fresh GrammarState
         # (GrammarState is mutated by advance(), so we need a fresh one each call)
@@ -156,27 +161,39 @@ class ToolRouter:
                 context_tokens=routing_context_tokens,
             )
 
-        # Step 7: Parse and validate output
-        selected_tool = gen_result.hy_source.strip()
+        # Step 7: Parse and validate output (multi-tool aware)
+        raw_tools = gen_result.hy_source.strip().split()
         valid_names = {t.name for t in filtered_tools}
-        if selected_tool not in valid_names:
+
+        # Deduplicate while preserving order, skip invalid names
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for name in raw_tools:
+            if name not in seen and name in valid_names:
+                seen.add(name)
+                ordered.append(name)
+
+        if not ordered:
             msg = (
-                f"Routing produced '{selected_tool}' which is not "
-                f"in valid tool set {valid_names}"
+                f"Routing produced '{gen_result.hy_source.strip()}' which "
+                f"contains no valid tools from {valid_names}"
             )
             raise ValueError(msg)
+
+        # Respect top_k
+        selected = ordered[:top_k]
 
         latency_ms = (time.monotonic() - start_time) * 1000
 
         logger.debug(
             "routing_complete",
-            selected_tool=selected_tool,
+            selected_tools=selected,
             routing_tokens=len(gen_result.tokens),
             latency_ms=latency_ms,
         )
 
         return RerankResult(
-            selected_tools=(selected_tool,),
+            selected_tools=tuple(selected),
             routing_tokens=len(gen_result.tokens),
             routing_latency_ms=latency_ms,
             routing_grammar_text=routing_grammar_text,

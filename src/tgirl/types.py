@@ -151,6 +151,7 @@ class ParameterDef(BaseModel):
     type_repr: TypeRepr
     default: Any = None
     has_default: bool = False
+    description: str = ""
 
 
 class ToolDefinition(BaseModel):
@@ -232,6 +233,8 @@ class TelemetryRecord(BaseModel):
     grammar_generation_ms: float
     ot_computation_total_ms: float
     ot_bypassed_count: int
+    ot_bypass_reasons: list[str | None]
+    ot_iterations: list[int]
     hy_source: str
     execution_result: Any = None
     execution_error: PipelineError | None = None
@@ -244,6 +247,8 @@ class TelemetryRecord(BaseModel):
     rerank_selected_tool: str | None = None
     rerank_routing_tokens: int | None = None
     rerank_latency_ms: float | None = None
+    backtrack_events: list[Any] = []
+    state_transitions: list[tuple[str, str, float]] = []
 
 
 # --- Reranking ---

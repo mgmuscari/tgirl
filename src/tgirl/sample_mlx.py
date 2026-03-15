@@ -18,11 +18,47 @@ from tgirl.sample import (
     ConstrainedGenerationResult,
     merge_interventions,
 )
+from tgirl.state_machine import TransitionSignal
 from tgirl.transport import TransportConfig
 from tgirl.transport_mlx import redistribute_logits_mlx
 from tgirl.types import ModelIntervention
 
 logger = structlog.get_logger()
+
+
+def compute_transition_signal_mlx(
+    token_position: int,
+    logits: mx.array,
+    grammar_valid_mask: mx.array,
+    vocab_size: int,
+    sampled_token_id: int | None = None,
+) -> TransitionSignal:
+    """Compute TransitionSignal using native MLX operations.
+
+    All math stays in mx.array — no Python list iteration over tensors.
+    """
+    probs = mx.softmax(logits, axis=-1)
+    log_probs = mx.log(mx.clip(probs, 1e-30, None))
+
+    grammar_mask_overlap = float(mx.sum(probs * grammar_valid_mask).item())
+
+    p_log_p = probs * log_probs
+    token_entropy = -float(mx.sum(p_log_p).item())
+
+    if sampled_token_id is not None:
+        token_log_prob = float(log_probs[sampled_token_id].item())
+    else:
+        token_log_prob = float(mx.max(log_probs).item())
+
+    grammar_freedom = float(mx.sum(grammar_valid_mask).item()) / vocab_size
+
+    return TransitionSignal(
+        token_position=token_position,
+        grammar_mask_overlap=grammar_mask_overlap,
+        token_entropy=token_entropy,
+        token_log_prob=token_log_prob,
+        grammar_freedom=grammar_freedom,
+    )
 
 
 @runtime_checkable
@@ -50,6 +86,150 @@ class InferenceHookMlx(Protocol):
         token_history: list[int],
         logits: mx.array,
     ) -> ModelIntervention: ...
+
+
+class BacktrackSteeringHookMlx:
+    """MLX-native pre-OT hook that applies negative logit bias on dead-end tokens.
+
+    Mirror of BacktrackSteeringHook from sample.py but conforms to
+    InferenceHookMlx protocol (receives valid_mask: mx.array).
+    """
+
+    def __init__(
+        self,
+        dead_end_tokens: frozenset[int],
+        bias_strength: float = -100.0,
+    ) -> None:
+        self.dead_end_tokens = dead_end_tokens
+        self.bias_strength = bias_strength
+
+    def pre_forward(
+        self,
+        position: int,
+        valid_mask: mx.array,
+        token_history: list[int],
+        logits: mx.array,
+    ) -> ModelIntervention:
+        if not self.dead_end_tokens:
+            return ModelIntervention()
+        bias = {tid: self.bias_strength for tid in self.dead_end_tokens}
+        return ModelIntervention(logit_bias=bias)
+
+
+class NestingDepthHookMlx:
+    """Prevents unclosable s-expressions by tracking nesting depth.
+
+    Pre-computes a paren delta for every token in the vocabulary.
+    During generation, tracks depth and penalizes open-paren tokens
+    when remaining budget is too small to close all open parens.
+    """
+
+    def __init__(
+        self,
+        max_tokens: int,
+        tokenizer_decode: Callable[[list[int]], str],
+        vocab_size: int,
+        margin: int = 2,
+        bias: float = -100.0,
+        open_char: str = "(",
+        close_char: str = ")",
+    ) -> None:
+        self.max_tokens = max_tokens
+        self.margin = margin
+        self.bias = bias
+        self._depth = 0
+
+        # Pre-compute per-token paren delta and classify openers
+        self._delta: dict[int, int] = {}
+        self._opener_ids: set[int] = set()
+        for tid in range(vocab_size):
+            text = tokenizer_decode([tid])
+            opens = text.count(open_char)
+            closes = text.count(close_char)
+            delta = opens - closes
+            if delta != 0:
+                self._delta[tid] = delta
+            if opens > closes:
+                self._opener_ids.add(tid)
+
+    def advance(self, token_id: int) -> None:
+        """Update nesting depth after a token is sampled."""
+        self._depth += self._delta.get(token_id, 0)
+        self._depth = max(self._depth, 0)
+
+    def reset(self) -> None:
+        """Reset depth for a new constrained generation pass."""
+        self._depth = 0
+
+    def pre_forward(
+        self,
+        position: int,
+        valid_mask: mx.array,
+        token_history: list[int],
+        logits: mx.array,
+    ) -> ModelIntervention:
+        remaining = self.max_tokens - position
+        needed = self._depth + self.margin
+        if remaining > needed:
+            return ModelIntervention()
+        # Budget too tight — penalize all tokens that open new parens
+        penalized = {tid: self.bias for tid in self._opener_ids}
+        return ModelIntervention(logit_bias=penalized)
+
+
+class RepetitionPenaltyHookMlx:
+    """Penalizes degenerate token repetition via cycle detection.
+
+    MLX-native variant. Detects repeating cycles in the token suffix
+    and applies escalating penalties. Also penalizes individual tokens
+    that exceed max_repeats in a window.
+    """
+
+    def __init__(
+        self,
+        window: int = 8,
+        max_repeats: int = 2,
+        bias: float = -20.0,
+        max_period: int = 16,
+        cycle_bias: float = -50.0,
+    ) -> None:
+        self.window = window
+        self.max_repeats = max_repeats
+        self.bias = bias
+        self.max_period = max_period
+        self.cycle_bias = cycle_bias
+
+    def pre_forward(
+        self,
+        position: int,
+        valid_mask: mx.array,
+        token_history: list[int],
+        logits: mx.array,
+    ) -> ModelIntervention:
+        from tgirl.sample import _detect_cycle
+
+        penalized: dict[int, float] = {}
+
+        # 1. Window-based: penalize tokens exceeding max_repeats
+        recent = token_history[-self.window:]
+        counts: dict[int, int] = {}
+        for tid in recent:
+            counts[tid] = counts.get(tid, 0) + 1
+        for tid, count in counts.items():
+            if count > self.max_repeats:
+                penalized[tid] = self.bias * (count - self.max_repeats)
+
+        # 2. Cycle detection: penalize all tokens in a detected cycle
+        cycle_len = _detect_cycle(token_history, self.max_period)
+        if cycle_len is not None and self.cycle_bias != 0.0:
+            cycle_tokens = set(token_history[-cycle_len:])
+            for tid in cycle_tokens:
+                existing = penalized.get(tid, 0.0)
+                penalized[tid] = existing + self.cycle_bias
+
+        if not penalized:
+            return ModelIntervention()
+        return ModelIntervention(logit_bias=penalized)
 
 
 class GrammarTemperatureHookMlx:
@@ -195,12 +375,22 @@ def run_constrained_generation_mlx(
     transport_config: TransportConfig,
     max_tokens: int = 512,
     context_tokens: list[int] | None = None,
+    confidence_monitor: object | None = None,
+    grammar_guide_factory: Callable | None = None,
+    grammar_text: str | None = None,
+    stop_token_ids: list[int] | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
     Fully MLX-native loop. Zero torch, zero numpy in computation.
     Only Python scalar extraction: int() on token ID.
+
+    If confidence_monitor is provided, tracks log probs and checkpoints
+    at high-freedom positions. When confidence drops below threshold,
+    returns early with backtrack_requested=True and the checkpoint.
     """
+    from tgirl.state_machine import BacktrackEvent, Checkpoint
+
     start_time = time.monotonic()
     tokens: list[int] = []
     token_history = list(context_tokens) if context_tokens else []
@@ -211,8 +401,18 @@ def run_constrained_generation_mlx(
     token_log_probs: list[float] = []
     ot_computation_total_ms = 0.0
     ot_bypassed_count = 0
+    ot_bypass_reasons: list[str | None] = []
+    ot_iterations: list[int] = []
+    backtrack_events: list[BacktrackEvent] = []
 
     vocab_size = embeddings.shape[0]
+    last_checkpoint: Checkpoint | None = None
+    backtrack_requested = False
+
+    # Reset stateful hooks for this generation pass
+    for hook in hooks:
+        if hasattr(hook, "reset"):
+            hook.reset()
 
     # Detect grammar state type once
     has_mlx_mask = hasattr(grammar_state, "get_valid_mask_mx")
@@ -231,9 +431,40 @@ def run_constrained_generation_mlx(
             # Fallback for torch-based grammar states
             valid_mask_torch = grammar_state.get_valid_mask(vocab_size)
             valid_mask = mx.array(valid_mask_torch.numpy())
+
+        # Mask out stop tokens while grammar is not yet accepting —
+        # prevents premature EOS. Once the grammar accepts (complete
+        # expression), stop tokens are allowed so the model can terminate.
+        if stop_token_ids and not grammar_state.is_accepting():
+            stop_mask = mx.ones(valid_mask.shape, dtype=mx.bool_)
+            indices = mx.array(stop_token_ids)
+            stop_mask[indices] = False
+            valid_mask = valid_mask & stop_mask
+
         valid_count = int(mx.sum(valid_mask).item())
         grammar_valid_counts.append(valid_count)
         _t2 = time.monotonic()
+
+        # Dead end: no valid token can continue the parse — abort
+        if valid_count == 0:
+            logger.warning("grammar_dead_end", position=position)
+            break
+
+        # Checkpoint if monitor says so
+        if (
+            confidence_monitor is not None
+            and grammar_text is not None
+            and confidence_monitor.should_checkpoint(valid_count)
+        ):
+            last_checkpoint = Checkpoint(
+                position=position,
+                tokens_so_far=tuple(tokens),
+                context_tokens=tuple(
+                    context_tokens if context_tokens else []
+                ),
+                grammar_text=grammar_text,
+                dead_end_tokens=frozenset(),
+            )
 
         # 3. Hooks — pure MLX, receive mx.array + pre-computed mask
         if hooks:
@@ -258,6 +489,8 @@ def run_constrained_generation_mlx(
         ot_elapsed_ms = (time.monotonic() - ot_start) * 1000
         ot_computation_total_ms += ot_elapsed_ms
         wasserstein_distances.append(ot_result.wasserstein_distance)
+        ot_bypass_reasons.append(ot_result.bypass_reason)
+        ot_iterations.append(ot_result.iterations)
         if ot_result.bypassed:
             ot_bypassed_count += 1
         _t5 = time.monotonic()
@@ -291,6 +524,12 @@ def run_constrained_generation_mlx(
             )
         tokens.append(token_id)
         token_history.append(token_id)
+
+        # Update stateful hooks (e.g., nesting depth tracking)
+        for hook in hooks:
+            if hasattr(hook, "advance"):
+                hook.advance(token_id)
+
         _t7 = time.monotonic()
 
         # Record log prob
@@ -302,6 +541,48 @@ def run_constrained_generation_mlx(
         )
         token_log_probs.append(log_prob)
         _t8 = time.monotonic()
+
+        # Confidence monitoring and backtrack check
+        if confidence_monitor is not None:
+            confidence_monitor.record_log_prob(log_prob)
+            if (
+                confidence_monitor.should_backtrack()
+                and confidence_monitor.backtracks_remaining > 0
+                and last_checkpoint is not None
+            ):
+                # Divergent token is the one chosen at checkpoint
+                cp_pos = last_checkpoint.position
+                divergent_token = (
+                    tokens[cp_pos]
+                    if cp_pos < len(tokens)
+                    else token_id
+                )
+                # Track best-so-far before backtracking
+                mean_lp = (
+                    sum(token_log_probs) / len(token_log_probs)
+                    if token_log_probs
+                    else float("-inf")
+                )
+                last_checkpoint = last_checkpoint.with_attempt(
+                    tokens=tuple(tokens), mean_log_prob=mean_lp
+                )
+                event = BacktrackEvent(
+                    checkpoint_position=cp_pos,
+                    trigger_position=position,
+                    trigger_log_prob=log_prob,
+                    dead_end_tokens_added=frozenset(
+                        {divergent_token}
+                    ),
+                )
+                backtrack_events.append(event)
+                last_checkpoint = (
+                    last_checkpoint.with_added_dead_end(
+                        divergent_token
+                    )
+                )
+                confidence_monitor.record_backtrack()
+                backtrack_requested = True
+                break
 
         # 8. Advance grammar
         grammar_state.advance(token_id)
@@ -340,5 +621,12 @@ def run_constrained_generation_mlx(
         token_log_probs=token_log_probs,
         ot_computation_total_ms=ot_computation_total_ms,
         ot_bypassed_count=ot_bypassed_count,
+        ot_bypass_reasons=ot_bypass_reasons,
+        ot_iterations=ot_iterations,
         grammar_generation_ms=elapsed_ms,
+        backtrack_requested=backtrack_requested,
+        backtrack_checkpoint=(
+            last_checkpoint if backtrack_requested else None
+        ),
+        backtrack_events=backtrack_events,
     )

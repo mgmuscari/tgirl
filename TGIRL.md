@@ -1,6 +1,6 @@
 # tgirl — Technical Requirements Document
 
-**Transformational Grammar for Inference-Restricting Languages**
+**Transformational Generator for Inference-Restricting Languages**
 
 Version 1.0 · March 2026 · Ontologi LLC
 
@@ -583,6 +583,22 @@ Beyond temperature, the grammar state implies adjustments to other sampling para
 
 These are implemented as additional `InferenceHook` instances that can be composed with the temperature scheduler.
 
+### 7.5 Inference Safety Hooks
+
+Three safety hooks prevent degenerate generation. See `docs/design/inference-safety-hooks.md` for full design rationale and implementation details.
+
+**RepetitionPenaltyHook** — Detects degenerate token loops via two mechanisms: (1) window-based counting with escalating bias (`bias * excess_count`), and (2) suffix cycle detection that identifies repeating multi-token patterns (e.g., `(-> (-> (-> ...`) and penalizes all tokens in the cycle.
+
+**NestingDepthHook** — Prevents unclosable s-expressions by tracking paren nesting depth. Pre-computes a paren delta per vocabulary token at init time. When `remaining_tokens <= depth + margin`, penalizes all tokens that would increase nesting depth, forcing the model to close expressions within the token budget.
+
+**Stop token masking** — EOS/stop tokens are masked from the valid token set while the grammar is not in an accepting state. Once the grammar accepts (complete, valid expression), stop tokens are allowed so the model can naturally terminate. Applied directly in the sampling loop, not as a hook.
+
+### 7.6 Grammar Safety Invariants
+
+- **Lowercase rule names**: All generated Lark rule names must be lowercase. Lark treats uppercase names as terminal references; violations cause silent grammar compilation failures in llguidance.
+- **Dead-end abort**: If `valid_count == 0` after grammar masking and stop token masking, the generation loop aborts immediately. This is a safety net — a well-formed grammar should always have at least one valid continuation or be in an accepting state.
+- **Parameter descriptions**: System prompts include parameter descriptions from tool schemas, not just type signatures. This provides semantic context (defaults, expected values, formats) that the grammar cannot express.
+
 ### 8.5 Sampling Loop
 
 The sampling loop handles both freeform and constrained modes:
@@ -604,20 +620,24 @@ for each token position:
 CONSTRAINED MODE:
     1. generate grammar from current registry snapshot
     2. initialize grammar state
+    3. reset stateful hooks (NestingDepthHook, etc.)
     for each token position:
         a. run model forward pass → logits
         b. get valid token mask from grammar state
-        c. call all InferenceHooks → merged ModelIntervention
-        d. apply OT redistribution (tgirl.transport) using valid mask
-        e. apply temperature, top_p, top_k from intervention
-        f. apply repetition/presence/frequency penalties
-        g. sample token
-        h. update grammar state with sampled token
-        i. record telemetry for this position
-        j. if grammar reaches accepting state → compile and execute pipeline
-    3. inject tool results into context
-    4. update quota state
-    5. return to FREEFORM MODE
+        c. mask stop tokens while grammar not accepting
+        d. if valid_count == 0 → abort (grammar dead end)
+        e. call all InferenceHooks → merged ModelIntervention
+        f. apply OT redistribution (tgirl.transport) using valid mask
+        g. apply temperature, top_p, top_k from intervention
+        h. apply logit biases (repetition penalty, nesting depth)
+        i. sample token
+        j. advance stateful hooks (NestingDepthHook.advance)
+        k. update grammar state with sampled token
+        l. record telemetry for this position
+        m. if grammar reaches accepting state → compile and execute pipeline
+    4. inject tool results into context
+    5. update quota state
+    6. return to FREEFORM MODE
 ```
 
 ### 8.6 Telemetry

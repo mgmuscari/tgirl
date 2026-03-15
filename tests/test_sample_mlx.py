@@ -421,3 +421,326 @@ class TestZeroTorchInSampleMlx:
         assert numpy_imports == [], (
             f"sample_mlx.py imports numpy: {numpy_imports}"
         )
+
+
+class TestStopTokenMasking:
+    """Stop tokens masked while grammar is not accepting, allowed when accepting."""
+
+    def test_stop_tokens_masked_while_not_accepting(self) -> None:
+        """Stop tokens are masked when grammar has not yet accepted."""
+        import mlx.core as mx
+        from unittest.mock import MagicMock
+
+        from tgirl.sample_mlx import run_constrained_generation_mlx
+        from tgirl.transport import TransportConfig
+
+        vocab_size = 10
+        stop_token_id = 7
+
+        # Grammar never accepts — stop token must be masked throughout
+        gs = MagicMock()
+        gs.get_valid_mask_mx = MagicMock(
+            return_value=mx.ones((vocab_size,), dtype=mx.bool_)
+        )
+        gs.is_accepting = MagicMock(return_value=False)
+        gs.advance = MagicMock()
+
+        # Forward fn that strongly prefers the stop token
+        def forward_fn(tokens):
+            logits = mx.zeros((vocab_size,))
+            logits = logits.at[stop_token_id].add(100.0)
+            return logits
+
+        def decode(ids):
+            return "".join(str(i) for i in ids)
+
+        embeddings = mx.ones((vocab_size, 4))
+
+        result = run_constrained_generation_mlx(
+            grammar_state=gs,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            hooks=[],
+            transport_config=TransportConfig(bypass_ratio=0.0),
+            max_tokens=5,
+            stop_token_ids=[stop_token_id],
+        )
+        assert stop_token_id not in result.tokens
+
+    def test_stop_tokens_allowed_when_accepting(self) -> None:
+        """Stop tokens are allowed once grammar reaches accepting state."""
+        import mlx.core as mx
+        from unittest.mock import MagicMock
+
+        from tgirl.sample_mlx import run_constrained_generation_mlx
+        from tgirl.transport import TransportConfig
+
+        vocab_size = 10
+        stop_token_id = 7
+
+        # Grammar accepts immediately — stop token should be allowed
+        gs = MagicMock()
+        gs.get_valid_mask_mx = MagicMock(
+            return_value=mx.ones((vocab_size,), dtype=mx.bool_)
+        )
+        gs.is_accepting = MagicMock(return_value=True)
+        gs.advance = MagicMock()
+
+        # Forward fn that strongly prefers the stop token
+        def forward_fn(tokens):
+            logits = mx.zeros((vocab_size,))
+            logits = logits.at[stop_token_id].add(100.0)
+            return logits
+
+        def decode(ids):
+            return "".join(str(i) for i in ids)
+
+        embeddings = mx.ones((vocab_size, 4))
+
+        result = run_constrained_generation_mlx(
+            grammar_state=gs,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            hooks=[],
+            transport_config=TransportConfig(bypass_ratio=0.0),
+            max_tokens=5,
+            stop_token_ids=[stop_token_id],
+        )
+        # Grammar accepts, so stop token is valid — model should sample it
+        assert stop_token_id in result.tokens
+
+
+class TestComputeTransitionSignalMlx:
+    """compute_transition_signal_mlx uses native MLX operations."""
+
+    def test_returns_transition_signal(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import compute_transition_signal_mlx
+        from tgirl.state_machine import TransitionSignal
+
+        logits = mx.array([1.0, 2.0, 3.0, 4.0])
+        mask = mx.array([1.0, 0.0, 1.0, 0.0])
+
+        signal = compute_transition_signal_mlx(
+            token_position=5, logits=logits,
+            grammar_valid_mask=mask, vocab_size=4,
+        )
+        assert isinstance(signal, TransitionSignal)
+        assert signal.token_position == 5
+
+    def test_grammar_mask_overlap(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import compute_transition_signal_mlx
+
+        logits = mx.array([0.0, 0.0, 0.0, 0.0])
+        mask = mx.array([1.0, 1.0, 0.0, 0.0])
+
+        signal = compute_transition_signal_mlx(
+            token_position=0, logits=logits,
+            grammar_valid_mask=mask, vocab_size=4,
+        )
+        assert abs(signal.grammar_mask_overlap - 0.5) < 1e-6
+
+    def test_grammar_freedom(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import compute_transition_signal_mlx
+
+        logits = mx.array([0.0, 0.0, 0.0, 0.0, 0.0])
+        mask = mx.array([1.0, 0.0, 1.0, 0.0, 1.0])
+
+        signal = compute_transition_signal_mlx(
+            token_position=0, logits=logits,
+            grammar_valid_mask=mask, vocab_size=5,
+        )
+        assert abs(signal.grammar_freedom - 0.6) < 1e-6
+
+    def test_token_entropy_nonnegative(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import compute_transition_signal_mlx
+
+        logits = mx.array([1.0, 2.0, 3.0])
+        mask = mx.array([1.0, 1.0, 1.0])
+
+        signal = compute_transition_signal_mlx(
+            token_position=0, logits=logits,
+            grammar_valid_mask=mask, vocab_size=3,
+        )
+        assert signal.token_entropy >= 0
+
+    def test_sampled_token_log_prob(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import compute_transition_signal_mlx
+
+        logits = mx.array([10.0, 0.0, 0.0])
+        mask = mx.array([1.0, 1.0, 1.0])
+
+        signal = compute_transition_signal_mlx(
+            token_position=0, logits=logits,
+            grammar_valid_mask=mask, vocab_size=3,
+            sampled_token_id=0,
+        )
+        assert signal.token_log_prob > -0.1
+
+    def test_no_list_comprehensions_in_source(self) -> None:
+        """Must use mx ops, not Python list comprehensions."""
+        import inspect
+        from tgirl.sample_mlx import compute_transition_signal_mlx
+
+        source = inspect.getsource(compute_transition_signal_mlx)
+        assert "for v in" not in source
+        assert "for p" not in source
+
+
+class TestRepetitionPenaltyHookMlx:
+    """RepetitionPenaltyHookMlx penalizes recently repeated tokens."""
+
+    def test_no_penalty_without_repetition(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import RepetitionPenaltyHookMlx
+
+        hook = RepetitionPenaltyHookMlx(window=4, max_repeats=2)
+
+        intervention = hook.pre_forward(
+            position=3,
+            valid_mask=mx.ones((10,), dtype=mx.bool_),
+            token_history=[1, 2, 3],
+            logits=mx.zeros((10,)),
+        )
+        assert intervention.logit_bias is None
+
+    def test_penalizes_repeated_tokens(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import RepetitionPenaltyHookMlx
+
+        hook = RepetitionPenaltyHookMlx(window=6, max_repeats=2, bias=-50.0, cycle_bias=0.0)
+
+        intervention = hook.pre_forward(
+            position=5,
+            valid_mask=mx.ones((10,), dtype=mx.bool_),
+            token_history=[5, 1, 5, 1, 5, 1],
+            logits=mx.zeros((10,)),
+        )
+        assert intervention.logit_bias is not None
+        assert 5 in intervention.logit_bias
+        assert intervention.logit_bias[5] == -50.0
+
+    def test_penalty_escalates_with_count(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import RepetitionPenaltyHookMlx
+
+        hook = RepetitionPenaltyHookMlx(window=8, max_repeats=2, bias=-20.0)
+
+        intervention = hook.pre_forward(
+            position=7,
+            valid_mask=mx.ones((10,), dtype=mx.bool_),
+            token_history=[5, 5, 5, 5, 5, 1, 2, 3],
+            logits=mx.zeros((10,)),
+        )
+        assert intervention.logit_bias[5] == -60.0
+
+class TestNestingDepthHookMlx:
+    """NestingDepthHookMlx prevents unclosable s-expressions."""
+
+    def test_no_penalty_when_budget_sufficient(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import NestingDepthHookMlx
+
+        # Simple decode: token 7='(', token 8=')', others='x'
+        def decode(ids):
+            m = {7: '(', 8: ')'}
+            return ''.join(m.get(i, 'x') for i in ids)
+
+        hook = NestingDepthHookMlx(
+            max_tokens=128,
+            tokenizer_decode=decode,
+            vocab_size=10,
+        )
+        hook._depth = 2
+        intervention = hook.pre_forward(
+            position=28,
+            valid_mask=mx.ones((10,), dtype=mx.bool_),
+            token_history=[],
+            logits=mx.zeros((10,)),
+        )
+        assert intervention.logit_bias is None
+
+    def test_penalizes_open_when_budget_tight(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import NestingDepthHookMlx
+
+        def decode(ids):
+            m = {7: '(', 8: ')', 9: ' ('}
+            return ''.join(m.get(i, 'x') for i in ids)
+
+        hook = NestingDepthHookMlx(
+            max_tokens=128,
+            tokenizer_decode=decode,
+            vocab_size=10,
+            margin=2,
+        )
+        hook._depth = 5
+        intervention = hook.pre_forward(
+            position=122,  # 6 tokens remaining, need 5 + 2 margin
+            valid_mask=mx.ones((10,), dtype=mx.bool_),
+            token_history=[],
+            logits=mx.zeros((10,)),
+        )
+        assert intervention.logit_bias is not None
+        # Token 7='(' and token 9=' (' should be penalized
+        assert 7 in intervention.logit_bias
+        assert 9 in intervention.logit_bias
+
+    def test_tracks_depth_from_advance(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import NestingDepthHookMlx
+
+        def decode(ids):
+            m = {7: '(', 8: ')'}
+            return ''.join(m.get(i, 'x') for i in ids)
+
+        hook = NestingDepthHookMlx(
+            max_tokens=128,
+            tokenizer_decode=decode,
+            vocab_size=10,
+        )
+        hook.advance(7)   # (
+        hook.advance(7)   # (
+        hook.advance(8)   # )
+        assert hook._depth == 1
+
+
+class TestRepetitionPenaltyHookMlx:
+    """RepetitionPenaltyHookMlx penalizes recently repeated tokens."""
+
+    def test_detects_multi_token_cycle(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import RepetitionPenaltyHookMlx
+
+        hook = RepetitionPenaltyHookMlx(window=8, max_repeats=2, cycle_bias=-50.0)
+
+        history = [7, 397, 318, 397, 318, 397, 318, 397, 318, 397, 318]
+        intervention = hook.pre_forward(
+            position=10,
+            valid_mask=mx.ones((400,), dtype=mx.bool_),
+            token_history=history,
+            logits=mx.zeros((400,)),
+        )
+        assert intervention.logit_bias is not None
+        assert 318 in intervention.logit_bias
+        assert 397 in intervention.logit_bias
+
+    def test_respects_window_size(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import RepetitionPenaltyHookMlx
+
+        hook = RepetitionPenaltyHookMlx(window=3, max_repeats=2, bias=-50.0)
+
+        intervention = hook.pre_forward(
+            position=6,
+            valid_mask=mx.ones((10,), dtype=mx.bool_),
+            token_history=[5, 5, 5, 1, 2, 3],
+            logits=mx.zeros((10,)),
+        )
+        assert intervention.logit_bias is None

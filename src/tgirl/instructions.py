@@ -96,6 +96,11 @@ def generate_tool_doc(tool: ToolDefinition) -> str:
         f"    {tool.description}",
     ]
 
+    for p in tool.parameters:
+        if p.description:
+            default_note = " (optional)" if p.has_default else ""
+            lines.append(f"    - {p.name}: {p.description}{default_note}")
+
     for example in tool.examples:
         lines.append(f"    Example: {example}")
 
@@ -162,12 +167,17 @@ def generate_system_prompt(
 def generate_routing_prompt(snapshot: RegistrySnapshot) -> str:
     """Generate a routing prompt for tool selection.
 
-    Optimized for classification: lists tools with descriptions,
-    instructs the model to output ONLY the tool name.
+    Composition-aware: instructs the model to list tools needed
+    to fulfill the request, most relevant first. If only one tool
+    is needed, list just that one.
     """
     lines = [
         "You are a tool routing assistant. "
-        "Given a user request, pick the best tool.",
+        "Given a user request, list the tools needed to fulfill it, "
+        "most relevant first.",
+        "If multiple tools could be composed together to answer "
+        "the request, list all of them.",
+        "If only one tool is needed, list just that one.",
         "",
         "Available tools:",
     ]
@@ -175,5 +185,5 @@ def generate_routing_prompt(snapshot: RegistrySnapshot) -> str:
         params = ", ".join(p.name for p in tool.parameters)
         lines.append(f"- {tool.name}({params}): {tool.description}")
     lines.append("")
-    lines.append("Reply with ONLY the tool name, nothing else.")
+    lines.append("Reply with ONLY tool names separated by spaces, nothing else.")
     return "\n".join(lines)
