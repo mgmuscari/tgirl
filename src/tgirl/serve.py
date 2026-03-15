@@ -1,0 +1,589 @@
+"""FastAPI local inference server for tgirl.
+
+Provides a REST API for grammar-constrained inference with registered
+tools. Supports both MLX and torch backends with automatic detection.
+
+Optional dependency: requires ``fastapi`` and either ``mlx-lm`` or
+``transformers`` depending on the chosen backend.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from typing import Any, Literal
+
+import structlog
+
+from tgirl.format import ChatTemplateFormatter
+from tgirl.registry import ToolRegistry
+from tgirl.types import PromptFormatter, SessionConfig
+
+try:
+    from fastapi import WebSocket as _FastAPIWebSocket  # noqa: F401
+except ImportError:
+    _FastAPIWebSocket = None  # type: ignore[assignment,misc]
+
+logger = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class InferenceContext:
+    """Everything needed to create SamplingSession instances.
+
+    Constructed once at startup via load_inference_context, then
+    shared across all requests. Each request creates a new
+    SamplingSession from this context.
+    """
+
+    registry: ToolRegistry
+    forward_fn: Callable[[list[int]], Any]
+    tokenizer_decode: Callable[[list[int]], str]
+    tokenizer_encode: Callable[[str], list[int]]
+    embeddings: Any
+    grammar_guide_factory: Callable[[str], Any]
+    mlx_grammar_guide_factory: Callable | None
+    formatter: PromptFormatter
+    backend: Literal["torch", "mlx"]
+    model_id: str
+    stop_token_ids: list[int]
+
+
+# --- Backend detection helpers ---
+
+
+def _try_import_mlx() -> bool:
+    """Check if mlx-lm is available."""
+    try:
+        import mlx_lm  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _try_import_torch() -> bool:
+    """Check if transformers is available."""
+    try:
+        import transformers  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+# --- Backend-specific loaders (extracted for mockability) ---
+
+
+def _load_mlx_model(model_id: str) -> tuple[Any, Any]:
+    """Load model and tokenizer via mlx-lm."""
+    import mlx_lm
+
+    model, tokenizer = mlx_lm.load(model_id)
+    return model, tokenizer
+
+
+def _make_mlx_forward(model: Any) -> Callable[[list[int]], Any]:
+    """Create cached forward function for MLX model."""
+    from tgirl.cache import make_mlx_forward_fn
+
+    return make_mlx_forward_fn(model)
+
+
+def _make_mlx_grammar_factory(tokenizer: Any) -> Callable:
+    """Create MLX grammar guide factory."""
+    from tgirl.outlines_adapter import make_outlines_grammar_factory_mlx
+
+    return make_outlines_grammar_factory_mlx(tokenizer)
+
+
+def _load_torch_model(model_id: str) -> tuple[Any, Any]:
+    """Load model and tokenizer via HuggingFace transformers."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id)
+    return model, tokenizer
+
+
+def _make_torch_forward(model: Any) -> Callable[[list[int]], Any]:
+    """Create cached forward function for HF model."""
+    from tgirl.cache import make_hf_forward_fn
+
+    return make_hf_forward_fn(model)
+
+
+def _make_torch_grammar_factory(tokenizer: Any) -> Callable:
+    """Create torch grammar guide factory."""
+    from tgirl.outlines_adapter import make_outlines_grammar_factory
+
+    return make_outlines_grammar_factory(tokenizer)
+
+
+# --- Main loader ---
+
+
+def load_inference_context(
+    model_id: str,
+    backend: str = "auto",
+) -> InferenceContext:
+    """Load model and construct all SamplingSession dependencies.
+
+    Backend detection:
+    - "auto": try MLX first (Apple Silicon), fall back to torch
+    - "mlx": require mlx-lm, fail if unavailable
+    - "torch": require transformers, fail if unavailable
+
+    Args:
+        model_id: HuggingFace model ID or local path.
+        backend: Backend to use ("auto", "mlx", "torch").
+
+    Returns:
+        InferenceContext ready for creating SamplingSession instances.
+    """
+    resolved_backend = _resolve_backend(backend)
+
+    if resolved_backend == "mlx":
+        return _build_mlx_context(model_id)
+    return _build_torch_context(model_id)
+
+
+def _resolve_backend(backend: str) -> Literal["mlx", "torch"]:
+    """Resolve backend string to concrete backend."""
+    if backend == "mlx":
+        if not _try_import_mlx():
+            msg = (
+                "mlx-lm is required for MLX backend. "
+                "Install with: pip install mlx-lm"
+            )
+            raise ImportError(msg)
+        return "mlx"
+
+    if backend == "torch":
+        if not _try_import_torch():
+            msg = (
+                "transformers is required for torch backend. "
+                "Install with: pip install transformers torch"
+            )
+            raise ImportError(msg)
+        return "torch"
+
+    # auto: prefer MLX
+    if _try_import_mlx():
+        return "mlx"
+    if _try_import_torch():
+        return "torch"
+
+    msg = (
+        "No inference backend available. "
+        "Install mlx-lm (Apple Silicon) or transformers + torch."
+    )
+    raise ImportError(msg)
+
+
+def _build_mlx_context(model_id: str) -> InferenceContext:
+    """Build InferenceContext for MLX backend."""
+    import mlx.core as mx
+
+    model, mlx_tokenizer = _load_mlx_model(model_id)
+    # mlx_lm wraps the HF tokenizer — extract the fast tokenizer
+    # for llguidance compatibility (requires fast tokenizer)
+    hf_tokenizer = mlx_tokenizer._tokenizer
+
+    forward_fn = _make_mlx_forward(model)
+    grammar_factory = _make_mlx_grammar_factory(hf_tokenizer)
+    embeddings = model.language_model.model.embed_tokens.weight.astype(
+        mx.float32
+    )
+    mx.eval(embeddings)
+
+    stop_ids: list[int] = []
+    if hf_tokenizer.eos_token_id is not None:
+        stop_ids.append(hf_tokenizer.eos_token_id)
+    for token_str in ["<|im_end|>", "<|endoftext|>"]:
+        ids = hf_tokenizer.encode(token_str, add_special_tokens=False)
+        if len(ids) == 1 and ids[0] not in stop_ids:
+            stop_ids.append(ids[0])
+
+    logger.info(
+        "mlx_model_loaded",
+        model_id=model_id,
+        vocab_size=embeddings.shape[0],
+    )
+
+    return InferenceContext(
+        registry=ToolRegistry(),
+        forward_fn=forward_fn,
+        tokenizer_decode=hf_tokenizer.decode,
+        tokenizer_encode=hf_tokenizer.encode,
+        embeddings=embeddings,
+        grammar_guide_factory=grammar_factory,
+        mlx_grammar_guide_factory=grammar_factory,
+        formatter=ChatTemplateFormatter(hf_tokenizer),
+        backend="mlx",
+        model_id=model_id,
+        stop_token_ids=stop_ids,
+    )
+
+
+def _build_torch_context(model_id: str) -> InferenceContext:
+    """Build InferenceContext for torch/HF backend."""
+    model, tokenizer = _load_torch_model(model_id)
+    forward_fn = _make_torch_forward(model)
+    grammar_factory = _make_torch_grammar_factory(tokenizer)
+    embeddings = model.get_input_embeddings().weight
+
+    eos = tokenizer.eos_token_id
+    stop_ids = [eos] if isinstance(eos, int) else list(eos)
+
+    logger.info(
+        "torch_model_loaded",
+        model_id=model_id,
+        vocab_size=len(tokenizer),
+    )
+
+    return InferenceContext(
+        registry=ToolRegistry(),
+        forward_fn=forward_fn,
+        tokenizer_decode=tokenizer.decode,
+        tokenizer_encode=tokenizer.encode,
+        embeddings=embeddings,
+        grammar_guide_factory=grammar_factory,
+        mlx_grammar_guide_factory=None,
+        formatter=ChatTemplateFormatter(tokenizer),
+        backend="torch",
+        model_id=model_id,
+        stop_token_ids=stop_ids,
+    )
+
+
+# --- FastAPI request/response models ---
+
+try:
+    from pydantic import BaseModel as _PydanticBase
+
+    class GenerateRequest(_PydanticBase):
+        """Request body for /generate endpoint."""
+
+        intent: str
+        scopes: list[str] | None = None
+        max_cost: float | None = None
+        restrict_tools: list[str] | None = None
+        ot_epsilon: float | None = None
+        base_temperature: float | None = None
+
+    class ToolCallResponse(_PydanticBase):
+        """Single tool call in a generate response."""
+
+        pipeline: str
+        result: Any | None = None
+        error: str | None = None
+        cycle_number: int = 0
+        tool_invocations: dict[str, int] = {}
+
+    class GenerateResponse(_PydanticBase):
+        """Response body for /generate endpoint."""
+
+        output: str
+        tool_calls: list[ToolCallResponse]
+        total_tokens: int
+        total_cycles: int
+        wall_time_ms: float
+        quotas_consumed: dict[str, int]
+        error: str | None = None
+
+    class GrammarPreviewRequest(_PydanticBase):
+        """Request body for /grammar/preview endpoint."""
+
+        scopes: list[str] | None = None
+        restrict_tools: list[str] | None = None
+
+except ImportError:
+    pass  # pydantic not available (shouldn't happen — it's a core dep)
+
+
+# --- FastAPI server ---
+
+
+def _run_session_chat(
+    ctx: InferenceContext,
+    messages: list[dict[str, str]],
+    session_config: SessionConfig | None = None,
+    transport_config: Any = None,
+    hooks: list[Any] | None = None,
+) -> Any:
+    """Create a SamplingSession and run chat. Extracted for mockability."""
+    from tgirl.sample import SamplingSession
+
+    session = SamplingSession(
+        registry=ctx.registry,
+        forward_fn=ctx.forward_fn,
+        tokenizer_decode=ctx.tokenizer_decode,
+        tokenizer_encode=ctx.tokenizer_encode,
+        embeddings=ctx.embeddings,
+        grammar_guide_factory=ctx.grammar_guide_factory,
+        mlx_grammar_guide_factory=ctx.mlx_grammar_guide_factory,
+        formatter=ctx.formatter,
+        backend=ctx.backend,
+        config=session_config,
+        transport_config=transport_config,
+        hooks=hooks,
+        stop_token_ids=ctx.stop_token_ids,
+    )
+    return session.run_chat(messages)
+
+
+def _filter_registry(
+    registry: ToolRegistry,
+    *,
+    restrict_tools: list[str] | None = None,
+    scopes: list[str] | None = None,
+) -> ToolRegistry:
+    """Create a new ToolRegistry containing only the requested tools.
+
+    Uses the snapshot filtering mechanism to determine which tools pass,
+    then copies matching tool definitions and callables into a new registry.
+    """
+    snapshot = registry.snapshot(
+        restrict_to=restrict_tools,
+        scopes=set(scopes) if scopes else None,
+    )
+    filtered = ToolRegistry()
+    for tool_def in snapshot.tools:
+        # Copy the tool definition and callable into the new registry
+        callable_fn = registry.get_callable(tool_def.name)
+        filtered._tools[tool_def.name] = tool_def
+        filtered._callables[tool_def.name] = callable_fn
+    return filtered
+
+
+def create_app(
+    ctx: InferenceContext,
+    session_config: SessionConfig | None = None,
+    transport_config: Any = None,
+    hooks: list[Any] | None = None,
+) -> Any:
+    """Create FastAPI app from a pre-loaded InferenceContext.
+
+    Each /generate request creates a new SamplingSession from
+    the shared InferenceContext.
+
+    Args:
+        ctx: Pre-loaded InferenceContext with model and dependencies.
+        session_config: Optional session configuration override.
+        transport_config: Optional transport configuration override.
+        hooks: Optional inference hooks.
+
+    Returns:
+        A FastAPI application instance.
+    """
+    from fastapi import FastAPI
+
+    app = FastAPI(title="tgirl")
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        return {
+            "model": ctx.model_id,
+            "tools": len(ctx.registry),
+            "backend": ctx.backend,
+            "status": "ok",
+        }
+
+    @app.post("/generate")
+    async def generate(request: GenerateRequest) -> GenerateResponse:
+        messages = [{"role": "user", "content": request.intent}]
+        try:
+            # Build per-request overrides from GenerateRequest params
+            req_ctx = ctx
+            req_session_config = session_config
+            req_transport_config = transport_config
+            req_hooks = hooks
+
+            # Filter registry by restrict_tools and/or scopes
+            if request.restrict_tools is not None or request.scopes is not None:
+                filtered_registry = _filter_registry(
+                    ctx.registry,
+                    restrict_tools=request.restrict_tools,
+                    scopes=request.scopes,
+                )
+                req_ctx = replace(ctx, registry=filtered_registry)
+
+            # Override transport epsilon
+            if request.ot_epsilon is not None:
+                from tgirl.transport import TransportConfig
+
+                if transport_config is not None:
+                    req_transport_config = transport_config.model_copy(
+                        update={"epsilon": request.ot_epsilon}
+                    )
+                else:
+                    req_transport_config = TransportConfig(epsilon=request.ot_epsilon)
+
+            # Override base temperature via hook
+            if request.base_temperature is not None:
+                from tgirl.sample import GrammarTemperatureHook
+
+                temp_hook = GrammarTemperatureHook(
+                    base_temperature=request.base_temperature
+                )
+                # Replace any existing GrammarTemperatureHook, keep others
+                base_hooks = [
+                    h
+                    for h in (hooks or [])
+                    if not isinstance(h, GrammarTemperatureHook)
+                ]
+                req_hooks = base_hooks + [temp_hook]
+
+            # Override session cost budget
+            if request.max_cost is not None:
+                if session_config is not None:
+                    req_session_config = session_config.model_copy(
+                        update={"session_cost_budget": request.max_cost}
+                    )
+                else:
+                    req_session_config = SessionConfig(
+                        session_cost_budget=request.max_cost
+                    )
+
+            result = await asyncio.to_thread(
+                _run_session_chat,
+                req_ctx,
+                messages,
+                req_session_config,
+                req_transport_config,
+                req_hooks,
+            )
+            tool_call_responses = [
+                ToolCallResponse(
+                    pipeline=tc.pipeline,
+                    result=tc.result,
+                    error=(
+                        tc.error.message if tc.error else None
+                    ),
+                    cycle_number=tc.cycle_number,
+                    tool_invocations=tc.tool_invocations,
+                )
+                for tc in result.tool_calls
+            ]
+            return GenerateResponse(
+                output=result.output_text,
+                tool_calls=tool_call_responses,
+                total_tokens=result.total_tokens,
+                total_cycles=result.total_cycles,
+                wall_time_ms=result.wall_time_ms,
+                quotas_consumed=result.quotas_consumed,
+            )
+        except Exception as e:
+            logger.error("generate_error", error=str(e))
+            return GenerateResponse(
+                output="",
+                tool_calls=[],
+                total_tokens=0,
+                total_cycles=0,
+                wall_time_ms=0.0,
+                quotas_consumed={},
+                error=str(e),
+            )
+
+    # In-memory telemetry buffer
+    telemetry_buffer: list[dict[str, Any]] = []
+
+    @app.get("/tools")
+    async def list_tools() -> list[dict[str, Any]]:
+        snapshot = ctx.registry.snapshot()
+        return [
+            {
+                "name": td.name,
+                "description": td.description,
+                "parameters": [
+                    {
+                        "name": p.name,
+                        "type": p.type_repr.model_dump(),
+                        "required": not p.has_default,
+                    }
+                    for p in td.parameters
+                ],
+                "quota": td.quota,
+                "scope": td.scope,
+            }
+            for td in snapshot.tools
+        ]
+
+    @app.get("/grammar")
+    async def get_grammar() -> dict[str, Any]:
+        from tgirl.grammar import generate as generate_grammar
+
+        snapshot = ctx.registry.snapshot()
+        output = generate_grammar(snapshot)
+        return {"text": output.text, "hash": output.snapshot_hash}
+
+    @app.post("/grammar/preview")
+    async def preview_grammar(
+        request: GrammarPreviewRequest,
+    ) -> dict[str, Any]:
+        from tgirl.grammar import generate as generate_grammar
+
+        snapshot = ctx.registry.snapshot(
+            scopes=set(request.scopes) if request.scopes else None,
+            restrict_to=request.restrict_tools,
+        )
+        output = generate_grammar(snapshot)
+        return {"text": output.text, "hash": output.snapshot_hash}
+
+    @app.get("/telemetry")
+    async def get_telemetry(limit: int = 100) -> list[dict[str, Any]]:
+        return telemetry_buffer[-limit:]
+
+    @app.websocket("/stream")
+    async def stream(websocket: _FastAPIWebSocket) -> None:
+        await websocket.accept()
+        try:
+            data = await websocket.receive_json()
+            intent = data.get("intent", "")
+            messages = [{"role": "user", "content": intent}]
+
+            try:
+                result = await asyncio.to_thread(
+                    _run_session_chat,
+                    ctx,
+                    messages,
+                    session_config,
+                    transport_config,
+                    hooks,
+                )
+                await websocket.send_json({
+                    "type": "result",
+                    "output": result.output_text,
+                    "tool_calls": [
+                        {
+                            "pipeline": tc.pipeline,
+                            "result": tc.result,
+                            "error": (
+                                tc.error.message
+                                if tc.error
+                                else None
+                            ),
+                            "cycle_number": tc.cycle_number,
+                            "tool_invocations": tc.tool_invocations,
+                        }
+                        for tc in result.tool_calls
+                    ],
+                    "total_tokens": result.total_tokens,
+                    "total_cycles": result.total_cycles,
+                    "wall_time_ms": result.wall_time_ms,
+                    "quotas_consumed": result.quotas_consumed,
+                })
+            except Exception as e:
+                logger.error("stream_error", error=str(e))
+                await websocket.send_json({
+                    "type": "error",
+                    "error": str(e),
+                })
+        except Exception:
+            pass
+        finally:
+            await websocket.close()
+
+    return app

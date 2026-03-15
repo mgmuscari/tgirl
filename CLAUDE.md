@@ -168,6 +168,10 @@ Five defined stances with distinct optimization targets:
 - Never weaken or delete tests to get green — fix the implementation instead
 - If stuck (3+ failed attempts on same task), stop and flag for human review
 - After any developer correction, update CLAUDE.md Known Gotchas via `/update-claude-md`
+- **No cross-framework conversions.** If a function needs both MLX and torch, implement two variants with matching interfaces. Never `mx.array(tensor.numpy())` or `torch.from_numpy(np.array(mx_array))` in any code path. Each variant uses only its own framework's native operations.
+- **No Python-fu on tensor data.** No list comprehensions, no `for v in tensor`, no `sum(list)` when the data came from a tensor. Use the framework's native ops (`mx.sum`, `torch.softmax`, etc.). If you must convert to Python, use `.tolist()`, never element-wise iteration.
+- **No "fix later" shims.** If a task requires functionality that doesn't exist yet (e.g., a missing registry method, a missing type mapping), implement it as part of the task. Never stub it, never label it "out of scope," never implement a workaround. The shim becomes load-bearing debt.
+- **Performance-aware implementation.** Any function that runs per-token or touches tensors with vocab-sized dimensions must be profiled mentally: if it iterates over 248k elements in Python, it's wrong. Use native framework ops.
 
 ## Methodology Enforcement Hooks
 
@@ -190,5 +194,7 @@ Three hooks in `.claude/hooks/` enforce the methodology:
 2026-03-09: Claude Code `model: inherit` doesn't resolve properly for agent spawns (bug #32368) → Use `model: opus` explicitly in all agent definitions and team spawn calls
 
 2026-03-09: `~/.claude/teams/` directory detection is unreliable for checking active teams → `block-solo-implementation.sh` uses tier + branch + file path checks instead
+
+2026-03-14: Spawned team agents don't get `PUSH_HANDS_TEAM_AGENT=1` env var (they're not launched through `claude-teammate-wrapper.sh`) → `block-solo-implementation.sh` now also checks for `~/.claude/teams/execute-{slug}/config.json` to detect active execute teams
 
 2026-03-14: **All tensor/matrix math must use the accelerated library for the context (MLX or PyTorch). Never use Python list comprehensions on tensor data.** `[float(v) for v in mx_array]` on 248k elements takes 8.3 seconds; `mx_array.tolist()` takes 6ms — a 1,400x difference. Conversion between linalg libraries (e.g., mx→torch, torch→numpy) must be avoided unless there is absolutely no alternative; exhaust the library's own API and documentation before resorting to cross-library conversion.

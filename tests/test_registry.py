@@ -11,6 +11,7 @@ from tgirl.types import (
     DictType,
     ListType,
     LiteralType,
+    ModelType,
     PrimitiveType,
     RegistrySnapshot,
     ToolDefinition,
@@ -556,3 +557,204 @@ class TestRegisterFromSchema:
         assert td.parameters[0].type_repr == ListType(
             element=AnyType()
         )
+
+    def test_register_from_schema_with_quota(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Register with quota: snapshot includes quota in quotas dict."""
+        schema_params = {
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        registry.register_from_schema(
+            name="quota_tool",
+            parameters=schema_params,
+            description="",
+            quota=5,
+        )
+        td = registry.get("quota_tool")
+        assert td.quota == 5
+        snap = registry.snapshot()
+        assert snap.quotas["quota_tool"] == 5
+
+    def test_register_from_schema_with_scope(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Register with scope: snapshot(scopes=...) filtering works."""
+        schema_params = {
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        registry.register_from_schema(
+            name="scoped_tool",
+            parameters=schema_params,
+            description="",
+            scope="admin",
+        )
+        # Included with matching scope
+        snap = registry.snapshot(scopes={"admin"})
+        assert len(snap.tools) == 1
+        # Excluded with non-matching scope
+        snap = registry.snapshot(scopes={"user"})
+        assert len(snap.tools) == 0
+
+    def test_register_from_schema_with_callable_fn(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Register with callable_fn: get_callable returns it, not no-op."""
+        def my_impl(**kwargs: object) -> str:
+            return "real"
+
+        schema_params = {
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        registry.register_from_schema(
+            name="callable_tool",
+            parameters=schema_params,
+            description="",
+            callable_fn=my_impl,
+        )
+        assert registry.get_callable("callable_tool") is my_impl
+        assert registry.get_callable("callable_tool")(x=1) == "real"
+
+    def test_register_from_schema_without_new_params(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Without new params: behavior identical to current."""
+        schema_params = {
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        registry.register_from_schema(
+            name="default_tool",
+            parameters=schema_params,
+            description="",
+        )
+        td = registry.get("default_tool")
+        assert td.quota is None
+        assert td.scope is None
+        assert td.cost == 0.0
+        assert td.timeout is None
+        # Default callable is a no-op
+        result = registry.get_callable("default_tool")(x=1)
+        assert result is None
+
+    def test_register_from_schema_with_cost_and_timeout(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Register with cost and timeout."""
+        schema_params = {
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        registry.register_from_schema(
+            name="cost_tool",
+            parameters=schema_params,
+            description="",
+            cost=1.5,
+            timeout=30.0,
+        )
+        td = registry.get("cost_tool")
+        assert td.cost == 1.5
+        assert td.timeout == 30.0
+
+    def test_schema_type_to_repr_object_with_properties(
+        self, registry: ToolRegistry
+    ) -> None:
+        """JSON Schema 'object' with properties maps to ModelType."""
+        schema_params = {
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["name"],
+                },
+            },
+            "required": ["config"],
+        }
+        registry.register_from_schema(
+            name="obj_tool", parameters=schema_params, description=""
+        )
+        td = registry.get("obj_tool")
+        type_repr = td.parameters[0].type_repr
+        assert isinstance(type_repr, ModelType)
+        assert len(type_repr.fields) == 2
+        # Check field names and types
+        field_map = {f.name: f for f in type_repr.fields}
+        assert field_map["name"].type_repr == PrimitiveType(kind="str")
+        assert field_map["name"].required is True
+        assert field_map["count"].type_repr == PrimitiveType(kind="int")
+        assert field_map["count"].required is False
+
+    def test_schema_type_to_repr_nested_object(
+        self, registry: ToolRegistry
+    ) -> None:
+        """Nested object properties recurse correctly."""
+        schema_params = {
+            "properties": {
+                "outer": {
+                    "type": "object",
+                    "properties": {
+                        "inner": {
+                            "type": "object",
+                            "properties": {
+                                "value": {"type": "boolean"},
+                            },
+                            "required": ["value"],
+                        },
+                    },
+                    "required": ["inner"],
+                },
+            },
+            "required": ["outer"],
+        }
+        registry.register_from_schema(
+            name="nested_tool", parameters=schema_params, description=""
+        )
+        td = registry.get("nested_tool")
+        outer = td.parameters[0].type_repr
+        assert isinstance(outer, ModelType)
+        inner_field = outer.fields[0]
+        assert inner_field.name == "inner"
+        assert isinstance(inner_field.type_repr, ModelType)
+        value_field = inner_field.type_repr.fields[0]
+        assert value_field.name == "value"
+        assert value_field.type_repr == PrimitiveType(kind="bool")
+
+    def test_schema_type_to_repr_object_without_properties(
+        self, registry: ToolRegistry
+    ) -> None:
+        """JSON Schema 'object' without properties maps to DictType."""
+        schema_params = {
+            "properties": {
+                "data": {"type": "object"},
+            },
+            "required": ["data"],
+        }
+        registry.register_from_schema(
+            name="dict_obj_tool", parameters=schema_params, description=""
+        )
+        td = registry.get("dict_obj_tool")
+        assert td.parameters[0].type_repr == DictType(
+            key=PrimitiveType(kind="str"), value=AnyType()
+        )
+
+    def test_schema_type_to_repr_null(
+        self, registry: ToolRegistry
+    ) -> None:
+        """JSON Schema 'null' maps to PrimitiveType(kind='none')."""
+        schema_params = {
+            "properties": {
+                "nothing": {"type": "null"},
+            },
+            "required": ["nothing"],
+        }
+        registry.register_from_schema(
+            name="null_tool", parameters=schema_params, description=""
+        )
+        td = registry.get("null_tool")
+        assert td.parameters[0].type_repr == PrimitiveType(kind="none")
