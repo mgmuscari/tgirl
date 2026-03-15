@@ -12,8 +12,10 @@ from tgirl._type_extract import extract_parameters
 from tgirl.types import (
     AnyType,
     DictType,
+    FieldDef,
     ListType,
     LiteralType,
+    ModelType,
     ParameterDef,
     PrimitiveType,
     RegistrySnapshot,
@@ -50,10 +52,32 @@ def _schema_type_to_repr(prop_schema: dict[str, Any]) -> TypeRepr:
             return ListType(element=_schema_type_to_repr(items))
         return ListType(element=AnyType())
 
+    if schema_type == "object":
+        properties = prop_schema.get("properties")
+        if properties:
+            required_names = set(prop_schema.get("required", []))
+            fields = tuple(
+                FieldDef(
+                    name=fname,
+                    type_repr=_schema_type_to_repr(fschema),
+                    required=fname in required_names,
+                    default=fschema.get("default"),
+                )
+                for fname, fschema in properties.items()
+            )
+            name_hash = "_".join(sorted(properties.keys()))[:32]
+            return ModelType(name=f"Object_{name_hash}", fields=fields)
+        return DictType(
+            key=PrimitiveType(kind="str"), value=AnyType()
+        )
+
     if schema_type == "dict":
         return DictType(
             key=PrimitiveType(kind="str"), value=AnyType()
         )
+
+    if schema_type == "null":
+        return PrimitiveType(kind="none")
 
     if schema_type == "tuple":
         return ListType(element=AnyType())
@@ -154,6 +178,11 @@ class ToolRegistry:
         description: str = "",
         *,
         return_type: TypeRepr | None = None,
+        quota: int | None = None,
+        cost: float = 0.0,
+        scope: str | None = None,
+        timeout: float | None = None,
+        callable_fn: Callable[..., Any] | None = None,
     ) -> None:
         """Register a tool from a JSON schema definition.
 
@@ -162,6 +191,11 @@ class ToolRegistry:
             parameters: JSON schema object with 'properties' and 'required'.
             description: Human-readable description.
             return_type: Return type. Defaults to AnyType.
+            quota: Maximum number of calls per pipeline, or None.
+            cost: Cost per invocation.
+            scope: Authorization scope, or None for unrestricted.
+            timeout: Execution timeout in seconds, or None.
+            callable_fn: Execution callable. Defaults to no-op.
 
         Raises:
             ValueError: If a tool with the same name is already registered.
@@ -198,16 +232,24 @@ class ToolRegistry:
             name=name,
             parameters=params,
             return_type=return_type or AnyType(),
+            quota=quota,
+            cost=cost,
+            scope=scope,
+            timeout=timeout,
             description=description,
         )
 
         self._tools[name] = tool_def
-        self._callables[name] = lambda **kwargs: None
+        self._callables[name] = (
+            callable_fn if callable_fn is not None else lambda **kwargs: None
+        )
 
         logger.debug(
             "tool_registered_from_schema",
             name=name,
             params=len(params),
+            quota=quota,
+            scope=scope,
         )
 
     def snapshot(
