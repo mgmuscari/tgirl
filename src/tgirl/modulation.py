@@ -348,9 +348,7 @@ class ModMatrixHookMlx:
                 + float(modulations[2].item()),
             ),
         )
-        # epsilon computed but stored as instance attr for Task 5
-        # (transport_epsilon field on ModelIntervention)
-        self._last_epsilon = max(
+        epsilon = max(
             cfg.epsilon_range[0],
             min(
                 cfg.epsilon_range[1],
@@ -393,6 +391,7 @@ class ModMatrixHookMlx:
             temperature=temperature,
             top_p=top_p,
             logit_bias=logit_bias if logit_bias else None,
+            transport_epsilon=epsilon,
             presence_penalty=(
                 presence if presence != 0.0 else None
             ),
@@ -553,7 +552,7 @@ class ModMatrixHook:
                 + float(modulations[2].item()),
             ),
         )
-        self._last_epsilon = max(
+        epsilon = max(
             cfg.epsilon_range[0],
             min(
                 cfg.epsilon_range[1],
@@ -596,6 +595,7 @@ class ModMatrixHook:
             temperature=temperature,
             top_p=top_p,
             logit_bias=logit_bias if logit_bias else None,
+            transport_epsilon=epsilon,
             presence_penalty=(
                 presence if presence != 0.0 else None
             ),

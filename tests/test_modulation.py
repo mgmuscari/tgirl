@@ -519,3 +519,27 @@ class TestModMatrixHookTorch:
         source = inspect.getsource(ModMatrixHook.pre_forward)
         assert "mx." not in source
         assert "mlx" not in source
+
+
+# === Task 5: transport_epsilon on ModelIntervention ===
+
+
+class TestTransportEpsilon:
+    """Tests for transport_epsilon field on ModelIntervention."""
+
+    def test_model_intervention_accepts_transport_epsilon(self) -> None:
+        mi = ModelIntervention(transport_epsilon=0.05)
+        assert mi.transport_epsilon == 0.05
+
+    def test_transport_epsilon_default_none(self) -> None:
+        mi = ModelIntervention()
+        assert mi.transport_epsilon is None
+
+    def test_mod_matrix_hook_sets_epsilon(self) -> None:
+        """ModMatrixHookMlx sets transport_epsilon in intervention."""
+        hook = _make_hook()
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        result = hook.pre_forward(0, valid_mask, [], logits)
+        assert result.transport_epsilon is not None
+        assert result.transport_epsilon > 0.0

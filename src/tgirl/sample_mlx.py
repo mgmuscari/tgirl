@@ -482,9 +482,22 @@ def run_constrained_generation_mlx(
         _t4 = time.monotonic()
 
         # 5. OT redistribution — pure MLX
+        # Use per-token epsilon if set by a hook
+        if merged.transport_epsilon is not None:
+            token_transport_config = TransportConfig(
+                epsilon=merged.transport_epsilon,
+                max_iterations=transport_config.max_iterations,
+                convergence_threshold=transport_config.convergence_threshold,
+                valid_ratio_threshold=transport_config.valid_ratio_threshold,
+                invalid_mass_threshold=transport_config.invalid_mass_threshold,
+                max_problem_size=transport_config.max_problem_size,
+            )
+        else:
+            token_transport_config = transport_config
+
         ot_start = time.monotonic()
         ot_result = redistribute_logits_mlx(
-            adjusted, valid_mask, embeddings, config=transport_config
+            adjusted, valid_mask, embeddings, config=token_transport_config
         )
         ot_elapsed_ms = (time.monotonic() - ot_start) * 1000
         ot_computation_total_ms += ot_elapsed_ms
