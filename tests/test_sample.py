@@ -1346,3 +1346,215 @@ class TestSamplingSessionBackend:
         result = session.run(prompt_tokens=[1, 2, 3])
         assert result.total_tokens == 5
         assert "a" in result.output_text
+
+
+class TestComputeTransitionSignalTorch:
+    """compute_transition_signal_torch uses native torch operations."""
+
+    def test_returns_transition_signal(self) -> None:
+        import torch
+        from tgirl.sample import compute_transition_signal_torch
+        from tgirl.state_machine import TransitionSignal
+
+        logits = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        mask = torch.tensor([1.0, 0.0, 1.0, 0.0])
+
+        signal = compute_transition_signal_torch(
+            token_position=5, logits=logits,
+            grammar_valid_mask=mask, vocab_size=4,
+        )
+        assert isinstance(signal, TransitionSignal)
+        assert signal.token_position == 5
+
+    def test_grammar_mask_overlap(self) -> None:
+        import torch
+        from tgirl.sample import compute_transition_signal_torch
+
+        logits = torch.tensor([0.0, 0.0, 0.0, 0.0])
+        mask = torch.tensor([1.0, 1.0, 0.0, 0.0])
+
+        signal = compute_transition_signal_torch(
+            token_position=0, logits=logits,
+            grammar_valid_mask=mask, vocab_size=4,
+        )
+        assert abs(signal.grammar_mask_overlap - 0.5) < 1e-6
+
+    def test_grammar_freedom(self) -> None:
+        import torch
+        from tgirl.sample import compute_transition_signal_torch
+
+        logits = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0])
+        mask = torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0])
+
+        signal = compute_transition_signal_torch(
+            token_position=0, logits=logits,
+            grammar_valid_mask=mask, vocab_size=5,
+        )
+        assert abs(signal.grammar_freedom - 0.6) < 1e-6
+
+    def test_token_entropy_nonnegative(self) -> None:
+        import torch
+        from tgirl.sample import compute_transition_signal_torch
+
+        logits = torch.tensor([1.0, 2.0, 3.0])
+        mask = torch.tensor([1.0, 1.0, 1.0])
+
+        signal = compute_transition_signal_torch(
+            token_position=0, logits=logits,
+            grammar_valid_mask=mask, vocab_size=3,
+        )
+        assert signal.token_entropy >= 0
+
+    def test_sampled_token_log_prob(self) -> None:
+        import torch
+        from tgirl.sample import compute_transition_signal_torch
+
+        logits = torch.tensor([10.0, 0.0, 0.0])
+        mask = torch.tensor([1.0, 1.0, 1.0])
+
+        signal = compute_transition_signal_torch(
+            token_position=0, logits=logits,
+            grammar_valid_mask=mask, vocab_size=3,
+            sampled_token_id=0,
+        )
+        assert signal.token_log_prob > -0.1
+
+    def test_no_sampled_token_uses_max(self) -> None:
+        import torch
+        from tgirl.sample import compute_transition_signal_torch
+
+        logits = torch.tensor([10.0, 0.0, 0.0])
+        mask = torch.tensor([1.0, 1.0, 1.0])
+
+        signal = compute_transition_signal_torch(
+            token_position=0, logits=logits,
+            grammar_valid_mask=mask, vocab_size=3,
+        )
+        assert signal.token_log_prob > -0.1
+
+    def test_no_list_comprehensions_in_source(self) -> None:
+        """Must use torch ops, not Python list comprehensions."""
+        import inspect
+        from tgirl.sample import compute_transition_signal_torch
+
+        source = inspect.getsource(compute_transition_signal_torch)
+        assert "for v in" not in source
+        assert "for p" not in source
+
+
+class TestRepetitionPenaltyHook:
+    """RepetitionPenaltyHook penalizes recently repeated tokens."""
+
+    def test_no_penalty_without_repetition(self) -> None:
+        import torch
+        from unittest.mock import MagicMock
+        from tgirl.sample import GrammarState, RepetitionPenaltyHook
+
+        hook = RepetitionPenaltyHook(window=4, max_repeats=2)
+        gs = MagicMock(spec=GrammarState)
+        gs.get_valid_mask.return_value = torch.ones(10, dtype=torch.bool)
+
+        intervention = hook.pre_forward(
+            position=3, grammar_state=gs,
+            token_history=[1, 2, 3], logits=torch.zeros(10),
+        )
+        assert intervention.logit_bias is None
+
+    def test_penalizes_repeated_tokens(self) -> None:
+        import torch
+        from unittest.mock import MagicMock
+        from tgirl.sample import GrammarState, RepetitionPenaltyHook
+
+        hook = RepetitionPenaltyHook(window=6, max_repeats=2, bias=-50.0, cycle_bias=0.0)
+        gs = MagicMock(spec=GrammarState)
+        gs.get_valid_mask.return_value = torch.ones(10, dtype=torch.bool)
+
+        intervention = hook.pre_forward(
+            position=5, grammar_state=gs,
+            token_history=[5, 1, 5, 1, 5, 1], logits=torch.zeros(10),
+        )
+        assert intervention.logit_bias is not None
+        assert 5 in intervention.logit_bias
+        # 3 occurrences, max_repeats=2, excess=1 → bias * 1
+        assert intervention.logit_bias[5] == -50.0
+
+    def test_penalty_escalates_with_count(self) -> None:
+        import torch
+        from unittest.mock import MagicMock
+        from tgirl.sample import GrammarState, RepetitionPenaltyHook
+
+        hook = RepetitionPenaltyHook(window=8, max_repeats=2, bias=-20.0)
+        gs = MagicMock(spec=GrammarState)
+        gs.get_valid_mask.return_value = torch.ones(10, dtype=torch.bool)
+
+        # Token 5 appears 5 times → excess=3 → bias * 3 = -60
+        intervention = hook.pre_forward(
+            position=7, grammar_state=gs,
+            token_history=[5, 5, 5, 5, 5, 1, 2, 3], logits=torch.zeros(10),
+        )
+        assert intervention.logit_bias[5] == -60.0
+
+    def test_detects_multi_token_cycle(self) -> None:
+        import torch
+        from unittest.mock import MagicMock
+        from tgirl.sample import GrammarState, RepetitionPenaltyHook
+
+        hook = RepetitionPenaltyHook(window=8, max_repeats=2, cycle_bias=-50.0)
+        gs = MagicMock(spec=GrammarState)
+        gs.get_valid_mask.return_value = torch.ones(400, dtype=torch.bool)
+
+        # Pattern [7, 397, 318] repeating — simulates (-> (-> (->
+        history = [7, 397, 318, 397, 318, 397, 318, 397, 318, 397, 318]
+        intervention = hook.pre_forward(
+            position=10, grammar_state=gs,
+            token_history=history, logits=torch.zeros(400),
+        )
+        assert intervention.logit_bias is not None
+        # Cycle tokens {318, 397} should be penalized
+        assert 318 in intervention.logit_bias
+        assert 397 in intervention.logit_bias
+
+
+class TestDetectCycle:
+    """Unit tests for _detect_cycle."""
+
+    def test_no_cycle_in_short_sequence(self) -> None:
+        from tgirl.sample import _detect_cycle
+        assert _detect_cycle([1, 2, 3]) is None
+
+    def test_detects_period_1(self) -> None:
+        from tgirl.sample import _detect_cycle
+        assert _detect_cycle([5, 5, 5, 5]) == 1
+
+    def test_detects_period_2(self) -> None:
+        from tgirl.sample import _detect_cycle
+        assert _detect_cycle([1, 2, 1, 2, 1, 2]) == 2
+
+    def test_detects_period_3(self) -> None:
+        from tgirl.sample import _detect_cycle
+        assert _detect_cycle([7, 397, 318, 7, 397, 318]) == 3
+
+    def test_no_cycle_when_not_repeating(self) -> None:
+        from tgirl.sample import _detect_cycle
+        assert _detect_cycle([1, 2, 3, 4, 5, 6]) is None
+
+    def test_respects_max_period(self) -> None:
+        from tgirl.sample import _detect_cycle
+        # Cycle of length 3, but max_period=2
+        assert _detect_cycle([1, 2, 3, 1, 2, 3], max_period=2) is None
+        assert _detect_cycle([1, 2, 3, 1, 2, 3], max_period=3) == 3
+
+    def test_respects_window_size(self) -> None:
+        import torch
+        from unittest.mock import MagicMock
+        from tgirl.sample import GrammarState, RepetitionPenaltyHook
+
+        hook = RepetitionPenaltyHook(window=3, max_repeats=2, bias=-50.0)
+        gs = MagicMock(spec=GrammarState)
+        gs.get_valid_mask.return_value = torch.ones(10, dtype=torch.bool)
+
+        intervention = hook.pre_forward(
+            position=6, grammar_state=gs,
+            token_history=[5, 5, 5, 1, 2, 3], logits=torch.zeros(10),
+        )
+        assert intervention.logit_bias is None
