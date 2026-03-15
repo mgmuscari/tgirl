@@ -41,8 +41,9 @@ MODEL_ID = "mlx-community/Qwen3.5-0.8B-MLX-4bit"
 def main() -> int:
     from tgirl.cache import CacheStats, make_mlx_forward_fn
     from tgirl.format import ChatTemplateFormatter
+    from tgirl.modulation import EnvelopeConfig, ModMatrixHook
     from tgirl.registry import ToolRegistry
-    from tgirl.sample import GrammarTemperatureHook, SamplingSession
+    from tgirl.sample import SamplingSession
     from tgirl.transport import TransportConfig
     from tgirl.types import RerankConfig, SessionConfig
 
@@ -123,7 +124,14 @@ def main() -> int:
         constrained_max_tokens=64,
         session_timeout=30.0,
     )
-    session_hooks = [GrammarTemperatureHook(base_temperature=0.5)]
+    session_hooks = [
+        ModMatrixHook(
+            config=EnvelopeConfig(base_temperature=0.5),
+            tokenizer_decode=hf_tokenizer.decode,
+            vocab_size=embeddings.shape[0],
+            max_tokens=64,
+        ),
+    ]
     transport_config = TransportConfig(bypass_ratio=0.5)
     rerank_config = RerankConfig(max_tokens=16, temperature=0.3, top_k=len(tool_names))
 
