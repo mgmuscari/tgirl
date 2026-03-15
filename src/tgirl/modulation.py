@@ -11,11 +11,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
-import mlx.core as mx
-
-from tgirl.sample import _detect_cycle
 from tgirl.types import ModelIntervention
+
+if TYPE_CHECKING:
+    import mlx.core as mx
+    import torch
 
 
 @dataclass(frozen=True)
@@ -223,6 +225,8 @@ class ModMatrixHookMlx:
         vocab_size: int,
         max_tokens: int = 128,
     ) -> None:
+        import mlx.core as mx
+
         self._config = config
         self._max_tokens = max_tokens
         self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
@@ -264,6 +268,10 @@ class ModMatrixHookMlx:
         logits: mx.array,
     ) -> ModelIntervention:
         """Compute modulated parameters via matrix multiply."""
+        import mlx.core as mx
+
+        from tgirl.sample import _detect_cycle
+
         vocab_size = logits.shape[0]
         cfg = self._config
 
@@ -366,6 +374,209 @@ class ModMatrixHookMlx:
             }
 
         # 8. Repetition bias via logit_bias on repeated tokens
+        if rep_bias < cfg.base_repetition_bias:
+            recent = token_history[-8:]
+            counts: dict[int, int] = {}
+            for tid in recent:
+                counts[tid] = counts.get(tid, 0) + 1
+            for tid, count in counts.items():
+                if count > 2:
+                    bias = rep_bias * (count - 2)
+                    if logit_bias is None:
+                        logit_bias = {}
+                    existing = logit_bias.get(tid, 0.0)
+                    logit_bias[tid] = max(
+                        existing + bias, -100.0
+                    )
+
+        return ModelIntervention(
+            temperature=temperature,
+            top_p=top_p,
+            logit_bias=logit_bias if logit_bias else None,
+            presence_penalty=(
+                presence if presence != 0.0 else None
+            ),
+        )
+
+
+class ModMatrixHook:
+    """Phase-aware modulation matrix for constrained generation (torch).
+
+    Torch variant of ModMatrixHookMlx. Same EnvelopeConfig and
+    EnvelopeState (pure Python), different tensor ops in pre_forward.
+    Conforms to InferenceHook protocol (receives GrammarState).
+    """
+
+    def __init__(
+        self,
+        config: EnvelopeConfig,
+        tokenizer_decode: Callable[[list[int]], str],
+        vocab_size: int,
+        max_tokens: int = 128,
+    ) -> None:
+        import torch as _torch
+
+        self._config = config
+        self._max_tokens = max_tokens
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+
+        # Build mod matrix as torch.Tensor
+        rows, cols = config.matrix_shape
+        self._mod_matrix = _torch.tensor(
+            list(config.matrix_flat),
+            dtype=_torch.float32,
+        ).reshape(rows, cols)
+
+        # Pre-compute per-token paren delta and classify openers
+        self._delta: dict[int, int] = {}
+        self._opener_ids: set[int] = set()
+        for tid in range(vocab_size):
+            text = tokenizer_decode([tid])
+            opens = text.count("(")
+            closes = text.count(")")
+            delta = opens - closes
+            if delta != 0:
+                self._delta[tid] = delta
+            if opens > closes:
+                self._opener_ids.add(tid)
+
+    def reset(self) -> None:
+        """Reset state for new constrained generation pass."""
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+
+    def advance(self, token_id: int) -> None:
+        """Update depth after token sampled."""
+        self._state.depth += self._delta.get(token_id, 0)
+        self._state.depth = max(self._state.depth, 0)
+
+    def pre_forward(
+        self,
+        position: int,
+        grammar_state: Any,
+        token_history: list[int],
+        logits: torch.Tensor,
+    ) -> ModelIntervention:
+        """Compute modulated parameters via torch matmul."""
+        import torch as _torch
+
+        from tgirl.sample import _detect_cycle
+
+        vocab_size = logits.shape[0]
+        cfg = self._config
+
+        # Get valid mask from grammar state
+        valid_mask = grammar_state.get_valid_mask(vocab_size)
+
+        # 1. Source signals (torch ops, scalar extract)
+        freedom = (
+            float(valid_mask.sum().item()) / vocab_size
+        )
+        probs = _torch.softmax(logits, dim=-1)
+        log_probs = _torch.log(
+            _torch.clamp(probs, min=1e-30)
+        )
+        entropy = -float(
+            _torch.sum(probs * log_probs).item()
+        )
+        overlap = float(
+            _torch.sum(
+                probs * valid_mask.float()
+            ).item()
+        )
+        confidence = float(
+            _torch.max(log_probs).item()
+        )
+
+        # 2. Detect phase
+        self._state.advance_phase(freedom, self._state.depth)
+        phase = self._state.phase
+
+        # 3. Cycle detection
+        cycle = (
+            1.0
+            if _detect_cycle(token_history) is not None
+            else 0.0
+        )
+
+        # 4. Build conditioned source vector
+        raw_sources = [
+            freedom,
+            entropy,
+            confidence,
+            overlap,
+            float(self._state.depth),
+            position / self._max_tokens,
+            1.0 if phase == "attack" else 0.0,
+            1.0 if phase == "decay" else 0.0,
+            1.0 if phase == "sustain" else 0.0,
+            1.0 if phase == "release" else 0.0,
+            cycle,
+        ]
+        conditioned = []
+        for i, (raw, scfg) in enumerate(
+            zip(raw_sources, cfg.conditioners, strict=True)
+        ):
+            val = condition_source(
+                raw, scfg, self._state.prev_smoothed[i]
+            )
+            self._state.prev_smoothed[i] = val
+            conditioned.append(val)
+
+        # 5. Matrix multiply (native torch)
+        source_vec = _torch.tensor(
+            conditioned, dtype=_torch.float32
+        )
+        modulations = source_vec @ self._mod_matrix
+
+        # 6. Base values + clamp
+        temperature = max(
+            cfg.temperature_range[0],
+            min(
+                cfg.temperature_range[1],
+                cfg.base_temperature
+                + float(modulations[0].item()),
+            ),
+        )
+        top_p = max(
+            cfg.top_p_range[0],
+            min(
+                cfg.top_p_range[1],
+                cfg.base_top_p
+                + float(modulations[1].item()),
+            ),
+        )
+        rep_bias = max(
+            cfg.repetition_bias_range[0],
+            min(
+                cfg.repetition_bias_range[1],
+                cfg.base_repetition_bias
+                + float(modulations[2].item()),
+            ),
+        )
+        self._last_epsilon = max(
+            cfg.epsilon_range[0],
+            min(
+                cfg.epsilon_range[1],
+                cfg.base_epsilon
+                + float(modulations[3].item()),
+            ),
+        )
+        opener_bias_val = cfg.base_opener_bias + float(
+            modulations[4].item()
+        )
+        presence = cfg.base_presence_penalty + float(
+            modulations[6].item()
+        )
+
+        # 7. Opener penalty
+        logit_bias: dict[int, float] | None = None
+        if opener_bias_val < -1.0:
+            logit_bias = {
+                tid: opener_bias_val
+                for tid in self._opener_ids
+            }
+
+        # 8. Repetition bias
         if rep_bias < cfg.base_repetition_bias:
             recent = token_history[-8:]
             counts: dict[int, int] = {}

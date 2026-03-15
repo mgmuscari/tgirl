@@ -9,12 +9,14 @@ from __future__ import annotations
 import dataclasses
 
 import mlx.core as mx
+import torch
 
 from tgirl.modulation import (
     DEFAULT_MATRIX,
     DEFAULT_MATRIX_FLAT,
     EnvelopeConfig,
     EnvelopeState,
+    ModMatrixHook,
     ModMatrixHookMlx,
     SourceConditionerConfig,
     condition_source,
@@ -437,3 +439,83 @@ class TestModMatrixHookMlx:
         # Check that logit_bias has a penalty for token 42
         if result.logit_bias is not None and 42 in result.logit_bias:
             assert result.logit_bias[42] < 0.0
+
+
+# === Task 4: ModMatrixHook (torch variant) ===
+
+
+def _make_torch_hook(
+    config: EnvelopeConfig | None = None,
+    vocab_size: int = 100,
+    max_tokens: int = 128,
+) -> ModMatrixHook:
+    """Create a torch hook with a simple tokenizer mock."""
+    if config is None:
+        config = EnvelopeConfig()
+
+    def decode(ids: list[int]) -> str:
+        mapping = {10: "(", 11: ")"}
+        return "".join(mapping.get(i, "x") for i in ids)
+
+    return ModMatrixHook(
+        config=config,
+        tokenizer_decode=decode,
+        vocab_size=vocab_size,
+        max_tokens=max_tokens,
+    )
+
+
+class TestModMatrixHookTorch:
+    """Tests for the torch variant of the modulation hook."""
+
+    def test_implements_inference_hook(self) -> None:
+        """Hook satisfies InferenceHook protocol."""
+        from tgirl.sample import InferenceHook
+
+        hook = _make_torch_hook()
+        assert isinstance(hook, InferenceHook)
+
+    def test_pre_forward_returns_intervention(self) -> None:
+        hook = _make_torch_hook()
+        logits = torch.randn(100)
+        # Create a mock grammar state
+        from unittest.mock import MagicMock
+
+        gs = MagicMock()
+        gs.get_valid_mask.return_value = torch.ones(100)
+        result = hook.pre_forward(0, gs, [], logits)
+        assert isinstance(result, ModelIntervention)
+        assert result.temperature is not None
+
+    def test_torch_mlx_parity(self) -> None:
+        """Torch and MLX variants produce same outputs for same inputs."""
+        config = EnvelopeConfig()
+        torch.manual_seed(42)
+        logits_np = torch.randn(100).numpy().tolist()
+
+        # Torch variant
+        torch_hook = _make_torch_hook(config=config)
+        t_logits = torch.tensor(logits_np)
+        from unittest.mock import MagicMock
+
+        gs = MagicMock()
+        gs.get_valid_mask.return_value = torch.ones(100)
+        r_torch = torch_hook.pre_forward(0, gs, [], t_logits)
+
+        # MLX variant
+        mlx_hook = _make_hook(config=config)
+        m_logits = mx.array(logits_np)
+        m_mask = mx.ones((100,), dtype=mx.bool_)
+        r_mlx = mlx_hook.pre_forward(0, m_mask, [], m_logits)
+
+        # Temperature and top_p should be close
+        assert abs(r_torch.temperature - r_mlx.temperature) < 0.01
+        assert abs(r_torch.top_p - r_mlx.top_p) < 0.01
+
+    def test_no_cross_framework_imports(self) -> None:
+        """Torch variant does not import mlx."""
+        import inspect
+
+        source = inspect.getsource(ModMatrixHook.pre_forward)
+        assert "mx." not in source
+        assert "mlx" not in source
