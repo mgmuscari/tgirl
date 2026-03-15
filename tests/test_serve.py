@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from tgirl.registry import ToolRegistry
 
 
 class TestInferenceContext:
@@ -160,3 +163,130 @@ class TestLoadInferenceContext:
             pytest.raises(ImportError, match="torch|transformers"),
         ):
             load_inference_context("test-model", backend="torch")
+
+
+def _make_mock_ctx(
+    tools: ToolRegistry | None = None,
+) -> Any:
+    """Create a mock InferenceContext for server testing."""
+    from tgirl.serve import InferenceContext
+
+    registry = tools or ToolRegistry()
+    return InferenceContext(
+        registry=registry,
+        forward_fn=lambda ids: None,
+        tokenizer_decode=lambda ids: "",
+        tokenizer_encode=lambda s: [],
+        embeddings=MagicMock(),
+        grammar_guide_factory=lambda s: None,
+        mlx_grammar_guide_factory=None,
+        formatter=MagicMock(),
+        backend="torch",
+        model_id="test-model",
+        stop_token_ids=[0],
+    )
+
+
+class TestCreateApp:
+    """Tests for the FastAPI app factory."""
+
+    def test_health_endpoint(self) -> None:
+        """/health returns model info and tool count."""
+        from tgirl.serve import create_app
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        ctx = _make_mock_ctx(tools=registry)
+        app = create_app(ctx)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["model"] == "test-model"
+        assert data["tools"] == 1
+        assert data["backend"] == "torch"
+
+    def test_generate_returns_correct_structure(self) -> None:
+        """/generate returns correct response structure."""
+        from tgirl.serve import create_app
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        ctx = _make_mock_ctx(tools=registry)
+        app = create_app(ctx)
+
+        # Mock run_chat to return a SamplingResult-like object
+        mock_result = MagicMock()
+        mock_result.output_text = "Hello world"
+        mock_result.tool_calls = []
+        mock_result.total_tokens = 42
+        mock_result.total_cycles = 1
+        mock_result.wall_time_ms = 100.5
+        mock_result.quotas_consumed = {}
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with patch(
+            "tgirl.serve._run_session_chat",
+            return_value=mock_result,
+        ):
+            resp = client.post(
+                "/generate",
+                json={"intent": "Add 2 and 3"},
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["output"] == "Hello world"
+            assert data["total_tokens"] == 42
+            assert data["total_cycles"] == 1
+            assert data["wall_time_ms"] == 100.5
+            assert data["tool_calls"] == []
+            assert data["error"] is None
+
+    def test_generate_missing_intent(self) -> None:
+        """/generate without intent returns 422."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        app = create_app(ctx)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        resp = client.post("/generate", json={})
+        assert resp.status_code == 422
+
+    def test_generate_error_handling(self) -> None:
+        """/generate handles model errors gracefully."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        app = create_app(ctx)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with patch(
+            "tgirl.serve._run_session_chat",
+            side_effect=RuntimeError("Model failed"),
+        ):
+            resp = client.post(
+                "/generate",
+                json={"intent": "test"},
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["error"] is not None
+            assert "Model failed" in data["error"]

@@ -9,6 +9,7 @@ Optional dependency: requires ``fastapi`` and either ``mlx-lm`` or
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -17,7 +18,7 @@ import structlog
 
 from tgirl.format import ChatTemplateFormatter
 from tgirl.registry import ToolRegistry
-from tgirl.types import PromptFormatter
+from tgirl.types import PromptFormatter, SessionConfig
 
 logger = structlog.get_logger()
 
@@ -236,3 +237,153 @@ def _build_torch_context(model_id: str) -> InferenceContext:
         model_id=model_id,
         stop_token_ids=stop_ids,
     )
+
+
+# --- FastAPI request/response models ---
+
+try:
+    from pydantic import BaseModel as _PydanticBase
+
+    class GenerateRequest(_PydanticBase):
+        """Request body for /generate endpoint."""
+
+        intent: str
+        scopes: list[str] | None = None
+        max_cost: float | None = None
+        restrict_tools: list[str] | None = None
+        ot_epsilon: float | None = None
+        base_temperature: float | None = None
+
+    class ToolCallResponse(_PydanticBase):
+        """Single tool call in a generate response."""
+
+        pipeline: str
+        result: Any | None = None
+        error: str | None = None
+        cycle_number: int = 0
+        tool_invocations: dict[str, int] = {}
+
+    class GenerateResponse(_PydanticBase):
+        """Response body for /generate endpoint."""
+
+        output: str
+        tool_calls: list[ToolCallResponse]
+        total_tokens: int
+        total_cycles: int
+        wall_time_ms: float
+        quotas_consumed: dict[str, int]
+        error: str | None = None
+
+except ImportError:
+    pass  # pydantic not available (shouldn't happen — it's a core dep)
+
+
+# --- FastAPI server ---
+
+
+def _run_session_chat(
+    ctx: InferenceContext,
+    messages: list[dict[str, str]],
+    session_config: SessionConfig | None = None,
+    transport_config: Any = None,
+    hooks: list[Any] | None = None,
+) -> Any:
+    """Create a SamplingSession and run chat. Extracted for mockability."""
+    from tgirl.sample import SamplingSession
+
+    session = SamplingSession(
+        registry=ctx.registry,
+        forward_fn=ctx.forward_fn,
+        tokenizer_decode=ctx.tokenizer_decode,
+        tokenizer_encode=ctx.tokenizer_encode,
+        embeddings=ctx.embeddings,
+        grammar_guide_factory=ctx.grammar_guide_factory,
+        mlx_grammar_guide_factory=ctx.mlx_grammar_guide_factory,
+        formatter=ctx.formatter,
+        backend=ctx.backend,
+        config=session_config,
+        transport_config=transport_config,
+        hooks=hooks,
+        stop_token_ids=ctx.stop_token_ids,
+    )
+    return session.run_chat(messages)
+
+
+def create_app(
+    ctx: InferenceContext,
+    session_config: SessionConfig | None = None,
+    transport_config: Any = None,
+    hooks: list[Any] | None = None,
+) -> Any:
+    """Create FastAPI app from a pre-loaded InferenceContext.
+
+    Each /generate request creates a new SamplingSession from
+    the shared InferenceContext.
+
+    Args:
+        ctx: Pre-loaded InferenceContext with model and dependencies.
+        session_config: Optional session configuration override.
+        transport_config: Optional transport configuration override.
+        hooks: Optional inference hooks.
+
+    Returns:
+        A FastAPI application instance.
+    """
+    from fastapi import FastAPI
+
+    app = FastAPI(title="tgirl")
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        return {
+            "model": ctx.model_id,
+            "tools": len(ctx.registry),
+            "backend": ctx.backend,
+            "status": "ok",
+        }
+
+    @app.post("/generate")
+    async def generate(request: GenerateRequest) -> GenerateResponse:
+        messages = [{"role": "user", "content": request.intent}]
+        try:
+            result = await asyncio.to_thread(
+                _run_session_chat,
+                ctx,
+                messages,
+                session_config,
+                transport_config,
+                hooks,
+            )
+            tool_call_responses = [
+                ToolCallResponse(
+                    pipeline=tc.pipeline,
+                    result=tc.result,
+                    error=(
+                        tc.error.message if tc.error else None
+                    ),
+                    cycle_number=tc.cycle_number,
+                    tool_invocations=tc.tool_invocations,
+                )
+                for tc in result.tool_calls
+            ]
+            return GenerateResponse(
+                output=result.output_text,
+                tool_calls=tool_call_responses,
+                total_tokens=result.total_tokens,
+                total_cycles=result.total_cycles,
+                wall_time_ms=result.wall_time_ms,
+                quotas_consumed=result.quotas_consumed,
+            )
+        except Exception as e:
+            logger.error("generate_error", error=str(e))
+            return GenerateResponse(
+                output="",
+                tool_calls=[],
+                total_tokens=0,
+                total_cycles=0,
+                wall_time_ms=0.0,
+                quotas_consumed={},
+                error=str(e),
+            )
+
+    return app
