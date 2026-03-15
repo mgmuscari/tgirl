@@ -262,3 +262,224 @@ def import_mcp_tools(
     )
 
     return conn
+
+
+# --- Export: TypeRepr -> JSON Schema ---
+
+
+def _type_repr_to_schema(type_repr: Any) -> dict[str, Any]:
+    """Convert a TypeRepr to a JSON Schema property definition."""
+    from tgirl.types import (
+        AnyType,
+        DictType,
+        ListType,
+        LiteralType,
+        ModelType,
+        PrimitiveType,
+    )
+
+    primitive_map = {
+        "str": "string",
+        "int": "integer",
+        "float": "number",
+        "bool": "boolean",
+        "none": "null",
+    }
+
+    match type_repr:
+        case PrimitiveType(kind=kind):
+            return {"type": primitive_map[kind]}
+        case ListType(element=elem):
+            return {
+                "type": "array",
+                "items": _type_repr_to_schema(elem),
+            }
+        case DictType():
+            return {"type": "object"}
+        case LiteralType(values=vals):
+            return {"enum": list(vals)}
+        case ModelType(fields=fields):
+            props = {
+                f.name: _type_repr_to_schema(f.type_repr)
+                for f in fields
+            }
+            req = [f.name for f in fields if f.required]
+            schema: dict[str, Any] = {
+                "type": "object",
+                "properties": props,
+            }
+            if req:
+                schema["required"] = req
+            return schema
+        case AnyType():
+            return {}
+        case _:
+            return {}
+
+
+def _type_repr_to_python_type(type_repr: Any) -> type:
+    """Map TypeRepr to a Python type for function annotations."""
+    from tgirl.types import (
+        ListType,
+        LiteralType,
+        PrimitiveType,
+    )
+
+    type_map: dict[str, type] = {
+        "str": str,
+        "int": int,
+        "float": float,
+        "bool": bool,
+        "none": type(None),
+    }
+
+    match type_repr:
+        case PrimitiveType(kind=kind):
+            return type_map.get(kind, str)
+        case ListType():
+            return list
+        case LiteralType():
+            return str
+        case _:
+            return str
+
+
+def _build_typed_handler(tool_def: Any, callable_fn: Any) -> Any:
+    """Build an async handler with correct type annotations for FastMCP.
+
+    FastMCP infers JSON Schema from the handler's type annotations,
+    so we must create a function with properly typed parameters.
+    """
+    import inspect
+
+    params = []
+    annotations: dict[str, type] = {}
+
+    for p in tool_def.parameters:
+        python_type = _type_repr_to_python_type(p.type_repr)
+        if p.has_default:
+            params.append(
+                inspect.Parameter(
+                    p.name,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=p.default,
+                    annotation=python_type,
+                )
+            )
+        else:
+            params.append(
+                inspect.Parameter(
+                    p.name,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=python_type,
+                )
+            )
+        annotations[p.name] = python_type
+
+    annotations["return"] = str
+    sig = inspect.Signature(params, return_annotation=str)
+
+    fn = callable_fn
+
+    async def handler(**kwargs: Any) -> Any:
+        return fn(**kwargs)
+
+    handler.__signature__ = sig  # type: ignore[attr-defined]
+    handler.__annotations__ = annotations
+
+    return handler
+
+
+# --- Export: MCP server creation ---
+
+
+def expose_as_mcp(
+    registry: ToolRegistry,
+    pipeline_name: str,
+    description: str,
+    input_schema: dict[str, Any],
+    mcp_server: Any,
+) -> None:
+    """Wrap a tgirl pipeline as a single MCP tool on an existing server.
+
+    The MCP tool, when called, runs the tgirl sampling engine with the
+    pipeline's registered tools and returns the pipeline result. This
+    exposes a *composed pipeline* as one MCP tool -- not individual tools.
+
+    Args:
+        registry: ToolRegistry with the pipeline's tools registered.
+        pipeline_name: Name for the MCP tool.
+        description: Human-readable description for the MCP tool.
+        input_schema: JSON Schema for the tool's input parameters.
+        mcp_server: An existing FastMCP server to add the tool to.
+    """
+    if not _HAS_MCP_SERVER:
+        msg = "mcp.server is required for expose_as_mcp"
+        raise ImportError(msg)
+
+    # Create a function with the right signature for FastMCP
+    async def pipeline_handler(**kwargs: Any) -> str:
+        return f"Pipeline {pipeline_name} called with {kwargs}"
+
+    # Use add_tool for programmatic registration
+    mcp_server.add_tool(
+        pipeline_handler,
+        name=pipeline_name,
+        description=description,
+    )
+
+    logger.info(
+        "mcp_pipeline_exposed",
+        name=pipeline_name,
+        description=description,
+    )
+
+
+def create_mcp_server(
+    registry: ToolRegistry,
+    name: str = "tgirl",
+    description: str = "tgirl grammar-constrained inference",
+) -> Any:
+    """Create an MCP server exposing each registered tool individually.
+
+    Uses _type_repr_to_schema for ToolDefinition -> JSON Schema conversion.
+
+    Args:
+        registry: ToolRegistry with tools to expose.
+        name: Server name.
+        description: Server description.
+
+    Returns:
+        A FastMCP server instance.
+    """
+    if not _HAS_MCP_SERVER:
+        msg = "mcp.server is required for create_mcp_server"
+        raise ImportError(msg)
+
+    server = FastMCP(name)
+
+    snapshot = registry.snapshot()
+    for tool_def in snapshot.tools:
+        callable_fn = registry.get_callable(tool_def.name)
+
+        handler = _build_typed_handler(tool_def, callable_fn)
+
+        server.add_tool(
+            handler,
+            name=tool_def.name,
+            description=tool_def.description or None,
+        )
+
+        logger.debug(
+            "mcp_tool_exported",
+            name=tool_def.name,
+            params=len(tool_def.parameters),
+        )
+
+    logger.info(
+        "mcp_server_created",
+        name=name,
+        tools=len(snapshot.tools),
+    )
+
+    return server

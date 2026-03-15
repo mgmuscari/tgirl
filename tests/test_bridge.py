@@ -9,7 +9,12 @@ import pytest
 
 from tgirl.registry import ToolRegistry
 from tgirl.types import (
+    AnyType,
+    DictType,
+    FieldDef,
+    ListType,
     LiteralType,
+    ModelType,
     PrimitiveType,
 )
 
@@ -335,3 +340,216 @@ class TestMcpConnection:
             wrapper = registry.get_callable("post_close")
             with pytest.raises(RuntimeError, match="closed"):
                 wrapper(x=1)
+
+
+class TestTypeReprToSchema:
+    """Tests for _type_repr_to_schema reverse mapping."""
+
+    def test_primitive_str(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        assert _type_repr_to_schema(PrimitiveType(kind="str")) == {
+            "type": "string"
+        }
+
+    def test_primitive_int(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        assert _type_repr_to_schema(PrimitiveType(kind="int")) == {
+            "type": "integer"
+        }
+
+    def test_primitive_float(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        assert _type_repr_to_schema(PrimitiveType(kind="float")) == {
+            "type": "number"
+        }
+
+    def test_primitive_bool(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        assert _type_repr_to_schema(PrimitiveType(kind="bool")) == {
+            "type": "boolean"
+        }
+
+    def test_primitive_none(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        assert _type_repr_to_schema(PrimitiveType(kind="none")) == {
+            "type": "null"
+        }
+
+    def test_list_type(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            ListType(element=PrimitiveType(kind="int"))
+        )
+        assert result == {
+            "type": "array",
+            "items": {"type": "integer"},
+        }
+
+    def test_dict_type(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            DictType(
+                key=PrimitiveType(kind="str"),
+                value=AnyType(),
+            )
+        )
+        assert result == {"type": "object"}
+
+    def test_literal_type(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        result = _type_repr_to_schema(
+            LiteralType(values=("a", "b", "c"))
+        )
+        assert result == {"enum": ["a", "b", "c"]}
+
+    def test_model_type(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        model = ModelType(
+            name="TestModel",
+            fields=(
+                FieldDef(
+                    name="x",
+                    type_repr=PrimitiveType(kind="int"),
+                    required=True,
+                ),
+                FieldDef(
+                    name="y",
+                    type_repr=PrimitiveType(kind="str"),
+                    required=False,
+                ),
+            ),
+        )
+        result = _type_repr_to_schema(model)
+        assert result == {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "string"},
+            },
+            "required": ["x"],
+        }
+
+    def test_any_type(self) -> None:
+        from tgirl.bridge import _type_repr_to_schema
+
+        assert _type_repr_to_schema(AnyType()) == {}
+
+    def test_round_trip_basic_types(self) -> None:
+        """Round-trip: schema -> TypeRepr -> schema produces equivalent JSON Schema."""
+        from tgirl.bridge import _type_repr_to_schema
+        from tgirl.registry import _schema_type_to_repr
+
+        cases = [
+            {"type": "string"},
+            {"type": "integer"},
+            {"type": "number"},
+            {"type": "boolean"},
+            {"type": "null"},
+            {"type": "array", "items": {"type": "integer"}},
+            {"enum": ["a", "b"]},
+        ]
+        for schema in cases:
+            type_repr = _schema_type_to_repr(schema)
+            roundtripped = _type_repr_to_schema(type_repr)
+            assert roundtripped == schema, (
+                f"Round-trip failed for {schema}: got {roundtripped}"
+            )
+
+
+class TestExposeMcp:
+    """Tests for expose_as_mcp and create_mcp_server."""
+
+    def test_create_mcp_server_has_tools(self) -> None:
+        """create_mcp_server creates a server with all registry tools."""
+        from tgirl.bridge import create_mcp_server
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        @registry.tool(description="Subtract two numbers")
+        def sub(a: int, b: int) -> int:
+            return a - b
+
+        server = create_mcp_server(registry, name="test")
+        # FastMCP stores tools internally; list them
+        import asyncio
+
+        async def _list():
+            return await server.list_tools()
+
+        tools = asyncio.run(_list())
+        tool_names = {t.name for t in tools}
+        assert "add" in tool_names
+        assert "sub" in tool_names
+
+    def test_create_mcp_server_tool_schemas(self) -> None:
+        """Tool schemas are correctly converted from ToolDefinition."""
+        from tgirl.bridge import create_mcp_server
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def greet(name: str, times: int) -> str:
+            return name * times
+
+        server = create_mcp_server(registry)
+        import asyncio
+
+        async def _list():
+            return await server.list_tools()
+
+        tools = asyncio.run(_list())
+        tool = next(t for t in tools if t.name == "greet")
+        props = tool.inputSchema["properties"]
+        # FastMCP may add extra fields (e.g., title); check type is correct
+        assert props["name"]["type"] == "string"
+        assert props["times"]["type"] == "integer"
+        assert set(tool.inputSchema["required"]) == {"name", "times"}
+
+    def test_expose_as_mcp_adds_tool(self) -> None:
+        """expose_as_mcp adds a tool to an existing FastMCP server."""
+        from mcp.server import FastMCP
+
+        from tgirl.bridge import expose_as_mcp
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def calc(x: int) -> int:
+            return x * 2
+
+        server = FastMCP("test")
+        expose_as_mcp(
+            registry=registry,
+            pipeline_name="calculator",
+            description="A calculator pipeline",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"},
+                },
+                "required": ["expression"],
+            },
+            mcp_server=server,
+        )
+
+        import asyncio
+
+        async def _list():
+            return await server.list_tools()
+
+        tools = asyncio.run(_list())
+        tool_names = {t.name for t in tools}
+        assert "calculator" in tool_names
