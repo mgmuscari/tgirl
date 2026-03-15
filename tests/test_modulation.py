@@ -6,7 +6,12 @@ envelope configuration, and the unified ModMatrixHook.
 
 from __future__ import annotations
 
+import dataclasses
+
 from tgirl.modulation import (
+    DEFAULT_MATRIX,
+    DEFAULT_MATRIX_FLAT,
+    EnvelopeConfig,
     EnvelopeState,
     SourceConditionerConfig,
     condition_source,
@@ -206,3 +211,61 @@ class TestPhaseDetection:
         assert state.peak_freedom == 0.8
         state.advance_phase(freedom=0.6, depth=1)
         assert state.peak_freedom == 0.8  # Doesn't decrease
+
+
+# === Task 2: Default modulation matrix and EnvelopeConfig ===
+
+
+class TestEnvelopeConfig:
+    """Tests for EnvelopeConfig and default matrix."""
+
+    def test_default_matrix_shape(self) -> None:
+        assert len(DEFAULT_MATRIX) == 11
+        for row in DEFAULT_MATRIX:
+            assert len(row) == 7
+
+    def test_default_matrix_flat_length(self) -> None:
+        assert len(DEFAULT_MATRIX_FLAT) == 11 * 7
+
+    def test_config_matrix_shape(self) -> None:
+        cfg = EnvelopeConfig()
+        assert cfg.matrix_shape == (11, 7)
+
+    def test_config_is_frozen(self) -> None:
+        cfg = EnvelopeConfig()
+        with __import__("pytest").raises(dataclasses.FrozenInstanceError):
+            cfg.base_temperature = 0.5  # type: ignore[misc]
+
+    def test_base_values_are_sensible(self) -> None:
+        cfg = EnvelopeConfig()
+        assert 0.0 < cfg.base_temperature < 2.0
+        assert 0.0 < cfg.base_top_p <= 1.0
+        assert cfg.base_repetition_bias < 0.0
+        assert 0.0 < cfg.base_epsilon < 1.0
+
+    def test_clamp_ranges_prevent_invalid(self) -> None:
+        cfg = EnvelopeConfig()
+        lo, hi = cfg.temperature_range
+        assert lo >= 0.0
+        assert hi <= 5.0
+        lo_p, hi_p = cfg.top_p_range
+        assert lo_p > 0.0
+        assert hi_p <= 1.0
+
+    def test_column_5_backtrack_zeroed(self) -> None:
+        """Column 5 (backtrack_threshold) is zeroed in default matrix."""
+        for row in DEFAULT_MATRIX:
+            assert row[5] == 0.0
+
+    def test_conditioners_count(self) -> None:
+        cfg = EnvelopeConfig()
+        assert len(cfg.conditioners) == 11
+
+    def test_matrix_weights_attack_row(self) -> None:
+        """Phase_attack row (index 6) has expected values."""
+        attack_row = DEFAULT_MATRIX[6]
+        # temp=0.3, top_p=0.35, rep=10.0, eps=-0.05
+        assert attack_row[0] == 0.3
+        assert attack_row[1] == 0.35
+        assert attack_row[2] == 10.0
+        assert attack_row[3] == -0.05

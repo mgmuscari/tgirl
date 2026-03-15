@@ -127,6 +127,64 @@ def condition_source(
     return cfg.slew_rate * normalized + (1.0 - cfg.slew_rate) * prev_smoothed
 
 
+# fmt: off
+DEFAULT_MATRIX: list[list[float]] = [
+    # temp   top_p  rep    eps    open   back*  pres
+    # *back (col 5) reserved -- zeroed, not wired in v1
+    [ 0.3,   0.2,   0.0,   0.0,   0.0,   0.0,   0.0],  # 0: freedom
+    [ 0.1,   0.1,   0.0,   0.0,   0.0,   0.0,   0.0],  # 1: entropy
+    [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 2: confidence
+    [ 0.0,   0.0,   0.0,  -0.1,   0.0,   0.0,   0.0],  # 3: overlap
+    [ 0.0,   0.0,   0.0,   0.0, -20.0,   0.0,   0.0],  # 4: depth
+    [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 5: position
+    [ 0.3,   0.35, 10.0,  -0.05,  0.0,   0.0,   0.0],  # 6: attack
+    [ 0.0,   0.2,   5.0,   0.0,   0.0,   0.0,   0.0],  # 7: decay
+    [-0.15, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # 8: sustain
+    [-0.05,  0.3,  10.0,  -0.05, -50.0,  0.0,   0.0],  # 9: release
+    [ 0.0,   0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # 10: cycle
+]
+# fmt: on
+
+DEFAULT_MATRIX_FLAT: tuple[float, ...] = tuple(
+    v for row in DEFAULT_MATRIX for v in row
+)
+
+
+@dataclass(frozen=True)
+class EnvelopeConfig:
+    """Complete modulation matrix configuration."""
+
+    # Base values (destinations start here, modulations are added)
+    base_temperature: float = 0.3
+    base_top_p: float = 0.9
+    base_repetition_bias: float = -20.0
+    base_epsilon: float = 0.1
+    base_opener_bias: float = 0.0
+    # reserved: col 5 zeroed, not wired in v1
+    base_backtrack_threshold: float = -0.5
+    base_presence_penalty: float = 0.0
+
+    # Output clamp ranges
+    temperature_range: tuple[float, float] = (0.0, 2.0)
+    top_p_range: tuple[float, float] = (0.1, 1.0)
+    repetition_bias_range: tuple[float, float] = (-100.0, 0.0)
+    epsilon_range: tuple[float, float] = (0.01, 1.0)
+
+    # Source conditioners (11 entries)
+    conditioners: tuple[SourceConditionerConfig, ...] = field(
+        default_factory=lambda: DEFAULT_CONDITIONERS,
+    )
+
+    # The matrix itself -- shape (11, 7), stored as flat tuple
+    matrix_flat: tuple[float, ...] = field(
+        default_factory=lambda: DEFAULT_MATRIX_FLAT,
+    )
+
+    @property
+    def matrix_shape(self) -> tuple[int, int]:
+        return (11, 7)
+
+
 DEFAULT_CONDITIONERS: tuple[SourceConditionerConfig, ...] = (
     SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 0: freedom
     SourceConditionerConfig(range_min=0.0, range_max=12.5),  # 1: entropy
