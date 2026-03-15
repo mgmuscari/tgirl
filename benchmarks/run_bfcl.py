@@ -380,8 +380,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
             "bfcl_output": bfcl_output,
             "ground_truth": ground_truth_by_id.get(entry_id),
             "hyperparams": {
-                "base_temperature": session_hooks[0]._config.base_temperature,
-                "modulation_matrix_hash": hash(session_hooks[0]._config.matrix_flat),
+                "base_temperature": session_hooks[0].config.base_temperature,
+                "modulation_matrix_hash": hash(session_hooks[0].config.matrix_flat),
                 "ot_epsilon": transport_config.epsilon,
                 "ot_valid_ratio_threshold": transport_config.valid_ratio_threshold,
                 "ot_max_iterations": transport_config.max_iterations,

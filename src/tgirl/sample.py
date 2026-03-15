@@ -136,7 +136,11 @@ class GrammarTemperatureHook:
 
 def _is_mod_matrix_hook(hook: object) -> bool:
     """Check if hook is a ModMatrixHook (avoids circular import)."""
-    return type(hook).__name__ == "ModMatrixHook"
+    t = type(hook)
+    return (
+        t.__qualname__ == "ModMatrixHook"
+        and t.__module__ == "tgirl.modulation"
+    )
 
 
 def detect_cycle(tokens: list[int], max_period: int = 16) -> int | None:
@@ -1054,10 +1058,10 @@ class SamplingSession:
 
                             self._mlx_hooks.append(
                                 ModMatrixHookMlx(
-                                    config=hook._config,
+                                    config=hook.config,
                                     tokenizer_decode=self._decode,
                                     vocab_size=self._embeddings_mlx.shape[0],
-                                    max_tokens=hook._max_tokens,
+                                    max_tokens=hook.max_tokens,
                                 )
                             )
                         # Skip other torch-only hooks

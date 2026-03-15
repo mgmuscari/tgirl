@@ -11,13 +11,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from tgirl.types import ModelIntervention
 
 if TYPE_CHECKING:
     import mlx.core as mx
     import torch
+
+    from tgirl.sample import GrammarState
 
 
 @dataclass(frozen=True)
@@ -239,8 +241,8 @@ class ModMatrixHookMlx:
     ) -> None:
         import mlx.core as mx
 
-        self._config = config
-        self._max_tokens = max_tokens
+        self.config = config
+        self.max_tokens = max_tokens
         self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
         self.last_telemetry: EnvelopeTelemetry | None = None
 
@@ -287,7 +289,7 @@ class ModMatrixHookMlx:
         from tgirl.sample import detect_cycle
 
         vocab_size = logits.shape[0]
-        cfg = self._config
+        cfg = self.config
 
         # 1. Compute raw source signals (MLX ops, scalar extract)
         freedom = float(mx.sum(valid_mask).item()) / vocab_size
@@ -318,7 +320,7 @@ class ModMatrixHookMlx:
             confidence,
             overlap,
             float(self._state.depth),
-            position / self._max_tokens,
+            position / self.max_tokens,
             1.0 if phase == "attack" else 0.0,
             1.0 if phase == "decay" else 0.0,
             1.0 if phase == "sustain" else 0.0,
@@ -443,8 +445,8 @@ class ModMatrixHook:
     ) -> None:
         import torch as _torch
 
-        self._config = config
-        self._max_tokens = max_tokens
+        self.config = config
+        self.max_tokens = max_tokens
         self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
 
         # Build mod matrix as torch.Tensor
@@ -479,7 +481,7 @@ class ModMatrixHook:
     def pre_forward(
         self,
         position: int,
-        grammar_state: Any,
+        grammar_state: GrammarState,
         token_history: list[int],
         logits: torch.Tensor,
     ) -> ModelIntervention:
@@ -489,7 +491,7 @@ class ModMatrixHook:
         from tgirl.sample import detect_cycle
 
         vocab_size = logits.shape[0]
-        cfg = self._config
+        cfg = self.config
 
         # Get valid mask from grammar state
         valid_mask = grammar_state.get_valid_mask(vocab_size)
@@ -532,7 +534,7 @@ class ModMatrixHook:
             confidence,
             overlap,
             float(self._state.depth),
-            position / self._max_tokens,
+            position / self.max_tokens,
             1.0 if phase == "attack" else 0.0,
             1.0 if phase == "decay" else 0.0,
             1.0 if phase == "sustain" else 0.0,
