@@ -286,14 +286,27 @@ class TestEnvelopeConfig:
         cfg = EnvelopeConfig()
         assert len(cfg.conditioners) == 11
 
-    def test_matrix_weights_attack_row(self) -> None:
-        """Phase_attack row (index 6) has expected values."""
-        attack_row = DEFAULT_MATRIX[6]
-        # temp=0.3, top_p=0.35, rep=10.0, eps=-0.05
-        assert attack_row[0] == 0.3
-        assert attack_row[1] == 0.35
-        assert attack_row[2] == 10.0
-        assert attack_row[3] == -0.05
+    def test_matrix_weights_all_rows(self) -> None:
+        """All matrix rows match the ADSR design doc values."""
+        # fmt: off
+        expected = [
+            [ 0.3,   0.2,   0.0,   0.0,   0.0,   0.0,   0.0],  # freedom
+            [ 0.1,   0.1,   0.0,   0.0,   0.0,   0.0,   0.0],  # entropy
+            [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # confidence
+            [ 0.0,   0.0,   0.0,  -0.1,   0.0,   0.0,   0.0],  # overlap
+            [ 0.0,   0.0,   0.0,   0.0, -20.0,   0.0,   0.0],  # depth
+            [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # position
+            [ 0.3,   0.35, 10.0,  -0.05,  0.0,   0.0,   0.0],  # attack
+            [ 0.0,   0.2,   5.0,   0.0,   0.0,   0.0,   0.0],  # decay
+            [-0.15, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # sustain
+            [-0.05,  0.3,  10.0,  -0.05, -50.0,  0.0,   0.0],  # release
+            [ 0.0,   0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # cycle
+        ]
+        # fmt: on
+        for i, (actual, exp) in enumerate(
+            zip(DEFAULT_MATRIX, expected, strict=True)
+        ):
+            assert actual == exp, f"Row {i} mismatch: {actual} != {exp}"
 
 
 # === Task 3: ModMatrixHookMlx ===

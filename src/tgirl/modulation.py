@@ -170,6 +170,22 @@ DEFAULT_MATRIX_FLAT: tuple[float, ...] = tuple(
     v for row in DEFAULT_MATRIX for v in row
 )
 
+DEFAULT_CONDITIONERS: tuple[SourceConditionerConfig, ...] = (
+    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 0: freedom
+    SourceConditionerConfig(range_min=0.0, range_max=12.5),  # 1: entropy
+    SourceConditionerConfig(                                  # 2: confidence
+        range_min=-5.0, range_max=0.0, invert=True,
+    ),
+    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 3: overlap
+    SourceConditionerConfig(range_min=0.0, range_max=10.0),  # 4: depth
+    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 5: position
+    SourceConditionerConfig(),  # 6: phase_attack (0 or 1)
+    SourceConditionerConfig(),  # 7: phase_decay
+    SourceConditionerConfig(),  # 8: phase_sustain
+    SourceConditionerConfig(),  # 9: phase_release
+    SourceConditionerConfig(),  # 10: cycle_detected
+)
+
 
 @dataclass(frozen=True)
 class EnvelopeConfig:
@@ -204,23 +220,6 @@ class EnvelopeConfig:
     @property
     def matrix_shape(self) -> tuple[int, int]:
         return (11, 7)
-
-
-DEFAULT_CONDITIONERS: tuple[SourceConditionerConfig, ...] = (
-    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 0: freedom
-    SourceConditionerConfig(range_min=0.0, range_max=12.5),  # 1: entropy
-    SourceConditionerConfig(                                  # 2: confidence
-        range_min=-5.0, range_max=0.0, invert=True,
-    ),
-    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 3: overlap
-    SourceConditionerConfig(range_min=0.0, range_max=10.0),  # 4: depth
-    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 5: position
-    SourceConditionerConfig(),  # 6: phase_attack (0 or 1)
-    SourceConditionerConfig(),  # 7: phase_decay
-    SourceConditionerConfig(),  # 8: phase_sustain
-    SourceConditionerConfig(),  # 9: phase_release
-    SourceConditionerConfig(),  # 10: cycle_detected
-)
 
 
 class ModMatrixHookMlx:
