@@ -274,6 +274,12 @@ try:
         quotas_consumed: dict[str, int]
         error: str | None = None
 
+    class GrammarPreviewRequest(_PydanticBase):
+        """Request body for /grammar/preview endpoint."""
+
+        scopes: list[str] | None = None
+        restrict_tools: list[str] | None = None
+
 except ImportError:
     pass  # pydantic not available (shouldn't happen — it's a core dep)
 
@@ -385,5 +391,54 @@ def create_app(
                 quotas_consumed={},
                 error=str(e),
             )
+
+    # In-memory telemetry buffer
+    telemetry_buffer: list[dict[str, Any]] = []
+
+    @app.get("/tools")
+    async def list_tools() -> list[dict[str, Any]]:
+        snapshot = ctx.registry.snapshot()
+        return [
+            {
+                "name": td.name,
+                "description": td.description,
+                "parameters": [
+                    {
+                        "name": p.name,
+                        "type": p.type_repr.model_dump(),
+                        "required": not p.has_default,
+                    }
+                    for p in td.parameters
+                ],
+                "quota": td.quota,
+                "scope": td.scope,
+            }
+            for td in snapshot.tools
+        ]
+
+    @app.get("/grammar")
+    async def get_grammar() -> dict[str, Any]:
+        from tgirl.grammar import generate as generate_grammar
+
+        snapshot = ctx.registry.snapshot()
+        output = generate_grammar(snapshot)
+        return {"text": output.text, "hash": output.snapshot_hash}
+
+    @app.post("/grammar/preview")
+    async def preview_grammar(
+        request: GrammarPreviewRequest,
+    ) -> dict[str, Any]:
+        from tgirl.grammar import generate as generate_grammar
+
+        snapshot = ctx.registry.snapshot(
+            scopes=set(request.scopes) if request.scopes else None,
+            restrict_to=request.restrict_tools,
+        )
+        output = generate_grammar(snapshot)
+        return {"text": output.text, "hash": output.snapshot_hash}
+
+    @app.get("/telemetry")
+    async def get_telemetry(limit: int = 100) -> list[dict[str, Any]]:
+        return telemetry_buffer[-limit:]
 
     return app

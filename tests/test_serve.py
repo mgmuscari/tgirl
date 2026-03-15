@@ -290,3 +290,117 @@ class TestCreateApp:
             data = resp.json()
             assert data["error"] is not None
             assert "Model failed" in data["error"]
+
+
+class TestInfoEndpoints:
+    """Tests for /tools, /grammar, /grammar/preview, /telemetry."""
+
+    def test_tools_endpoint(self) -> None:
+        """/tools lists all registered tools with correct info."""
+        from tgirl.serve import create_app
+
+        registry = ToolRegistry()
+
+        @registry.tool(description="Add numbers")
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        @registry.tool(description="Greet someone")
+        def greet(name: str) -> str:
+            return f"Hello {name}"
+
+        ctx = _make_mock_ctx(tools=registry)
+        app = create_app(ctx)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        resp = client.get("/tools")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        names = {t["name"] for t in data}
+        assert names == {"add", "greet"}
+        add_tool = next(t for t in data if t["name"] == "add")
+        assert add_tool["description"] == "Add numbers"
+
+    def test_grammar_endpoint(self) -> None:
+        """/grammar returns valid grammar text and hash."""
+        from tgirl.serve import create_app
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        ctx = _make_mock_ctx(tools=registry)
+        app = create_app(ctx)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        resp = client.get("/grammar")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "text" in data
+        assert "hash" in data
+        assert isinstance(data["text"], str)
+        assert len(data["text"]) > 0
+
+    def test_grammar_preview_endpoint(self) -> None:
+        """/grammar/preview with tool restriction produces filtered grammar."""
+        from tgirl.serve import create_app
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        @registry.tool()
+        def sub(a: int, b: int) -> int:
+            return a - b
+
+        ctx = _make_mock_ctx(tools=registry)
+        app = create_app(ctx)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        resp = client.post(
+            "/grammar/preview",
+            json={"restrict_tools": ["add"]},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "text" in data
+        assert "add" in data["text"]
+
+    def test_telemetry_endpoint(self) -> None:
+        """/telemetry returns empty list when no sessions have run."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        app = create_app(ctx)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        resp = client.get("/telemetry")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, list)
+
+    def test_telemetry_respects_limit(self) -> None:
+        """/telemetry respects limit parameter."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        app = create_app(ctx)
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        resp = client.get("/telemetry?limit=5")
+        assert resp.status_code == 200
