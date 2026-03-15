@@ -467,3 +467,30 @@ class TestWebSocket:
             data = ws.receive_json()
             assert data["type"] == "error"
             assert "Inference failed" in data["error"]
+
+
+class TestCli:
+    """Tests for CLI entrypoint."""
+
+    def test_serve_help(self) -> None:
+        """CLI serve command has --help."""
+        from click.testing import CliRunner
+
+        from tgirl.cli import serve
+
+        runner = CliRunner()
+        result = runner.invoke(serve, ["--help"])
+        assert result.exit_code == 0
+        assert "--model" in result.output
+        assert "--port" in result.output
+        assert "--backend" in result.output
+
+    def test_serve_default_port(self) -> None:
+        """CLI serve command defaults to port 8420."""
+        from click.testing import CliRunner
+
+        from tgirl.cli import serve
+
+        runner = CliRunner()
+        result = runner.invoke(serve, ["--help"])
+        assert "8420" in result.output
