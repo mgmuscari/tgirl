@@ -168,6 +168,10 @@ Five defined stances with distinct optimization targets:
 - Never weaken or delete tests to get green — fix the implementation instead
 - If stuck (3+ failed attempts on same task), stop and flag for human review
 - After any developer correction, update CLAUDE.md Known Gotchas via `/update-claude-md`
+- **No cross-framework conversions.** If a function needs both MLX and torch, implement two variants with matching interfaces. Never `mx.array(tensor.numpy())` or `torch.from_numpy(np.array(mx_array))` in any code path. Each variant uses only its own framework's native operations.
+- **No Python-fu on tensor data.** No list comprehensions, no `for v in tensor`, no `sum(list)` when the data came from a tensor. Use the framework's native ops (`mx.sum`, `torch.softmax`, etc.). If you must convert to Python, use `.tolist()`, never element-wise iteration.
+- **No "fix later" shims.** If a task requires functionality that doesn't exist yet (e.g., a missing registry method, a missing type mapping), implement it as part of the task. Never stub it, never label it "out of scope," never implement a workaround. The shim becomes load-bearing debt.
+- **Performance-aware implementation.** Any function that runs per-token or touches tensors with vocab-sized dimensions must be profiled mentally: if it iterates over 248k elements in Python, it's wrong. Use native framework ops.
 
 ## Methodology Enforcement Hooks
 
