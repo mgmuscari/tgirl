@@ -184,29 +184,43 @@ def _resolve_backend(backend: str) -> Literal["mlx", "torch"]:
 
 def _build_mlx_context(model_id: str) -> InferenceContext:
     """Build InferenceContext for MLX backend."""
-    model, tokenizer = _load_mlx_model(model_id)
-    forward_fn = _make_mlx_forward(model)
-    grammar_factory = _make_mlx_grammar_factory(tokenizer)
-    embeddings = model.model.embed_tokens.weight
+    import mlx.core as mx
 
-    eos = tokenizer.eos_token_id
-    stop_ids = [eos] if isinstance(eos, int) else list(eos)
+    model, mlx_tokenizer = _load_mlx_model(model_id)
+    # mlx_lm wraps the HF tokenizer — extract the fast tokenizer
+    # for llguidance compatibility (requires fast tokenizer)
+    hf_tokenizer = mlx_tokenizer._tokenizer
+
+    forward_fn = _make_mlx_forward(model)
+    grammar_factory = _make_mlx_grammar_factory(hf_tokenizer)
+    embeddings = model.language_model.model.embed_tokens.weight.astype(
+        mx.float32
+    )
+    mx.eval(embeddings)
+
+    stop_ids: list[int] = []
+    if hf_tokenizer.eos_token_id is not None:
+        stop_ids.append(hf_tokenizer.eos_token_id)
+    for token_str in ["<|im_end|>", "<|endoftext|>"]:
+        ids = hf_tokenizer.encode(token_str, add_special_tokens=False)
+        if len(ids) == 1 and ids[0] not in stop_ids:
+            stop_ids.append(ids[0])
 
     logger.info(
         "mlx_model_loaded",
         model_id=model_id,
-        vocab_size=len(tokenizer),
+        vocab_size=embeddings.shape[0],
     )
 
     return InferenceContext(
         registry=ToolRegistry(),
         forward_fn=forward_fn,
-        tokenizer_decode=tokenizer.decode,
-        tokenizer_encode=tokenizer.encode,
+        tokenizer_decode=hf_tokenizer.decode,
+        tokenizer_encode=hf_tokenizer.encode,
         embeddings=embeddings,
         grammar_guide_factory=grammar_factory,
         mlx_grammar_guide_factory=grammar_factory,
-        formatter=ChatTemplateFormatter(tokenizer),
+        formatter=ChatTemplateFormatter(hf_tokenizer),
         backend="mlx",
         model_id=model_id,
         stop_token_ids=stop_ids,
