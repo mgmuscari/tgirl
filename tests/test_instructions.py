@@ -111,6 +111,33 @@ class TestGenerateToolDoc:
         assert "obj" in doc
         assert "key" in doc
 
+    def test_includes_parameter_descriptions(self) -> None:
+        """Parameter descriptions from schema appear in tool doc."""
+        from tgirl.instructions import generate_tool_doc
+        from tgirl.types import ParameterDef, PrimitiveType, ToolDefinition
+
+        tool = ToolDefinition(
+            name="get_distance",
+            parameters=(
+                ParameterDef(
+                    name="origin",
+                    type_repr=PrimitiveType(kind="str"),
+                    description="Starting city name",
+                ),
+                ParameterDef(
+                    name="unit",
+                    type_repr=PrimitiveType(kind="str"),
+                    has_default=True,
+                    description="Unit of distance (default: km)",
+                ),
+            ),
+            return_type=PrimitiveType(kind="float"),
+            description="Calculate driving distance.",
+        )
+        doc = generate_tool_doc(tool)
+        assert "Starting city name" in doc
+        assert "Unit of distance (default: km)" in doc
+
     def test_different_tools_produce_different_docs(
         self, json_registry: ToolRegistry
     ) -> None:
@@ -435,7 +462,7 @@ class TestGenerateRoutingPrompt:
         from tgirl.instructions import generate_routing_prompt
 
         prompt = generate_routing_prompt(simple_registry.snapshot())
-        assert "Reply with ONLY the tool name" in prompt
+        assert "Reply with ONLY tool names separated by spaces" in prompt
 
     def test_routing_prompt_deterministic(
         self, simple_registry: ToolRegistry

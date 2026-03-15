@@ -104,7 +104,7 @@ def _type_name_slug(type_repr: TypeRepr) -> str:
 def _literal_value_to_grammar(val: str | int | float | bool) -> str:
     """Convert a literal value to a Lark grammar alternative."""
     if isinstance(val, bool):
-        return f'"{"true" if val else "false"}"'
+        return f'"{"True" if val else "False"}"'
     if isinstance(val, str):
         escaped = val.replace("\\", "\\\\").replace('"', '\\"')
         return f'"\\"{escaped}\\""'
@@ -131,7 +131,7 @@ def _type_to_rule(
             "str": "ESCAPED_STRING",
             "int": "SIGNED_INT",
             "float": "SIGNED_FLOAT",
-            "bool": '"true" | "false"',
+            "bool": '"True" | "False"',
             "none": '"nil"',
         }
         return [Production(name=rule_name, rule=rule_map[type_repr.kind])]
@@ -232,7 +232,7 @@ def _type_to_rule(
         return _type_to_rule(type_repr.base, rule_name, config)
 
     if isinstance(type_repr, AnyType):
-        rule = 'ESCAPED_STRING | SIGNED_INT | SIGNED_FLOAT | "true" | "false" | "nil"'
+        rule = 'ESCAPED_STRING | SIGNED_INT | SIGNED_FLOAT | "True" | "False" | "nil"'
         return [Production(name=rule_name, rule=rule)]
 
     msg = f"Unknown TypeRepr: {type_repr}"  # pragma: no cover
@@ -280,14 +280,14 @@ def _tool_to_rules(
             # The actual rule definition is emitted once (deduped later)
             prods.append(Production(name=rule_name, rule=tg[tag]))
         else:
-            type_name = f"param_{tool.name}_{param.name}"
+            type_name = f"param_{tool.name}_{param.name}".lower()
             param_type_names.append(type_name)
             prods.extend(_type_to_rule(param.type_repr, type_name, config))
 
     if not tool.parameters:
         # No parameters: (tool_name)
         rule = f'"(" "{tool.name}" ")"'
-        prods.insert(0, Production(name=f"call_{tool.name}", rule=rule))
+        prods.insert(0, Production(name=f"call_{tool.name}".lower(), rule=rule))
         return prods
 
     # Build the args portion with trailing optional chain
@@ -321,7 +321,7 @@ def _tool_to_rules(
     else:
         # All-optional: space is part of the optional group
         rule = f'"(" "{tool.name}" {args} ")"'
-    prods.insert(0, Production(name=f"call_{tool.name}", rule=rule))
+    prods.insert(0, Production(name=f"call_{tool.name}".lower(), rule=rule))
     return prods
 
 
@@ -381,12 +381,24 @@ def _render_grammar(
     )
 
 
-def generate_routing_grammar(snapshot: RegistrySnapshot) -> str:
-    """Generate a minimal grammar that accepts only tool names.
+def generate_routing_grammar(
+    snapshot: RegistrySnapshot,
+    top_k: int = 1,
+) -> str:
+    """Generate a minimal grammar that accepts tool names.
 
-    The grammar is a simple alternation of string literals:
+    When top_k=1 (default), produces a single-choice grammar:
         start: tool_choice
-        tool_choice: "get_field" | "set_field" | ...
+        tool_choice: "alpha" | "beta" | "gamma"
+
+    When top_k > 1, produces a space-separated list grammar:
+        start: tool_list
+        tool_list: tool_choice (" " tool_choice){0,top_k-1}
+        tool_choice: "alpha" | "beta" | "gamma"
+
+    Args:
+        snapshot: Registry snapshot with available tools.
+        top_k: Maximum number of tools in the output list.
 
     Returns Lark EBNF text (not a GrammarOutput -- no productions or hash needed).
     """
@@ -394,7 +406,20 @@ def generate_routing_grammar(snapshot: RegistrySnapshot) -> str:
         msg = "Cannot generate routing grammar for empty snapshot"
         raise ValueError(msg)
     alternatives = " | ".join(f'"{tool.name}"' for tool in snapshot.tools)
-    return f"start: tool_choice\ntool_choice: {alternatives}\n"
+    if top_k <= 1:
+        return f"start: tool_choice\ntool_choice: {alternatives}\n"
+    # Build trailing optional chain for bounded repetition.
+    # Uses the same nested-optional pattern as _tool_to_rules for
+    # optional parameters — compatible with both Lark LALR(1) and llguidance.
+    # e.g., top_k=3: tool_choice (" " tool_choice (" " tool_choice)?)?
+    chain = '" " tool_choice'
+    for _ in range(top_k - 2):
+        chain = f'" " tool_choice ({chain})?'
+    return (
+        f"start: tool_list\n"
+        f"tool_list: tool_choice ({chain})?\n"
+        f"tool_choice: {alternatives}\n"
+    )
 
 
 def generate(
@@ -420,7 +445,7 @@ def generate(
 
     # Also collect type productions from return types
     for tool in snapshot.tools:
-        ret_name = f"ret_{tool.name}"
+        ret_name = f"ret_{tool.name}".lower()
         all_prods.extend(_type_to_rule(tool.return_type, ret_name, cfg))
 
     # Deduplicate by name (keep first occurrence)

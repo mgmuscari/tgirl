@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from tgirl.sample import GrammarState
+from tgirl.sample import ConstrainedGenerationResult, GrammarState
+from tgirl.state_machine import Checkpoint  # noqa: F401 — triggers model_rebuild
+
+# Resolve Checkpoint forward ref so ConstrainedGenerationResult can be instantiated
+ConstrainedGenerationResult.model_rebuild()
+
 from tgirl.types import (
     ParameterDef,
     PrimitiveType,
@@ -156,6 +161,8 @@ class TestToolRouterRoute:
                 token_log_probs=[-0.5],
                 ot_computation_total_ms=1.0,
                 ot_bypassed_count=0,
+                ot_bypass_reasons=[None],
+                ot_iterations=[5],
                 grammar_generation_ms=5.0,
             )
             router.route(snap, context_tokens=[1, 2])
@@ -287,6 +294,8 @@ class TestToolRouterCache:
                 token_log_probs=[-0.5],
                 ot_computation_total_ms=1.0,
                 ot_bypassed_count=0,
+                ot_bypass_reasons=[None],
+                ot_iterations=[5],
                 grammar_generation_ms=5.0,
             )
             router.route(snap, context_tokens=[1, 2])
@@ -326,6 +335,8 @@ class TestToolRouterCache:
                 token_log_probs=[-0.5],
                 ot_computation_total_ms=1.0,
                 ot_bypassed_count=0,
+                ot_bypass_reasons=[None],
+                ot_iterations=[5],
                 grammar_generation_ms=5.0,
             )
             snap1 = _make_snapshot(["alpha", "beta"])
@@ -371,6 +382,8 @@ class TestToolRouterContextPassthrough:
                 token_log_probs=[-0.5],
                 ot_computation_total_ms=1.0,
                 ot_bypassed_count=0,
+                ot_bypass_reasons=[None],
+                ot_iterations=[5],
                 grammar_generation_ms=5.0,
             )
             router.route(snap, context_tokens=[1, 2, 3])
@@ -401,8 +414,229 @@ class TestToolRouterValidation:
         )
         snap = _make_snapshot(["alpha", "beta"])
 
-        with pytest.raises(ValueError, match="not in valid tool set"):
+        with pytest.raises(ValueError, match="contains no valid tools"):
             router.route(snap, context_tokens=[1, 2])
+
+
+class TestToolRouterMultiTool:
+    """Tests for multi-tool routing with top_k > 1."""
+
+    def test_multi_tool_output_parsed(self) -> None:
+        """Router parses space-separated tool names when top_k > 1."""
+        from tgirl.rerank import ToolRouter
+
+        mock_gs = _make_mock_grammar_state()
+        factory = MagicMock(return_value=mock_gs)
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        decode = MagicMock(return_value="alpha beta")
+        embeddings = torch.randn(100, 32)
+
+        config = RerankConfig(top_k=3)
+        router = ToolRouter(
+            grammar_guide_factory=factory,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            config=config,
+        )
+        snap = _make_snapshot(["alpha", "beta", "gamma"])
+
+        with patch("tgirl.rerank.run_constrained_generation") as mock_gen:
+            from tgirl.sample import ConstrainedGenerationResult
+
+            mock_gen.return_value = ConstrainedGenerationResult(
+                tokens=[5, 6],
+                hy_source="alpha beta",
+                grammar_valid_counts=[3, 3],
+                temperatures_applied=[0.3, 0.3],
+                wasserstein_distances=[0.0, 0.0],
+                top_p_applied=[-1.0, -1.0],
+                token_log_probs=[-0.5, -0.5],
+                ot_computation_total_ms=1.0,
+                ot_bypassed_count=0,
+                ot_bypass_reasons=[None, None],
+                ot_iterations=[5, 5],
+                grammar_generation_ms=5.0,
+            )
+            result = router.route(snap, context_tokens=[1, 2])
+
+        assert result.selected_tools == ("alpha", "beta")
+
+    def test_multi_tool_deduplicates(self) -> None:
+        """Duplicate tool names in output are deduplicated, preserving order."""
+        from tgirl.rerank import ToolRouter
+
+        mock_gs = _make_mock_grammar_state()
+        factory = MagicMock(return_value=mock_gs)
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        decode = MagicMock(return_value="alpha alpha beta")
+        embeddings = torch.randn(100, 32)
+
+        config = RerankConfig(top_k=3)
+        router = ToolRouter(
+            grammar_guide_factory=factory,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            config=config,
+        )
+        snap = _make_snapshot(["alpha", "beta", "gamma"])
+
+        with patch("tgirl.rerank.run_constrained_generation") as mock_gen:
+            from tgirl.sample import ConstrainedGenerationResult
+
+            mock_gen.return_value = ConstrainedGenerationResult(
+                tokens=[5, 6, 7],
+                hy_source="alpha alpha beta",
+                grammar_valid_counts=[3, 3, 3],
+                temperatures_applied=[0.3, 0.3, 0.3],
+                wasserstein_distances=[0.0, 0.0, 0.0],
+                top_p_applied=[-1.0, -1.0, -1.0],
+                token_log_probs=[-0.5, -0.5, -0.5],
+                ot_computation_total_ms=1.0,
+                ot_bypassed_count=0,
+                ot_bypass_reasons=[None, None, None],
+                ot_iterations=[5, 5, 5],
+                grammar_generation_ms=5.0,
+            )
+            result = router.route(snap, context_tokens=[1, 2])
+
+        assert result.selected_tools == ("alpha", "beta")
+
+    def test_multi_tool_respects_top_k(self) -> None:
+        """Result is capped at top_k even if model outputs more."""
+        from tgirl.rerank import ToolRouter
+
+        mock_gs = _make_mock_grammar_state()
+        factory = MagicMock(return_value=mock_gs)
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        decode = MagicMock(return_value="alpha beta gamma")
+        embeddings = torch.randn(100, 32)
+
+        config = RerankConfig(top_k=2)
+        router = ToolRouter(
+            grammar_guide_factory=factory,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            config=config,
+        )
+        snap = _make_snapshot(["alpha", "beta", "gamma"])
+
+        with patch("tgirl.rerank.run_constrained_generation") as mock_gen:
+            from tgirl.sample import ConstrainedGenerationResult
+
+            mock_gen.return_value = ConstrainedGenerationResult(
+                tokens=[5, 6, 7],
+                hy_source="alpha beta gamma",
+                grammar_valid_counts=[3, 3, 3],
+                temperatures_applied=[0.3, 0.3, 0.3],
+                wasserstein_distances=[0.0, 0.0, 0.0],
+                top_p_applied=[-1.0, -1.0, -1.0],
+                token_log_probs=[-0.5, -0.5, -0.5],
+                ot_computation_total_ms=1.0,
+                ot_bypassed_count=0,
+                ot_bypass_reasons=[None, None, None],
+                ot_iterations=[5, 5, 5],
+                grammar_generation_ms=5.0,
+            )
+            result = router.route(snap, context_tokens=[1, 2])
+
+        assert len(result.selected_tools) == 2
+        assert result.selected_tools == ("alpha", "beta")
+
+    def test_top_k_1_backwards_compat(self) -> None:
+        """top_k=1 (default) produces single-element tuple as before."""
+        from tgirl.rerank import ToolRouter
+
+        mock_gs = _make_mock_grammar_state()
+        factory = MagicMock(return_value=mock_gs)
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        decode = MagicMock(return_value="alpha")
+        embeddings = torch.randn(100, 32)
+
+        router = ToolRouter(
+            grammar_guide_factory=factory,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+        )
+        snap = _make_snapshot(["alpha", "beta"])
+
+        with patch("tgirl.rerank.run_constrained_generation") as mock_gen:
+            from tgirl.sample import ConstrainedGenerationResult
+
+            mock_gen.return_value = ConstrainedGenerationResult(
+                tokens=[5],
+                hy_source="alpha",
+                grammar_valid_counts=[2],
+                temperatures_applied=[0.3],
+                wasserstein_distances=[0.0],
+                top_p_applied=[-1.0],
+                token_log_probs=[-0.5],
+                ot_computation_total_ms=1.0,
+                ot_bypassed_count=0,
+                ot_bypass_reasons=[None],
+                ot_iterations=[5],
+                grammar_generation_ms=5.0,
+            )
+            result = router.route(snap, context_tokens=[1, 2])
+
+        assert result.selected_tools == ("alpha",)
+
+    def test_multi_tool_passes_top_k_to_grammar(self) -> None:
+        """Router passes top_k to generate_routing_grammar."""
+        from tgirl.rerank import ToolRouter
+
+        mock_gs = _make_mock_grammar_state()
+        factory = MagicMock(return_value=mock_gs)
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        decode = MagicMock(return_value="alpha")
+        embeddings = torch.randn(100, 32)
+
+        config = RerankConfig(top_k=3)
+        router = ToolRouter(
+            grammar_guide_factory=factory,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            config=config,
+        )
+        snap = _make_snapshot(["alpha", "beta"])
+
+        with patch("tgirl.rerank.run_constrained_generation") as mock_gen, \
+             patch("tgirl.rerank.generate_routing_grammar") as mock_grammar:
+            from tgirl.sample import ConstrainedGenerationResult
+
+            mock_grammar.return_value = (
+                'start: tool_list\n'
+                'tool_list: tool_choice (" " tool_choice)~0..2\n'
+                'tool_choice: "alpha" | "beta"\n'
+            )
+            mock_gen.return_value = ConstrainedGenerationResult(
+                tokens=[5],
+                hy_source="alpha",
+                grammar_valid_counts=[2],
+                temperatures_applied=[0.3],
+                wasserstein_distances=[0.0],
+                top_p_applied=[-1.0],
+                token_log_probs=[-0.5],
+                ot_computation_total_ms=1.0,
+                ot_bypassed_count=0,
+                ot_bypass_reasons=[None],
+                ot_iterations=[5],
+                grammar_generation_ms=5.0,
+            )
+            router.route(snap, context_tokens=[1, 2])
+
+            # Verify top_k was passed to generate_routing_grammar
+            mock_grammar.assert_called_once()
+            _, kwargs = mock_grammar.call_args
+            assert kwargs.get("top_k") == 3 or (
+                mock_grammar.call_args[0]
+                and len(mock_grammar.call_args[0]) > 1
+                and mock_grammar.call_args[0][1] == 3
+            )
 
 
 class TestToolRouterMlxPath:
@@ -464,6 +698,8 @@ class TestToolRouterMlxPath:
                 token_log_probs=[-0.5],
                 ot_computation_total_ms=1.0,
                 ot_bypassed_count=0,
+                ot_bypass_reasons=[None],
+                ot_iterations=[5],
                 grammar_generation_ms=5.0,
             )
             result = router.route(snap, context_tokens=[1, 2])
@@ -511,6 +747,8 @@ class TestToolRouterMlxPath:
                 token_log_probs=[-0.5],
                 ot_computation_total_ms=1.0,
                 ot_bypassed_count=0,
+                ot_bypass_reasons=[None],
+                ot_iterations=[5],
                 grammar_generation_ms=5.0,
             )
             router.route(snap, context_tokens=[1, 2])

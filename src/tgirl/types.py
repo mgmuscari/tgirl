@@ -151,6 +151,7 @@ class ParameterDef(BaseModel):
     type_repr: TypeRepr
     default: Any = None
     has_default: bool = False
+    description: str = ""
 
 
 class ToolDefinition(BaseModel):
