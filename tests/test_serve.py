@@ -494,3 +494,325 @@ class TestCli:
         runner = CliRunner()
         result = runner.invoke(serve, ["--help"])
         assert "8420" in result.output
+
+    def test_serve_has_tools_option(self) -> None:
+        """CLI serve command has --tools option."""
+        from click.testing import CliRunner
+
+        from tgirl.cli import serve
+
+        runner = CliRunner()
+        result = runner.invoke(serve, ["--help"])
+        assert result.exit_code == 0
+        assert "--tools" in result.output
+
+    def test_serve_loads_tools_from_module(self, tmp_path: Any) -> None:
+        """CLI --tools loads a Python module that defines a register() function."""
+        from click.testing import CliRunner
+
+        from tgirl.cli import load_tools_from_path, serve
+
+        # Create a temp tool module with a register() function
+        tool_file = tmp_path / "my_tools.py"
+        tool_file.write_text(
+            "def register(registry):\n"
+            "    @registry.tool()\n"
+            "    def my_add(a: int, b: int) -> int:\n"
+            "        return a + b\n"
+        )
+
+        registry = ToolRegistry()
+        load_tools_from_path(str(tool_file), registry)
+        assert len(registry) == 1
+        snap = registry.snapshot()
+        assert any(t.name == "my_add" for t in snap.tools)
+
+    def test_serve_loads_tools_registry_var(self, tmp_path: Any) -> None:
+        """CLI --tools loads a Python module that defines a module-level registry."""
+        from tgirl.cli import load_tools_from_path
+
+        tool_file = tmp_path / "tools_with_registry.py"
+        tool_file.write_text(
+            "from tgirl.registry import ToolRegistry\n"
+            "registry = ToolRegistry()\n"
+            "@registry.tool()\n"
+            "def my_sub(a: int, b: int) -> int:\n"
+            "    return a - b\n"
+        )
+
+        target_registry = ToolRegistry()
+        load_tools_from_path(str(tool_file), target_registry)
+        assert len(target_registry) == 1
+        snap = target_registry.snapshot()
+        assert any(t.name == "my_sub" for t in snap.tools)
+
+    def test_serve_loads_tools_from_directory(self, tmp_path: Any) -> None:
+        """CLI --tools loads all .py files from a directory."""
+        from tgirl.cli import load_tools_from_path
+
+        # Create two tool modules in a directory
+        (tmp_path / "tool_a.py").write_text(
+            "def register(registry):\n"
+            "    @registry.tool()\n"
+            "    def tool_a(x: int) -> int:\n"
+            "        return x\n"
+        )
+        (tmp_path / "tool_b.py").write_text(
+            "def register(registry):\n"
+            "    @registry.tool()\n"
+            "    def tool_b(x: int) -> int:\n"
+            "        return x * 2\n"
+        )
+
+        registry = ToolRegistry()
+        load_tools_from_path(str(tmp_path), registry)
+        assert len(registry) == 2
+
+
+class TestGenerateRequestParams:
+    """Tests for wiring GenerateRequest params to SamplingSession."""
+
+    def test_restrict_tools_passed_to_session(self) -> None:
+        """restrict_tools filters the registry snapshot passed to session."""
+        from tgirl.serve import create_app
+
+        registry = ToolRegistry()
+
+        @registry.tool()
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        @registry.tool()
+        def sub(a: int, b: int) -> int:
+            return a - b
+
+        ctx = _make_mock_ctx(tools=registry)
+        app = create_app(ctx)
+
+        mock_result = MagicMock()
+        mock_result.output_text = "ok"
+        mock_result.tool_calls = []
+        mock_result.total_tokens = 1
+        mock_result.total_cycles = 0
+        mock_result.wall_time_ms = 1.0
+        mock_result.quotas_consumed = {}
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with patch(
+            "tgirl.serve._run_session_chat",
+            return_value=mock_result,
+        ) as mock_run:
+            resp = client.post(
+                "/generate",
+                json={"intent": "test", "restrict_tools": ["add"]},
+            )
+            assert resp.status_code == 200
+            # Check that _run_session_chat was called with a registry
+            # that only contains the restricted tools
+            call_args = mock_run.call_args
+            called_ctx = call_args[0][0] if call_args[0] else call_args[1].get("ctx")
+            # The ctx should have a filtered registry
+            snap = called_ctx.registry.snapshot()
+            tool_names = {t.name for t in snap.tools}
+            assert tool_names == {"add"}
+
+    def test_ot_epsilon_passed_to_transport_config(self) -> None:
+        """ot_epsilon creates a TransportConfig with custom epsilon."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        app = create_app(ctx)
+
+        mock_result = MagicMock()
+        mock_result.output_text = "ok"
+        mock_result.tool_calls = []
+        mock_result.total_tokens = 1
+        mock_result.total_cycles = 0
+        mock_result.wall_time_ms = 1.0
+        mock_result.quotas_consumed = {}
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with patch(
+            "tgirl.serve._run_session_chat",
+            return_value=mock_result,
+        ) as mock_run:
+            resp = client.post(
+                "/generate",
+                json={"intent": "test", "ot_epsilon": 0.05},
+            )
+            assert resp.status_code == 200
+            call_args = mock_run.call_args
+            # transport_config is the 4th positional arg (index 3)
+            transport_config = call_args[0][3]
+            assert transport_config.epsilon == 0.05
+
+    def test_base_temperature_passed_to_hooks(self) -> None:
+        """base_temperature creates a GrammarTemperatureHook."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        app = create_app(ctx)
+
+        mock_result = MagicMock()
+        mock_result.output_text = "ok"
+        mock_result.tool_calls = []
+        mock_result.total_tokens = 1
+        mock_result.total_cycles = 0
+        mock_result.wall_time_ms = 1.0
+        mock_result.quotas_consumed = {}
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with patch(
+            "tgirl.serve._run_session_chat",
+            return_value=mock_result,
+        ) as mock_run:
+            resp = client.post(
+                "/generate",
+                json={"intent": "test", "base_temperature": 0.5},
+            )
+            assert resp.status_code == 200
+            call_args = mock_run.call_args
+            # hooks is the 5th positional arg (index 4)
+            hooks_arg = call_args[0][4]
+            assert hooks_arg is not None
+            assert len(hooks_arg) >= 1
+            # Find the GrammarTemperatureHook
+            from tgirl.sample import GrammarTemperatureHook
+            temp_hooks = [
+                h for h in hooks_arg
+                if isinstance(h, GrammarTemperatureHook)
+            ]
+            assert len(temp_hooks) == 1
+            assert temp_hooks[0].base_temperature == 0.5
+
+    def test_scopes_passed_to_snapshot(self) -> None:
+        """scopes filters registry snapshot via scopes parameter."""
+        from tgirl.serve import create_app
+
+        registry = ToolRegistry()
+
+        @registry.tool(scope="admin")
+        def admin_tool(x: int) -> int:
+            return x
+
+        @registry.tool()
+        def public_tool(x: int) -> int:
+            return x
+
+        ctx = _make_mock_ctx(tools=registry)
+        app = create_app(ctx)
+
+        mock_result = MagicMock()
+        mock_result.output_text = "ok"
+        mock_result.tool_calls = []
+        mock_result.total_tokens = 1
+        mock_result.total_cycles = 0
+        mock_result.wall_time_ms = 1.0
+        mock_result.quotas_consumed = {}
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with patch(
+            "tgirl.serve._run_session_chat",
+            return_value=mock_result,
+        ) as mock_run:
+            # Request with no admin scope — admin_tool should be excluded
+            resp = client.post(
+                "/generate",
+                json={"intent": "test", "scopes": ["user"]},
+            )
+            assert resp.status_code == 200
+            call_args = mock_run.call_args
+            called_ctx = call_args[0][0]
+            snap = called_ctx.registry.snapshot()
+            tool_names = {t.name for t in snap.tools}
+            # admin_tool requires "admin" scope, only "user" was given
+            assert "admin_tool" not in tool_names
+            # public_tool has no scope restriction
+            assert "public_tool" in tool_names
+
+    def test_max_cost_passed_to_session_config(self) -> None:
+        """max_cost sets session_cost_budget in SessionConfig."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        app = create_app(ctx)
+
+        mock_result = MagicMock()
+        mock_result.output_text = "ok"
+        mock_result.tool_calls = []
+        mock_result.total_tokens = 1
+        mock_result.total_cycles = 0
+        mock_result.wall_time_ms = 1.0
+        mock_result.quotas_consumed = {}
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with patch(
+            "tgirl.serve._run_session_chat",
+            return_value=mock_result,
+        ) as mock_run:
+            resp = client.post(
+                "/generate",
+                json={"intent": "test", "max_cost": 10.0},
+            )
+            assert resp.status_code == 200
+            call_args = mock_run.call_args
+            # session_config is the 3rd positional arg (index 2)
+            session_config = call_args[0][2]
+            assert session_config.session_cost_budget == 10.0
+
+    def test_none_params_use_defaults(self) -> None:
+        """When request params are None, defaults from create_app are used."""
+        from tgirl.serve import create_app
+        from tgirl.transport import TransportConfig
+        from tgirl.types import SessionConfig
+
+        default_session_config = SessionConfig(session_cost_budget=99.0)
+        default_transport = TransportConfig(epsilon=0.2)
+
+        ctx = _make_mock_ctx()
+        app = create_app(
+            ctx,
+            session_config=default_session_config,
+            transport_config=default_transport,
+        )
+
+        mock_result = MagicMock()
+        mock_result.output_text = "ok"
+        mock_result.tool_calls = []
+        mock_result.total_tokens = 1
+        mock_result.total_cycles = 0
+        mock_result.wall_time_ms = 1.0
+        mock_result.quotas_consumed = {}
+
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        with patch(
+            "tgirl.serve._run_session_chat",
+            return_value=mock_result,
+        ) as mock_run:
+            resp = client.post(
+                "/generate",
+                json={"intent": "test"},
+            )
+            assert resp.status_code == 200
+            call_args = mock_run.call_args
+            # Should use original ctx (not filtered)
+            called_ctx = call_args[0][0]
+            assert called_ctx is ctx
+            # Should use default session_config
+            session_cfg = call_args[0][2]
+            assert session_cfg is default_session_config
+            # Should use default transport_config
+            transport_cfg = call_args[0][3]
+            assert transport_cfg is default_transport

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import structlog
@@ -320,6 +320,30 @@ def _run_session_chat(
     return session.run_chat(messages)
 
 
+def _filter_registry(
+    registry: ToolRegistry,
+    *,
+    restrict_tools: list[str] | None = None,
+    scopes: list[str] | None = None,
+) -> ToolRegistry:
+    """Create a new ToolRegistry containing only the requested tools.
+
+    Uses the snapshot filtering mechanism to determine which tools pass,
+    then copies matching tool definitions and callables into a new registry.
+    """
+    snapshot = registry.snapshot(
+        restrict_to=restrict_tools,
+        scopes=set(scopes) if scopes else None,
+    )
+    filtered = ToolRegistry()
+    for tool_def in snapshot.tools:
+        # Copy the tool definition and callable into the new registry
+        callable_fn = registry.get_callable(tool_def.name)
+        filtered._tools[tool_def.name] = tool_def
+        filtered._callables[tool_def.name] = callable_fn
+    return filtered
+
+
 def create_app(
     ctx: InferenceContext,
     session_config: SessionConfig | None = None,
@@ -357,13 +381,65 @@ def create_app(
     async def generate(request: GenerateRequest) -> GenerateResponse:
         messages = [{"role": "user", "content": request.intent}]
         try:
+            # Build per-request overrides from GenerateRequest params
+            req_ctx = ctx
+            req_session_config = session_config
+            req_transport_config = transport_config
+            req_hooks = hooks
+
+            # Filter registry by restrict_tools and/or scopes
+            if request.restrict_tools is not None or request.scopes is not None:
+                filtered_registry = _filter_registry(
+                    ctx.registry,
+                    restrict_tools=request.restrict_tools,
+                    scopes=request.scopes,
+                )
+                req_ctx = replace(ctx, registry=filtered_registry)
+
+            # Override transport epsilon
+            if request.ot_epsilon is not None:
+                from tgirl.transport import TransportConfig as TC
+
+                if transport_config is not None:
+                    req_transport_config = transport_config.model_copy(
+                        update={"epsilon": request.ot_epsilon}
+                    )
+                else:
+                    req_transport_config = TC(epsilon=request.ot_epsilon)
+
+            # Override base temperature via hook
+            if request.base_temperature is not None:
+                from tgirl.sample import GrammarTemperatureHook
+
+                temp_hook = GrammarTemperatureHook(
+                    base_temperature=request.base_temperature
+                )
+                # Replace any existing GrammarTemperatureHook, keep others
+                base_hooks = [
+                    h
+                    for h in (hooks or [])
+                    if not isinstance(h, GrammarTemperatureHook)
+                ]
+                req_hooks = base_hooks + [temp_hook]
+
+            # Override session cost budget
+            if request.max_cost is not None:
+                if session_config is not None:
+                    req_session_config = session_config.model_copy(
+                        update={"session_cost_budget": request.max_cost}
+                    )
+                else:
+                    req_session_config = SessionConfig(
+                        session_cost_budget=request.max_cost
+                    )
+
             result = await asyncio.to_thread(
                 _run_session_chat,
-                ctx,
+                req_ctx,
                 messages,
-                session_config,
-                transport_config,
-                hooks,
+                req_session_config,
+                req_transport_config,
+                req_hooks,
             )
             tool_call_responses = [
                 ToolCallResponse(
