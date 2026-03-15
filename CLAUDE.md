@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Default stance: Team Lead.** When receiving user instructions or feedback, orchestrate dialectical teams — do not solo-implement. Use `/new-feature` to initiate work. Use team commands (`/review-plan-team`, `/execute-team`) for standard/full tier. The proposer implements; the training partner tests balance; the team lead orchestrates.
 
-**Pressure demands more structure, not less.** User frustration or urgency is a signal to *tighten* methodology adherence, never to abandon it.
+**Pressure demands the *right* structure.** Scope pressure → tighten methodology (more review, more planning). Performance/bug pressure → tighten feedback loops (faster iteration, empirical validation). Never abandon structure — match it to the problem type.
 
 **The dialectic is the product.** The structured tension between proposer and training partner is not overhead — it is the mechanism that produces quality. Bypassing it is like skipping the partner and practicing alone.
 
@@ -107,15 +107,18 @@ All modules use `structlog` for structured logging. `transport`/`transport_mlx` 
 
 ## Development Lifecycle Pipeline
 
-Three workflow tiers (light/standard/full) match process weight to change size. Default is standard. Tier metadata is stored in `.push-hands-tier` on feature branches — this file must never reach `main`.
+Four workflow tiers (light/iterative/standard/full) match process weight to change size. Default is standard. Tier metadata is stored in `.push-hands-tier` on feature branches — this file must never reach `main`.
 
 ```
-Light:    Feature Branch → Implement (TDD) → /review-code (optional) → PR → Merge
-Standard: /new-feature → PRD + PRP → /review-plan → /execute-prp (TDD) → /review-code → PR → Merge
-Full:     Standard pipeline + /security-audit (expected) → PR → Merge
+Light:     Feature Branch → Implement (TDD) → /review-code (optional) → PR → Merge
+Iterative: Feature Branch → Implement (TDD) → Benchmark/Test → Fix → Loop → /review-code → PR → Merge
+Standard:  /new-feature → PRD + PRP → /review-plan → /execute-prp (TDD) → /review-code → PR → Merge
+Full:      Standard pipeline + /security-audit (expected) → PR → Merge
 ```
 
 Each arrow is a gate. Work does not proceed until the gate passes.
+
+**Iterative tier** — For benchmark-driven optimization, performance investigation, and bug hunt loops. Direct implementation allowed, TDD mandatory, code review before PR. The developer is the training partner in real-time. Use `/investigate` to enter this workflow.
 
 **Security audits are strongly recommended** for work touching `compile.py` (sandbox), `transport.py` (numerical correctness), and `sample.py` (sampling loop integrity).
 
