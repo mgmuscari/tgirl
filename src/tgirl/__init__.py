@@ -1,4 +1,4 @@
-"""tgirl: Transformational Grammar for Inference-Restricting Languages."""
+"""tgirl: Transformational Generator for Inference-Restricting Languages."""
 
 from annotated_types import Ge, Gt, Le, Lt, MultipleOf
 

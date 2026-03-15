@@ -1,6 +1,6 @@
 # tgirl
 
-**Transformational Grammar for Inference-Restricting Languages**
+**Transformational Generator for Inference-Restricting Languages**
 
 A Python library for local LLM inference with grammar-constrained compositional tool calling. tgirl makes invalid tool calls inexpressible at the token level — not caught at runtime, not retried, not hallucinated. Impossible.
 

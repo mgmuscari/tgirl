@@ -37,6 +37,13 @@ yarn-error.log*
 .env.local
 .env.*.local
 
+# Benchmark outputs
+result/
+benchmarks/*.log
+
+# Claude Code session artifacts
+.claude/scheduled_tasks.lock
+
 # Worktrees (parallel sessions)
 # Git worktrees are created outside this directory, but ignore any local artifacts
 *.worktree
