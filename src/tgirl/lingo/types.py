@@ -55,7 +55,10 @@ class TypeHierarchy:
             all_names.add(defn.name)
             if defn.name not in direct_supers:
                 direct_supers[defn.name] = set()
-                logger.warning("Addendum for unknown type %r (no := definition)", defn.name)
+                logger.warning(
+                    "Addendum for unknown type %r (no := def)",
+                    defn.name,
+                )
             self._addenda.setdefault(defn.name, []).append(defn)
 
         # Ensure all referenced supertypes have entries
@@ -106,7 +109,10 @@ class TypeHierarchy:
         # Handle any remaining types (cycles — shouldn't happen in valid TDL)
         for name in all_names:
             if name not in self._ancestors:
-                logger.warning("Type %r involved in cycle, using partial ancestors", name)
+                logger.warning(
+                    "Type %r in cycle, using partial ancestors",
+                    name,
+                )
                 anc = {name}
                 for st in direct_supers.get(name, set()):
                     if st in self._ancestors:

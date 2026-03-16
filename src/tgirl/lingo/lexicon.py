@@ -7,15 +7,15 @@ Parses TDL lexicon entries and builds a mapping from surface forms
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from tgirl.lingo.tdl_parser import (
+    TdlConj,
     TdlDefinition,
     TdlFeatStruct,
     TdlList,
     TdlString,
-    TdlConj,
 )
 
 logger = logging.getLogger(__name__)

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import collections
 import logging
-from typing import Callable
+from collections.abc import Callable
+from pathlib import Path
 
 import mlx.core as mx
 
@@ -38,9 +39,8 @@ class CoherenceTracker:
     def advance(self, token_id: int) -> None:
         """Record a token and update the coherence window."""
         is_known = self._map.is_known_token(token_id)
-        if len(self._window) == self._window_size:
-            if self._window[0]:
-                self._known_count -= 1
+        if len(self._window) == self._window_size and self._window[0]:
+            self._known_count -= 1
         self._window.append(is_known)
         if is_known:
             self._known_count += 1
@@ -120,19 +120,17 @@ class LingoGrammar:
         return LingoGrammarState(token_map, tracker, vocab_size)
 
 
-def load_grammar(path: str | "Path") -> LingoGrammar:
+def load_grammar(path: str | Path) -> LingoGrammar:
     """Load a TDL grammar from a directory.
 
     Starting from english.tdl, recursively follows all :include directives
     to parse every referenced TDL file. Builds the type hierarchy and
     lexicon from all collected definitions.
     """
-    from pathlib import Path as _Path
-
     from tgirl.lingo.lexicon import load_lexicon
     from tgirl.lingo.tdl_parser import TdlDefinition, parse_tdl_directory
 
-    grammar_path = _Path(path)
+    grammar_path = Path(path)
     top_file = grammar_path / "english.tdl"
     if not top_file.exists():
         raise FileNotFoundError(f"Top-level TDL file not found: {top_file}")

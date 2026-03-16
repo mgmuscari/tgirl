@@ -9,11 +9,14 @@ Design: docs/design/adsr-envelope.md
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from tgirl.types import ModelIntervention
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import mlx.core as mx
@@ -43,7 +46,7 @@ class EnvelopeState:
     prev_depth: int = 0
     prev_freedom: float = 1.0
     peak_freedom: float = 0.0
-    prev_smoothed: list[float] = field(default_factory=lambda: [0.0] * 11)
+    prev_smoothed: list[float] = field(default_factory=lambda: [0.0] * 12)
     # Hysteresis state
     pending_phase: str | None = None  # candidate phase waiting for confirmation
     pending_count: int = 0  # consecutive tokens meeting transition condition
@@ -171,6 +174,7 @@ DEFAULT_MATRIX: list[list[float]] = [
     [-0.04, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # 8: sustain (-0.04 → temp ~0.01)
     [-0.02,  0.1,  10.0,  -0.05, -80.0,  0.0,   0.0],  # 9: release
     [-0.05,  0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # 10: cycle (drops temp too)
+    [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 11: linguistic_coherence (zero = no-op)
 ]
 # fmt: on
 
@@ -192,6 +196,7 @@ DEFAULT_CONDITIONERS: tuple[SourceConditionerConfig, ...] = (
     SourceConditionerConfig(),  # 8: phase_sustain
     SourceConditionerConfig(),  # 9: phase_release
     SourceConditionerConfig(),  # 10: cycle_detected
+    SourceConditionerConfig(range_min=0.0, range_max=1.0),  # 11: linguistic_coherence
 )
 
 
@@ -215,25 +220,58 @@ class EnvelopeConfig:
     repetition_bias_range: tuple[float, float] = (-100.0, 0.0)
     epsilon_range: tuple[float, float] = (0.01, 1.0)
 
-    # Source conditioners (11 entries)
+    # Source conditioners (12 entries)
     conditioners: tuple[SourceConditionerConfig, ...] = field(
         default_factory=lambda: DEFAULT_CONDITIONERS,
     )
 
-    # The matrix itself -- shape (11, 7), stored as flat tuple
+    # The matrix itself -- shape (12, 7), stored as flat tuple
     matrix_flat: tuple[float, ...] = field(
         default_factory=lambda: DEFAULT_MATRIX_FLAT,
     )
 
+    def __post_init__(self) -> None:
+        rows, cols = 12, 7
+        expected_flat = rows * cols
+        # Backward compatibility: auto-pad old 11-row configs
+        if len(self.matrix_flat) == 77 and expected_flat == 84:
+            logger.warning(
+                "EnvelopeConfig: padding matrix_flat from 77 to 84 (11→12 rows)"
+            )
+            object.__setattr__(
+                self, "matrix_flat",
+                tuple(list(self.matrix_flat) + [0.0] * cols),
+            )
+        elif len(self.matrix_flat) != expected_flat:
+            raise ValueError(
+                f"matrix_flat has {len(self.matrix_flat)} values, "
+                f"expected {expected_flat} for shape ({rows}, {cols})"
+            )
+        if len(self.conditioners) == 11 and rows == 12:
+            logger.warning(
+                "EnvelopeConfig: padding conditioners from 11 to 12"
+            )
+            object.__setattr__(
+                self, "conditioners",
+                tuple(list(self.conditioners) + [
+                    SourceConditionerConfig(range_min=0.0, range_max=1.0),
+                ]),
+            )
+        elif len(self.conditioners) != rows:
+            raise ValueError(
+                f"conditioners has {len(self.conditioners)} entries, "
+                f"expected {rows}"
+            )
+
     @property
     def matrix_shape(self) -> tuple[int, int]:
-        return (11, 7)
+        return (12, 7)
 
 
 class ModMatrixHookMlx:
     """Phase-aware modulation matrix for constrained generation.
 
-    Routes 11 source signals through an (11, 7) matrix to produce
+    Routes 12 source signals through a (12, 7) matrix to produce
     7 parameter modulations per token. Replaces GrammarTemperatureHook
     and NestingDepthHook with a single configurable hook.
     """
@@ -244,12 +282,14 @@ class ModMatrixHookMlx:
         tokenizer_decode: Callable[[list[int]], str],
         vocab_size: int,
         max_tokens: int = 128,
+        coherence_fn: Callable[[], float] | None = None,
     ) -> None:
         import mlx.core as mx
 
         self.config = config
         self.max_tokens = max_tokens
-        self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+        self._coherence_fn = coherence_fn
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 12)
         self.last_telemetry: EnvelopeTelemetry | None = None
 
         # Build mod matrix as mx.array from flat config
@@ -274,7 +314,7 @@ class ModMatrixHookMlx:
 
     def reset(self) -> None:
         """Reset state for new constrained generation pass."""
-        self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 12)
         self.last_telemetry = None
 
     def advance(self, token_id: int) -> None:
@@ -318,8 +358,11 @@ class ModMatrixHookMlx:
             else 0.0
         )
 
-        # 4. Build source vector (conditioned)
-        # n=11 Python scalars — documented deviation, sub-microsecond
+        # 4. Linguistic coherence (from LingoGrammarState if wired)
+        coherence = self._coherence_fn() if self._coherence_fn else 0.0
+
+        # 5. Build source vector (conditioned)
+        # n=12 Python scalars — documented deviation, sub-microsecond
         raw_sources = [
             freedom,
             entropy,
@@ -332,6 +375,7 @@ class ModMatrixHookMlx:
             1.0 if phase == "sustain" else 0.0,
             1.0 if phase == "release" else 0.0,
             cycle,
+            coherence,
         ]
         conditioned = []
         for i, (raw, scfg) in enumerate(
@@ -448,12 +492,14 @@ class ModMatrixHook:
         tokenizer_decode: Callable[[list[int]], str],
         vocab_size: int,
         max_tokens: int = 128,
+        coherence_fn: Callable[[], float] | None = None,
     ) -> None:
         import torch as _torch
 
         self.config = config
         self.max_tokens = max_tokens
-        self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+        self._coherence_fn = coherence_fn
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 12)
 
         # Build mod matrix as torch.Tensor
         rows, cols = config.matrix_shape
@@ -477,7 +523,7 @@ class ModMatrixHook:
 
     def reset(self) -> None:
         """Reset state for new constrained generation pass."""
-        self._state = EnvelopeState(prev_smoothed=[0.0] * 11)
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 12)
 
     def advance(self, token_id: int) -> None:
         """Update depth after token sampled."""
@@ -533,7 +579,10 @@ class ModMatrixHook:
             else 0.0
         )
 
-        # 4. Build conditioned source vector
+        # 4. Linguistic coherence
+        coherence = self._coherence_fn() if self._coherence_fn else 0.0
+
+        # 5. Build conditioned source vector
         raw_sources = [
             freedom,
             entropy,
@@ -546,6 +595,7 @@ class ModMatrixHook:
             1.0 if phase == "sustain" else 0.0,
             1.0 if phase == "release" else 0.0,
             cycle,
+            coherence,
         ]
         conditioned = []
         for i, (raw, scfg) in enumerate(

@@ -13,8 +13,18 @@ from tgirl.lingo.grammar_state import (
     LingoGrammarState,
     load_grammar,
 )
-from tgirl.lingo.lexicon import LexEntry, Lexicon, TokenLexemeMap, load_lexicon
-from tgirl.lingo.tdl_parser import parse_tdl, parse_tdl_directory, parse_tdl_file, tokenize_tdl
+from tgirl.lingo.lexicon import (
+    LexEntry,
+    Lexicon,
+    TokenLexemeMap,
+    load_lexicon,
+)
+from tgirl.lingo.tdl_parser import (
+    parse_tdl,
+    parse_tdl_directory,
+    parse_tdl_file,
+    tokenize_tdl,
+)
 from tgirl.lingo.types import TypeHierarchy
 
 __all__ = [

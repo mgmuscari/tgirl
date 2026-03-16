@@ -104,7 +104,7 @@ class TestPhaseDetection:
     """Tests for EnvelopeState.detect_phase with hysteresis."""
 
     def _make_state(self, **kwargs) -> EnvelopeState:
-        defaults = {"prev_smoothed": [0.0] * 11}
+        defaults = {"prev_smoothed": [0.0] * 12}
         defaults.update(kwargs)
         return EnvelopeState(**defaults)
 
@@ -190,7 +190,7 @@ class TestPhaseDetection:
         - inner close paren triggers release (depth 2->1, depth <= 1)
         - outer close paren triggers release (depth 1->0)
         """
-        state = self._make_state(prev_smoothed=[0.0] * 11)
+        state = self._make_state(prev_smoothed=[0.0] * 12)
 
         # Opening '(' — depth 0 -> 1: attack
         state.advance_phase(freedom=0.8, depth=1)
@@ -229,7 +229,7 @@ class TestPhaseDetection:
 
     def test_advance_phase_tracks_peak_freedom(self) -> None:
         """Peak freedom is tracked during attack phase."""
-        state = self._make_state(prev_smoothed=[0.0] * 11)
+        state = self._make_state(prev_smoothed=[0.0] * 12)
         state.advance_phase(freedom=0.5, depth=1)
         assert state.peak_freedom == 0.5
         state.advance_phase(freedom=0.8, depth=1)
@@ -245,16 +245,16 @@ class TestEnvelopeConfig:
     """Tests for EnvelopeConfig and default matrix."""
 
     def test_default_matrix_shape(self) -> None:
-        assert len(DEFAULT_MATRIX) == 11
+        assert len(DEFAULT_MATRIX) == 12
         for row in DEFAULT_MATRIX:
             assert len(row) == 7
 
     def test_default_matrix_flat_length(self) -> None:
-        assert len(DEFAULT_MATRIX_FLAT) == 11 * 7
+        assert len(DEFAULT_MATRIX_FLAT) == 12 * 7
 
     def test_config_matrix_shape(self) -> None:
         cfg = EnvelopeConfig()
-        assert cfg.matrix_shape == (11, 7)
+        assert cfg.matrix_shape == (12, 7)
 
     def test_config_is_frozen(self) -> None:
         cfg = EnvelopeConfig()
@@ -284,7 +284,7 @@ class TestEnvelopeConfig:
 
     def test_conditioners_count(self) -> None:
         cfg = EnvelopeConfig()
-        assert len(cfg.conditioners) == 11
+        assert len(cfg.conditioners) == 12
 
     def test_matrix_weights_all_rows(self) -> None:
         """All matrix rows match the tuned default values."""
@@ -301,6 +301,7 @@ class TestEnvelopeConfig:
             [-0.04, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # sustain
             [-0.02,  0.1,  10.0,  -0.05, -80.0,  0.0,   0.0],  # release
             [-0.05,  0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # cycle
+            [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # linguistic_coherence
         ]
         # fmt: on
         for i, (actual, exp) in enumerate(
@@ -433,7 +434,7 @@ class TestModMatrixHookMlx:
         """Verify mod matrix is an mx.array (native MLX matmul)."""
         hook = _make_hook()
         assert isinstance(hook._mod_matrix, mx.array)
-        assert hook._mod_matrix.shape == (11, 7)
+        assert hook._mod_matrix.shape == (12, 7)
 
     def test_temperature_clamped_to_range(self) -> None:
         """Temperature is clamped within config range."""
@@ -594,14 +595,14 @@ class TestEnvelopeTelemetry:
             phase="attack",
             phase_position=0,
             depth=1,
-            source_vector=[0.5] * 11,
+            source_vector=[0.5] * 12,
             modulation_vector=[0.1] * 7,
             final_temperature=0.3,
             final_epsilon=0.1,
         )
         assert t.phase == "attack"
         assert t.depth == 1
-        assert len(t.source_vector) == 11
+        assert len(t.source_vector) == 12
         assert len(t.modulation_vector) == 7
 
     def test_telemetry_json_serializable(self) -> None:
@@ -609,7 +610,7 @@ class TestEnvelopeTelemetry:
             phase="sustain",
             phase_position=5,
             depth=2,
-            source_vector=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 0.0, 1.0, 0.0, 0.0],
+            source_vector=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
             modulation_vector=[0.3, 0.9, -20.0, 0.1, 0.0, 0.0, 0.0],
             final_temperature=0.45,
             final_epsilon=0.08,
