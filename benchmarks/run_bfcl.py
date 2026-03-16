@@ -224,7 +224,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     session_config = SessionConfig(
         max_tool_cycles=10,
         freeform_max_tokens=512,
-        constrained_max_tokens=128,
+        constrained_max_tokens=512,
         session_timeout=30.0,
     )
     session_hooks = [
