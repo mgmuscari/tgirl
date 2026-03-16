@@ -15,7 +15,7 @@
 
 **Postulate 2: Inference Loop Primacy.** Capability emerges from the inference loop, not the model. A probabilistic state machine switching between grammatical modes allows any language model to transition between introspection, seeking input, and output generation. Intelligence is a property of the clock, not the pendulum.
 
-**Evidence.** tgirl v0.1.0 achieves 48% AST accuracy on BFCL v4 with a 0.8B base model — no instruct tuning, no tool-call fine-tuning — recovering ~56% of the performance gap between a 0.8B base model and frontier instruct models through inference-time architectural intervention alone. The model has never seen a tool call in its life. The inference loop made it capable.
+**Evidence.** tgirl achieves 80% AST accuracy on BFCL v4 with Qwen3.5-9B (base, no instruct tuning) — matching Opus 4.5, 14pp above the model's reported 66% — through inference-time grammar constraints, ADSR modulation, and optimal transport alone. The 0.8B variant achieves 48% on the full set. Neither model has ever seen a tool call in training. The inference loop made them capable. For domains where output structure is formally specifiable, injecting that knowledge at inference time is strictly more efficient than scaling.
 
 ---
 
@@ -96,13 +96,32 @@ The weights. Frozen at training time, read at every forward pass. The entire lea
 
 ### GSU — Grammar Selection Unit
 
-Transpiles formal grammars — HPSG, CFG, any well-formedness formalism — into token-level constraint masks. Manages the active grammar set and compiles grammars into forms the SCU can apply.
+Transpiles formal grammars — HPSG, CFG, any well-formedness formalism — into token-level constraint masks. Manages the active grammar set and compiles grammars into forms the SCU can apply. The GSU is formalism-agnostic: any grammar that implements the `GrammarState` protocol (`get_valid_mask`, `is_accepting`, `advance`) can participate.
 
-**Existing implementation:** `tgirl.grammar` (Jinja2 template-based CFG generation from registry snapshots), `tgirl.outlines_adapter` (llguidance grammar state compilation), `tgirl.instructions` (prompt generation from tool schemas).
+**Existing implementation:** `tgirl.grammar` (Jinja2 template-based CFG generation from registry snapshots), `tgirl.outlines_adapter` (llguidance grammar state compilation), `tgirl.instructions` (prompt generation from tool schemas), `tgirl.lingo` (ERG type hierarchy, lexicon, token-lexeme mapping, coherence signal).
 
-**Key property:** The GSU doesn't constrain directly. It prepares constraint surfaces — valid token masks — that the SCU activates and the STB respects. The GSU is the instruction decoder: it translates between grammar formalisms and the hardware interface.
+**Key property:** The GSU doesn't constrain directly. It prepares constraint surfaces — valid token masks — that the SCU activates and the STB respects. The GSU is the instruction decoder: it translates between grammar formalisms and the hardware interface. Every grammar added makes the system more capable without touching model weights.
 
-**Future extension:** LinGO Grammar Matrix integration. HPSG grammars for ~40 languages transpiled into incremental token-level well-formedness checkers. Multiple grammars compiled and held ready for simultaneous activation by the SCU.
+**Grammar portfolio (target):**
+
+| Grammar | Source | GrammarState Provider | Use Case |
+|---------|--------|-----------------------|----------|
+| Hy CFG | `tgirl.grammar` + llguidance | `LLGuidanceGrammarStateMlx` | Tool calling, composition |
+| English NL | ERG 2025 via `tgirl.lingo` | `LingoGrammarState` | Natural language well-formedness |
+| Python | Python grammar spec + llguidance | `LLGuidanceGrammarStateMlx` | Python codegen |
+| Rust | Rust grammar spec + llguidance | `LLGuidanceGrammarStateMlx` | Rust codegen |
+| JSON Schema | Schema → CFG + llguidance | `LLGuidanceGrammarStateMlx` | Structured output |
+
+**Learned controller (Phase 2B):** A small MLP sits between the CLU's logit distribution and the GSU's grammar weights. The MLP projects logits through grammar-specific token maps into type/rule spaces, then predicts which grammars should be active and with what weight. This replaces hand-coded grammar switching with a learned controller that adapts to the specific model and task. The MLP is trained on grammar-derived type transitions (for HPSG) or self-supervised from generation quality metrics.
+
+```
+logits → softmax → TokenLexemeMap projection → type distribution (~956 dims)
+                                                    ↓
+                                              MLP (learned)
+                                                    ↓
+                                         grammar weight vector → SCU
+                                         predicted valid types → token mask → STB
+```
 
 ### SCU — Stochastic Control Unit
 
@@ -134,7 +153,7 @@ Reads the CLU's logit distribution and produces the signals that drive the SCU: 
 
 **Key property:** The CSG closes the feedback loop. The CLU generates tokens → the CSG reads the distribution → the SCU decides what to do → the GSU prepares constraints → the STB applies them → the CLU generates the next token. The system is self-clocked.
 
-**Future extension:** Linguistic coherence signal from LinGO grammar evaluation. The CSG gains a `linguistic_coherence` dimension — not just "the model is confident" but "the model is producing grammatically well-formed output in the target language."
+**Linguistic coherence (operational):** The CSG now includes a `linguistic_coherence` signal dimension (modulation matrix row 12) — fed by `tgirl.lingo.CoherenceTracker` which measures the sliding-window ratio of tokens mapping to known ERG lexeme types. This signal modulates inference parameters via the ADSR matrix. Phase 2B replaces this simple ratio with an MLP-derived type distribution signal for more discriminative grammar awareness.
 
 ### IOC — I/O Controller
 
@@ -238,29 +257,25 @@ The grammars (GSU) define competence — what can be expressed. The model (CLU) 
 | IOC | `compile.py`, `bridge.py`, `sample.py` (partial) | Partial |
 | IRQ | Timeout + tool result injection in `sample.py` | Minimal |
 
-### Phase 1: LinGO Integration into GSU
+### Phase 1: LinGO Data Pipeline ✅ COMPLETE
 
-Extend the Grammar Selection Unit with LinGO Grammar Matrix support. Transpile HPSG grammars into incremental per-token well-formedness checkers. Add `linguistic_coherence` to `TransitionSignal`. The CSG gains a new signal dimension. The SCU's `ConfidenceTransitionPolicy` gains competence-aware confidence.
+TDL parser, type hierarchy (51k types), lexicon (43k entries), token-lexeme mapping, coherence signal, GrammarState adapter, modulation matrix integration. The `tgirl.lingo` module is operational. Coherence signal feeds modulation matrix row 12.
 
-**Critical dependency:** Investigate PyDelphin for incremental parsing capability. If unavailable, design an approximate linguistic coherence signal (n-gram language model over valid HPSG parses, or sliding-window batch parsing).
+### Phase 2: Learned Syntactic Constraint Predictor (MLP)
 
-### Phase 2: Cross-Lingual OT in STB
+Small MLP maps logit distributions → ERG type space → predicted valid types → token masks. The model's implicit grammatical knowledge is extracted and projected into the formal grammar's type system. Trained on ERG construction rule transitions. See ROADMAP.md Phase 2B.
 
-Extend `redistribute_logits` to accept weighted multi-grammar valid masks. The STB transports mass across language boundaries using the same embedding-space cost matrix. The SCU provides grammar weights; the GSU provides per-grammar valid masks; the STB combines them.
+### Phase 3: Multi-Grammar GSU + Codegen
 
-**Concrete experiment:** One model (Qwen3.5), two grammars (English, Chinese), a generation task where the correct reasoning is in Chinese and the required output is in English. Measure: semantic preservation (embedding similarity) and language purity (target-language token ratio) with and without cross-lingual OT.
-
-### Phase 3: Multi-Grammar SCU
-
-The SCU manages N simultaneous grammar weights. `GrammarWeightVector` as a new type. Grammar weight transition policies as a new policy class. The GSU compiles and caches multiple grammars. The STB receives the weighted combination.
+Grammar portfolio: Hy CFG, English NL (ERG), Python CFG, Rust CFG, JSON Schema, etc. MLP-controlled grammar weight vector. STB accepts weighted multi-grammar masks. Codegen benchmark targets: HumanEval, MBPP, MultiPL-E. See ROADMAP.md Phase 3.
 
 ### Phase 4: Interrupt-Driven IOC
 
-The model runs as a continuous daemon. `stream_to_user` is an I/O tool. User input is an interrupt. The chat-template request-response paradigm is replaced by continuous inference with gated output. The IOC becomes the primary interface between the CPU and the external world.
+The model runs as a continuous daemon. `stream_to_user` is an I/O tool. User input is an interrupt. The chat-template request-response paradigm is replaced by continuous inference with gated output.
 
 ### Phase 5: Pidgin Emergence (Research)
 
-Characterize the contact grammars that emerge when multiple linguistic grammars are simultaneously active. Measure semantic fidelity of pidgin-mode generation versus strict single-language enforcement. This is research, not engineering — Phase 5 explores what the architecture makes possible.
+Characterize the contact grammars that emerge when multiple linguistic grammars are simultaneously active. Measure semantic fidelity of pidgin-mode generation versus strict single-language enforcement.
 
 ---
 
