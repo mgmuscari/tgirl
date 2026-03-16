@@ -127,6 +127,7 @@ Each arrow is a gate. Work does not proceed until the gate passes.
 ```
 Team Review:  /review-plan-team → concurrent PRP review + revision
 Team Execute: /execute-team → message-gated implementation (TDD) + incremental review
+Team Code:    /review-code-team → dual-agent code review (reviewer + defender)
 Team Audit:   /security-audit-team → dual-agent security audit with peer challenge
 ```
 
