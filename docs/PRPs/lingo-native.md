@@ -28,19 +28,26 @@ Full design: `docs/design/lingo-native-gsu.md`
 - `EnvelopeConfig.matrix_shape` (modulation.py:229-230) -- returns (12, 7)
 
 ### ERG source structure (~/ontologi/tools/erg-2025/)
-- `english.tdl` -- top-level load file with `:include` directives
+- `english.tdl` -- top-level load file with ~30 `:include` directives
 - `fundamentals.tdl` (5,182 lines) -- core type definitions with deep feature structures
-- `letypes.tdl` (1,974 lines) -- lexical entry types (956 leaf types for lexeme classification)
+- `lextypes.tdl` (29,966 lines, 2,924 definitions) -- full lexical type hierarchy (word classes)
+- `letypes.tdl` (1,974 lines, 256 definitions) -- leaf lexical entry types (yield of lextypes hierarchy)
+- `syntax.tdl` (14,693 lines) -- syntactic type definitions
+- `lexrules.tdl` (3,554 lines) -- lexical rule type definitions
 - `lexicon.tdl` (226,198 lines) -- 43,729 lexeme entries with ORTH, type, and features
-- `constructions.tdl` -- 293 construction rule instances
+- `constructions.tdl` (2,441 lines, 301 definitions) -- construction rule instances
 - `inflr.tdl` -- inflectional rules with `%suffix` directives and `%(letter-set ...)` macros
+- Plus ~20 additional files (tmr/, delims, ctype, auxverbs, gle, ple, roots, parse-nodes, etc.)
+
+**Note:** Both `lextypes.tdl` and `letypes.tdl` exist and are distinct. `lextypes.tdl` is the full hierarchy (2,924 types); `letypes.tdl` is the leaf subset (256 types). Both are included by `english.tdl`. The `load_grammar()` function must follow `:include` directives recursively from `english.tdl` to capture all ~51k type definitions across all files.
 
 ### TDL syntax constructs to parse
 ```
 ; Line comment
 #| Block comment |#
-type := supertype1 & supertype2.             ; type with supertypes
+type := supertype1 & supertype2.             ; type with supertypes (definition)
 type := supertype & [ FEAT value ].          ; type with feature structure
+type :+ [ FEAT value ].                      ; addendum (merge into existing type)
 type := supertype & [ FEAT.PATH value ].     ; dot-separated feature path
 type := supertype & [ FEAT #coref ].         ; coreference variable
 type := supertype & [ FEAT < elem1, elem2 > ]. ; list
@@ -74,12 +81,25 @@ Build a recursive descent parser for TDL syntax. The parser produces an AST of `
 - `section: str | None` -- section context (`:begin :type`, `:begin :instance`, etc.)
 
 Key parsing stages:
-1. **Tokenizer** -- split TDL text into tokens: identifiers, strings, operators (`:=`, `&`, `.`, `[`, `]`, `<`, `>`, `#`, `,`), comments (`;` to EOL, `#|...|#`), docstrings (`"""..."""`)
+1. **Tokenizer** -- split TDL text into tokens: identifiers, strings, operators (`:=`, `:+`, `&`, `.`, `[`, `]`, `<`, `>`, `#`, `,`), comments (`;` to EOL, `#|...|#`), docstrings (`"""..."""`)
 2. **Section tracking** -- parse `:begin :type.` / `:end :type.` and `:begin :instance :status <status>.` / `:end :instance.` directives
-3. **Definition parser** -- parse `name := body .` where body is supertypes `&` conjunction with optional feature structures
+3. **Definition parser** -- parse `name := body .` (definition) and `name :+ body .` (addendum) where body is supertypes `&` conjunction with optional feature structures. Addenda have no supertypes — their body is purely feature structures merged into the existing type.
 4. **Feature structure parser** -- parse `[ FEAT val, FEAT2 val2 ]` with nesting, dot paths, coreferences, and lists
-5. **Include handling** -- parse `:include "filename".` and return as a special AST node (caller resolves paths)
-6. **Suffix/letter-set** -- parse `%suffix (...)` and `%(letter-set (...))` as opaque AST nodes (v1 stores them but doesn't interpret)
+5. **Include handling** -- parse `:include "filename".` and return as a `TdlInclude` AST node. Resolution is handled by a dedicated `resolve_include(base_dir: Path, filename: str) -> Path` function with these rules:
+   - Try `base_dir / filename` first (handles includes with `.tdl` extension like `:include "lfr.tdl".`)
+   - If not found, try `base_dir / (filename + ".tdl")` (handles bare includes like `:include "fundamentals".`)
+   - Subdirectory paths resolve relative to `base_dir` (e.g., `:include "tmr/gml".` resolves to `base_dir/tmr/gml.tdl`)
+   - Raise `FileNotFoundError` with the include directive's file/line if neither path exists
+   - **Comment stripping must happen before directive detection.** Lines starting with `;` (like `;:include "bridges".` at english.tdl:110) are comments, not include directives. The tokenizer strips line comments first, so directive parsing never sees commented-out includes.
+   - **Section context propagates into included files.** When `:include "lexicon".` appears inside `:begin :instance :status lex-entry.` / `:end :instance.`, all definitions parsed from `lexicon.tdl` inherit `is_instance=True` and `section="instance:lex-entry"`. The include resolver must accept and pass through the current section context.
+6. **Suffix/letter-set** -- `%(letter-set (...))` directives appear at file scope as standalone top-level constructs; parse as opaque `TdlDirective` AST nodes. `%suffix (...)` directives appear *inside definition bodies* between `:=` and the supertype, e.g.:
+   ```
+   n_pl_olr :=
+   %suffix (!s !ss) (ch ches) ...
+   """docstring"""
+   n_pl_inflrule & [ ... ].
+   ```
+   The definition parser must recognize `%suffix` after `:=` as an optional component of the definition body. Store the suffix content as an opaque string on `TdlDefinition` (new field `suffix: str | None`), then continue parsing the docstring and type body normally. V1 does not interpret suffix rules but must not crash on them.
 
 The parser must handle:
 - UTF-8 encoded files with extended characters in letter-sets
@@ -135,6 +155,8 @@ class TdlDefinition:
     docstring: str | None
     section: str | None
     is_instance: bool
+    is_addendum: bool  # True for :+ definitions (merge into existing type)
+    suffix: str | None  # Raw %suffix content if present (e.g., "(!s !ss) (ch ches)")
 
 @dataclass
 class TdlInclude:
@@ -148,12 +170,32 @@ class TdlDirective:
 def tokenize_tdl(text: str) -> list[TdlToken]: ...
 def parse_tdl(tokens: list[TdlToken]) -> list[TdlDefinition | TdlInclude | TdlDirective]: ...
 def parse_tdl_file(path: Path) -> list[TdlDefinition | TdlInclude | TdlDirective]: ...
+
+def resolve_include(base_dir: Path, filename: str) -> Path:
+    """Resolve a TDL :include directive to an absolute file path.
+
+    Tries base_dir/filename first, then base_dir/filename.tdl.
+    Raises FileNotFoundError with context if neither exists.
+    """
+    ...
+
+def parse_tdl_directory(
+    top_file: Path,
+    section_context: str | None = None,
+) -> list[TdlDefinition | TdlDirective]:
+    """Recursively parse a TDL grammar starting from a top-level file.
+
+    Follows :include directives, resolves paths, propagates section
+    context into included files. Returns all definitions from all files.
+    """
+    ...
 ```
 
 **Tests:**
 - Tokenizer correctly splits `type := super & [ FEAT val ].` into tokens
 - Parser handles simple type definition: `a := b.`
 - Parser handles conjunction: `a := b & c.`
+- Parser handles addendum: `a :+ [ FEAT val ].` produces `TdlDefinition` with `is_addendum=True` and no supertypes
 - Parser handles feature structure: `a := b & [ FEAT val ].`
 - Parser handles nested features: `a := b & [ F1 [ F2 val ] ].`
 - Parser handles dot paths: `a := b & [ F1.F2.F3 val ].`
@@ -164,13 +206,22 @@ def parse_tdl_file(path: Path) -> list[TdlDefinition | TdlInclude | TdlDirective
 - Parser handles docstrings: definition with `"""..."""` before `.`
 - Parser handles block comments: `#| ... |#` stripped from input
 - Parser handles line comments: `; ...` stripped from input
+- Commented-out include: `;:include "bridges".` is a line comment, not parsed as include directive
 - Parser handles `:include "filename".` directive
+- `resolve_include` finds bare name: `resolve_include(dir, "fundamentals")` resolves to `dir/fundamentals.tdl`
+- `resolve_include` finds explicit extension: `resolve_include(dir, "lfr.tdl")` resolves to `dir/lfr.tdl`
+- `resolve_include` finds subdirectory: `resolve_include(dir, "tmr/gml")` resolves to `dir/tmr/gml.tdl`
+- `resolve_include` raises `FileNotFoundError` for missing file
+- Section context propagates into includes: definitions from file included inside `:begin :instance :status lex-entry.` have `is_instance=True`
 - Parser handles `:begin :type.` / `:end :type.` section directives
 - Parser handles `%suffix` directives (stored as opaque AST node)
-- Parser handles `%(letter-set ...)` macros (stored as opaque AST node)
+- Parser handles `%(letter-set ...)` macros at file scope (stored as opaque `TdlDirective`)
+- Parser handles `%suffix` embedded in definition body: `n_pl_olr := %suffix (!s !ss) ... n_pl_inflrule & [ ... ].` produces `TdlDefinition` with `suffix="(!s !ss) ..."` and correct supertypes
 - Parser handles multi-line definitions (continued until `.`)
+- Parser handles real ERG file: `parse_tdl_file("inflr.tdl")` produces 26 definitions, 18 of which have non-None `suffix` field
 - Parser handles real ERG file: `parse_tdl_file("fundamentals.tdl")` produces >100 definitions without errors
-- Parser handles real ERG file: `parse_tdl_file("letypes.tdl")` produces lexical entry type definitions
+- Parser handles real ERG file: `parse_tdl_file("lextypes.tdl")` produces >2,900 definitions (full lexical type hierarchy)
+- Parser handles real ERG file: `parse_tdl_file("letypes.tdl")` produces ~256 leaf lexical entry type definitions
 - Parser handles real ERG file: `parse_tdl_file("lexicon.tdl")` parses all 43,729 entries (slow test, mark with `@pytest.mark.slow`)
 
 **Validation:** `pytest tests/test_tdl_parser.py -v`
@@ -236,10 +287,11 @@ class TypeHierarchy:
         ...
 ```
 
-Performance strategy: Build the hierarchy in two passes:
-1. First pass: collect all type names and their direct supertypes
-2. Second pass: compute transitive ancestor sets using topological sort (parents before children). For each type, ancestors = direct supertypes union their ancestors. Store as `dict[str, frozenset[str]]`.
-3. Descendant sets: invert the ancestor map. For each type in the ancestor set of X, X is a descendant.
+Performance strategy: Build the hierarchy in three passes:
+1. First pass: collect all type names and their direct supertypes from `:=` definitions
+2. Second pass: apply `:+` addenda — merge features into existing types. Addenda don't add supertypes but may add feature constraints. For v1 (type-level only, no feature unification), addenda are recorded but don't alter the supertype graph. Log any addendum referencing an unknown type.
+3. Third pass: compute transitive ancestor sets using topological sort (parents before children). For each type, ancestors = direct supertypes union their ancestors. Store as `dict[str, frozenset[str]]`.
+4. Descendant sets: invert the ancestor map. For each type in the ancestor set of X, X is a descendant.
 
 This avoids O(n^2) GLB precomputation. `is_subtype(a, b)` is O(1): check `b in ancestors[a]`. GLB existence is checked lazily.
 
@@ -253,8 +305,9 @@ This avoids O(n^2) GLB precomputation. `is_subtype(a, b)` is O(1): check `b in a
 - `greatest_lower_bound("b", "c")` returns "a" when `a := b & c.`
 - `greatest_lower_bound("b", "d")` returns None when no common subtype exists
 - `leaf_types` returns types with no children
-- Load real ERG: build hierarchy from `fundamentals.tdl` + `letypes.tdl`, verify >1000 types loaded
-- Load full ERG: build hierarchy from all TDL files, verify ~51k types loaded in <5 seconds (mark `@pytest.mark.slow`)
+- Addenda are recorded: after building hierarchy with `a := b.` and `a :+ [ FEAT val ].`, the addendum is associated with type `a`
+- Load partial ERG: build hierarchy from `fundamentals.tdl` + `lextypes.tdl` + `letypes.tdl`, verify >3000 types loaded
+- Load full ERG: build hierarchy from all TDL files (recursive `:include` from `english.tdl`), verify ~51k types loaded in <5 seconds (mark `@pytest.mark.slow`)
 - `all_types` count matches expected ERG size
 - `sign` type is an ancestor of `word_or_lexrule` (ERG hierarchy check)
 
@@ -347,8 +400,10 @@ class TokenLexemeMap:
     """Maps token IDs to sets of compatible lexeme types.
 
     Built by scanning the full tokenizer vocabulary once at init time.
-    For each token, decode it to text, strip whitespace, lowercase,
-    and check which words in the lexicon it could be or be a prefix of.
+    For each token, decode it to text, normalize, and check for exact
+    whole-word matches in the lexicon. No prefix matching — subword
+    fragments are "unknown." This gives a meaningful coherence signal:
+    actual words score, fragments don't.
     """
 
     def __init__(
@@ -363,8 +418,13 @@ class TokenLexemeMap:
         1. Decode token to text
         2. Strip leading/trailing whitespace, lowercase
         3. If exact match in lexicon: map to those lexeme types
-        4. If prefix match: map to union of matching lexeme types
-        5. If no match: token is "unknown" (empty set)
+        4. If no match: token is "unknown" (empty set)
+
+        BPE word-boundary heuristic: tokens decoded with a leading space
+        (e.g., " cat") are treated as word starters. The leading space
+        is stripped before lexicon lookup. Tokens without a leading space
+        that are not exact lexicon matches are treated as subword
+        continuations and marked unknown.
         """
         ...
 
@@ -387,17 +447,19 @@ class TokenLexemeMap:
         ...
 ```
 
-Performance: The vocab scan is O(vocab_size * avg_decode_time). For a 128k vocab tokenizer, this is ~1-3 seconds (same order as NestingDepthHookMlx init). The lexicon word lookup uses a dict, so each token's lookup is O(1) amortized.
+Performance: The vocab scan is O(vocab_size * avg_decode_time). For a 128k vocab tokenizer, this is ~1-3 seconds (same order as NestingDepthHookMlx init). The lexicon word lookup is a dict `__contains__` check, so each token's lookup is O(1).
 
-For prefix matching: build a set of all known words. For each decoded token text, check if `text in known_words` (exact) or if any known word starts with `text` (prefix). To avoid O(n) prefix scan, build a prefix trie or sorted list with binary search. For v1, a simple approach: build `word_prefixes: dict[str, set[str]]` mapping each prefix of length 1-20 to the set of words with that prefix.
+No prefix matching in v1. Prefix matching is combinatorially explosive for short tokens — prefix "a" matches thousands of words, and the union of their lexeme types destroys discriminative power of the coherence signal (single-character tokens would all be "known," making coherence trivially high for any text including nonsense). Exact whole-word matching gives a clean signal: actual English words score, BPE fragments don't.
 
 **Tests:**
 - Exact match: token decoding to "cat" maps to `n_-_c_le` types
-- Prefix match: token decoding to "ca" maps to types for "cat", "car", "can", etc.
-- Whitespace handling: token decoding to " cat" (with leading space, as in BPE) maps same as "cat"
+- BPE word boundary: token decoding to " cat" (leading space) maps same as "cat"
+- Subword fragment: token decoding to "ca" (no leading space, not a lexicon word) maps to empty set
+- Single character: token decoding to "a" maps to lexeme types only if "a" is an exact lexicon entry (e.g., determiner), not via prefix explosion
 - Unknown token: special tokens (BOS, EOS) map to empty set
 - Coverage property: returns float in [0, 1]
 - known_token_ids: returns frozenset of ints
+- Discriminative power: for a mock vocab with ["cat", "ca", "c", " dog", "xyz"], only "cat" and " dog" are known (exact matches)
 - Mock tokenizer test: create a small vocab with known decodings, verify mapping
 - Integration with real tokenizer if available (mark `@pytest.mark.slow`)
 
@@ -480,7 +542,9 @@ class LingoGrammarState:
     - Each token maps to a set of lexeme types (from TokenLexemeMap)
     - Tokens are valid if they map to at least one known lexeme type
     - Unknown tokens are allowed but penalized via coherence signal
-    - is_accepting() always returns False (freeform mode never "completes")
+    - is_accepting() always returns True (freeform grammar is always
+      in an accepting state — any prefix of natural language is a
+      valid stopping point)
 
     The primary value is the coherence signal, not hard masking.
     Hard masking (blocking unknown tokens entirely) is too aggressive
@@ -510,8 +574,16 @@ class LingoGrammarState:
         return mx.ones(tokenizer_vocab_size, dtype=mx.bool_)
 
     def is_accepting(self) -> bool:
-        """Freeform grammar never completes -- always False."""
-        return False
+        """Freeform grammar is always accepting -- returns True.
+
+        CRITICAL: The sampling loop (sample_mlx.py:489-493) masks out
+        all stop/EOS tokens when is_accepting() returns False. A
+        freeform linguistic grammar must return True because any prefix
+        of well-formed natural language is a valid stopping point.
+        Returning False would prevent the model from ever terminating,
+        causing infinite generation or max_tokens exhaustion.
+        """
+        return True
 
     def advance(self, token_id: int) -> None:
         """Record token and update coherence tracker."""
@@ -542,8 +614,11 @@ class LingoGrammar:
 def load_grammar(path: str | Path) -> LingoGrammar:
     """Load a TDL grammar from a directory.
 
-    Parses all TDL files referenced from the top-level load file,
-    builds the type hierarchy and lexicon.
+    Starting from `english.tdl` (or the top-level load file), recursively
+    follows all `:include` directives to parse every referenced TDL file.
+    Builds the type hierarchy and lexicon from all collected definitions.
+    Does NOT cherry-pick files — the full ~30-file include graph must be
+    traversed to capture all ~51k type definitions.
     """
     ...
 ```
@@ -551,7 +626,7 @@ def load_grammar(path: str | Path) -> LingoGrammar:
 **Tests:**
 - `LingoGrammarState` satisfies `GrammarStateMlx` protocol (isinstance check)
 - `get_valid_mask_mx` returns all-True mask of correct size
-- `is_accepting()` returns False
+- `is_accepting()` returns True (freeform grammar is always accepting — prevents EOS masking in sampling loop)
 - `advance()` updates coherence tracker
 - `coherence_score()` returns float in [0.0, 1.0]
 - `LingoGrammar.constrain()` produces working `LingoGrammarState`
@@ -590,20 +665,44 @@ SourceConditionerConfig(range_min=0.0, range_max=1.0),  # 11: linguistic_coheren
 
 7. **`ModMatrixHook`** (torch variant) -- same changes as MLX variant.
 
-**Backward compatibility:** Existing `EnvelopeConfig` instances with 11-row matrices continue to work because:
-- The new row has zero weights by default (no-op)
-- `EnvelopeConfig` validates `matrix_flat` length matches `matrix_shape` product
-- If a user provides a custom 11x7 matrix (77 values), we need to handle this: pad with zeros to 12x7 (84 values), or raise a clear error. Decision: pad with zeros and log a warning.
+**Lockstep change list:** All of the following must change atomically — partial changes will crash due to `strict=True` in `zip(raw_sources, cfg.conditioners, strict=True)` (modulation.py:338, :552):
+- `DEFAULT_MATRIX` — 11 rows to 12 rows
+- `DEFAULT_MATRIX_FLAT` — 77 values to 84 values (derived from DEFAULT_MATRIX)
+- `DEFAULT_CONDITIONERS` — 11 entries to 12 entries
+- `EnvelopeState.prev_smoothed` — `[0.0] * 11` to `[0.0] * 12` (modulation.py:46)
+- `EnvelopeState` reset in `ModMatrixHookMlx.reset()` — `[0.0] * 11` to `[0.0] * 12` (modulation.py:277)
+- `EnvelopeConfig.matrix_shape` — `(11, 7)` to `(12, 7)` (modulation.py:229-230)
+- `EnvelopeConfig.conditioners` default — must reference new 12-entry `DEFAULT_CONDITIONERS`
+- `raw_sources` list in `ModMatrixHookMlx.pre_forward` — 11 entries to 12 (modulation.py:323-335)
+- `raw_sources` list in `ModMatrixHook.pre_forward` — same change (modulation.py:537-549)
+- Comment in `ModMatrixHookMlx` docstring — "11 source signals" to "12 source signals"
+- Comment in `ModMatrixHook` docstring — same
 
-**Tests:**
+**Backward compatibility for custom configs:** `EnvelopeConfig` has no `__post_init__` validation today, so old 77-element `matrix_flat` tuples won't crash at construction time — they'll crash at matrix multiply time when the (11, 7) matrix meets a 12-element source vector. Add a `__post_init__` to `EnvelopeConfig` that:
+1. Validates `len(matrix_flat) == matrix_shape[0] * matrix_shape[1]`
+2. If `len(matrix_flat) == 77` and `matrix_shape == (12, 7)`: pad with 7 zeros, log a `structlog` warning
+3. Validates `len(conditioners) == matrix_shape[0]`
+4. If `len(conditioners) == 11` and `matrix_shape == (12, 7)`: append the default coherence conditioner, log warning
+
+**Existing test assertions to update (not "still pass" — must be changed):**
+- `tests/test_modulation.py:248`: `len(DEFAULT_MATRIX) == 11` → `== 12`
+- `tests/test_modulation.py:253`: `len(DEFAULT_MATRIX_FLAT) == 11 * 7` → `== 12 * 7`
+- `tests/test_modulation.py:257`: `cfg.matrix_shape == (11, 7)` → `== (12, 7)`
+- `tests/test_modulation.py:436`: `hook._mod_matrix.shape == (11, 7)` → `== (12, 7)`
+- `tests/test_modulation.py:597`: `source_vector=[0.5] * 11` → `* 12`
+- `tests/test_modulation.py:604`: `len(t.source_vector) == 11` → `== 12`
+- `tests/test_modulation.py:612`: `source_vector=` 11-element list → 12-element list
+
+**New tests:**
 - Default matrix shape is (12, 7) with 84 values
 - Default conditioners has 12 entries
 - EnvelopeState.prev_smoothed has 12 entries
 - ModMatrixHookMlx with coherence_fn=None produces same output as before (linguistic_coherence=0.0 * zero row = no change)
 - ModMatrixHookMlx with coherence_fn returning 0.8 and non-zero row 11 weights produces different temperature
 - ModMatrixHook (torch) produces same results as MLX variant
-- Backward compatibility: old 11-row matrix config pads to 12 rows
-- All existing modulation tests still pass
+- Backward compatibility: `EnvelopeConfig(matrix_flat=tuple([0.0]*77))` auto-pads to 84 with warning
+- Backward compatibility: `EnvelopeConfig(conditioners=tuple([SourceConditionerConfig()]*11))` auto-pads to 12 with warning
+- Invalid matrix_flat length (e.g., 50 values) raises `ValueError`
 
 **Validation:** `pytest tests/test_modulation.py -v`
 
@@ -639,8 +738,8 @@ All new code is in `src/tgirl/lingo/` (new package) and new test files. Modulati
 
 ## 6. Uncertainty Log
 
-- **TDL parsing completeness:** The ERG uses TDL features accumulated over 30 years. The parser may encounter undocumented syntax in less-commonly-used files. Strategy: parse `fundamentals.tdl`, `letypes.tdl`, and `lexicon.tdl` first (these cover the core hierarchy and lexicon); defer parsing of `constructions.tdl` and `inflr.tdl` until needed. Log unparsed lines rather than crashing.
-- **Prefix matching strategy:** The current plan maps tokens to lexeme types via prefix matching against the lexicon. This may over-match: a token "a" is a prefix of thousands of words. Consider filtering to only count exact whole-word matches, using token boundary detection (leading space in BPE tokens indicates word start). This needs experimentation.
+- **TDL parsing completeness:** The ERG uses TDL features accumulated over 30 years. The parser may encounter undocumented syntax in less-commonly-used files. Strategy: `load_grammar()` follows all `:include` directives recursively from `english.tdl` (~30 files, ~293k total lines). The parser must not skip any file — type definitions are spread across `lextypes.tdl` (2,924 types), `syntax.tdl`, `lexrules.tdl`, `constructions.tdl` (301 types), and others. For lines with unparseable syntax, log a warning with file/line info and continue rather than crashing. Track parse success rate per file.
+- **Subword coverage in v2:** V1 uses exact whole-word matching only (no prefix matching). This means BPE subword continuations are always "unknown," which slightly underestimates coherence for long words split across multiple tokens. A v2 enhancement could track multi-token word assembly using BPE leading-space word-boundary detection and match completed words against the lexicon. This requires per-sequence state (accumulating subword fragments) and is deferred.
 - **GLB computation complexity:** The type hierarchy has ~51k types. Full GLB precomputation is O(n^2) = ~2.6 billion pairs. Lazy computation with caching is the right approach, but the cache may grow large for frequently-queried type pairs. Monitor memory usage during testing.
 - **Coherence window size:** 32 tokens is a guess. Too small and the signal is noisy; too large and it's unresponsive. The modulation matrix's slew rate conditioning provides some smoothing, but the window size should be validated empirically.
 - **ModMatrixHook coherence wiring:** The hook needs a `coherence_fn` callback, which requires the `LingoGrammarState` to be accessible from the hook. In the current architecture, hooks don't have access to other grammar state objects. Options: (a) pass coherence_fn at hook construction time, (b) compute coherence inside the hook using a separate token-lexeme map, (c) add coherence_fn as a field on the hook that gets wired during SamplingSession construction. Option (a) is cleanest and matches the existing pattern where hooks receive configuration at init time.
