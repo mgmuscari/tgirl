@@ -117,3 +117,62 @@ def load_lexicon(definitions: list[TdlDefinition]) -> Lexicon:
 
     logger.info("Loaded %d lexicon entries", len(entries))
     return Lexicon(entries)
+
+
+class TokenLexemeMap:
+    """Maps token IDs to sets of compatible lexeme types.
+
+    Built by scanning the full tokenizer vocabulary once at init time.
+    For each token, decode it to text, normalize, and check for exact
+    whole-word matches in the lexicon. No prefix matching.
+    """
+
+    def __init__(
+        self,
+        lexicon: Lexicon,
+        tokenizer_decode: Callable[[list[int]], str],
+        vocab_size: int,
+    ) -> None:
+        self._token_types: dict[int, frozenset[str]] = {}
+        self._known_ids: set[int] = set()
+
+        for tid in range(vocab_size):
+            text = tokenizer_decode([tid])
+            # BPE word boundary: strip leading space
+            word = text.lstrip()
+            # Also strip trailing whitespace
+            word = word.strip()
+            # Lowercase for lookup
+            word_lower = word.lower()
+
+            types = lexicon.types_for_word(word_lower)
+            if types:
+                self._token_types[tid] = types
+                self._known_ids.add(tid)
+
+        self._vocab_size = vocab_size
+        logger.info(
+            "Token-lexeme map: %d/%d tokens known (%.1f%%)",
+            len(self._known_ids), vocab_size,
+            100.0 * len(self._known_ids) / vocab_size if vocab_size > 0 else 0,
+        )
+
+    def types_for_token(self, token_id: int) -> frozenset[str]:
+        """Lexeme types compatible with this token."""
+        return self._token_types.get(token_id, frozenset())
+
+    def is_known_token(self, token_id: int) -> bool:
+        """True if token maps to at least one lexeme type."""
+        return token_id in self._known_ids
+
+    @property
+    def coverage(self) -> float:
+        """Fraction of vocabulary with at least one lexeme mapping."""
+        if self._vocab_size == 0:
+            return 0.0
+        return len(self._known_ids) / self._vocab_size
+
+    @property
+    def known_token_ids(self) -> frozenset[int]:
+        """Token IDs that map to at least one lexeme type."""
+        return frozenset(self._known_ids)

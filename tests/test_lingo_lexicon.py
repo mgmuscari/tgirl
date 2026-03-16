@@ -16,7 +16,7 @@ from tgirl.lingo.tdl_parser import (
     tokenize_tdl,
     parse_tdl,
 )
-from tgirl.lingo.lexicon import LexEntry, Lexicon, load_lexicon
+from tgirl.lingo.lexicon import LexEntry, Lexicon, TokenLexemeMap, load_lexicon
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +161,82 @@ class TestLoadLexicon:
         )]
         lex = load_lexicon(defs)
         assert len(list(lex.all_words)) == 0
+
+
+# ---------------------------------------------------------------------------
+# TokenLexemeMap tests
+# ---------------------------------------------------------------------------
+
+def _mock_tokenizer(vocab: dict[int, str]):
+    """Create a mock tokenizer_decode from a vocab dict."""
+    def decode(ids: list[int]) -> str:
+        return "".join(vocab.get(i, "") for i in ids)
+    return decode
+
+
+class TestTokenLexemeMap:
+
+    def _make_map(self, vocab: dict[int, str], words: list[str]) -> TokenLexemeMap:
+        entries = [LexEntry(name=f"{w}_n1", lexeme_type=f"{w}_le", orth=(w,)) for w in words]
+        lex = Lexicon(entries)
+        return TokenLexemeMap(lex, _mock_tokenizer(vocab), len(vocab))
+
+    def test_exact_match(self) -> None:
+        vocab = {0: "cat", 1: "dog", 2: "xyz"}
+        m = self._make_map(vocab, ["cat", "dog"])
+        assert m.is_known_token(0)
+        assert m.is_known_token(1)
+        assert not m.is_known_token(2)
+
+    def test_bpe_leading_space(self) -> None:
+        """Token ' cat' (leading space) should match 'cat'."""
+        vocab = {0: " cat", 1: " dog"}
+        m = self._make_map(vocab, ["cat", "dog"])
+        assert m.is_known_token(0)
+        assert "cat_le" in m.types_for_token(0)
+
+    def test_subword_fragment_unknown(self) -> None:
+        """Token 'ca' (no leading space, not a word) should be unknown."""
+        vocab = {0: "ca", 1: "cat"}
+        m = self._make_map(vocab, ["cat"])
+        assert not m.is_known_token(0)
+        assert m.is_known_token(1)
+
+    def test_single_char_exact_only(self) -> None:
+        """'a' maps only if 'a' is an exact lexicon entry."""
+        vocab = {0: "a", 1: "b"}
+        m = self._make_map(vocab, ["a"])
+        assert m.is_known_token(0)
+        assert not m.is_known_token(1)
+
+    def test_special_tokens_unknown(self) -> None:
+        vocab = {0: "<|endoftext|>", 1: "<s>"}
+        m = self._make_map(vocab, ["cat"])
+        assert not m.is_known_token(0)
+        assert not m.is_known_token(1)
+
+    def test_coverage(self) -> None:
+        vocab = {0: "cat", 1: "dog", 2: "xyz", 3: "abc"}
+        m = self._make_map(vocab, ["cat", "dog"])
+        assert m.coverage == 0.5
+
+    def test_known_token_ids(self) -> None:
+        vocab = {0: "cat", 1: "xyz", 2: " dog"}
+        m = self._make_map(vocab, ["cat", "dog"])
+        known = m.known_token_ids
+        assert 0 in known  # "cat"
+        assert 2 in known  # " dog" -> "dog"
+        assert 1 not in known  # "xyz"
+
+    def test_discriminative_power(self) -> None:
+        """Only exact whole-word matches are known."""
+        vocab = {0: "cat", 1: "ca", 2: "c", 3: " dog", 4: "xyz"}
+        m = self._make_map(vocab, ["cat", "dog"])
+        assert m.is_known_token(0)  # "cat" exact
+        assert not m.is_known_token(1)  # "ca" fragment
+        assert not m.is_known_token(2)  # "c" fragment
+        assert m.is_known_token(3)  # " dog" -> "dog"
+        assert not m.is_known_token(4)  # "xyz" unknown
 
 
 # ---------------------------------------------------------------------------
