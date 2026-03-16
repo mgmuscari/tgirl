@@ -6,9 +6,10 @@ Parses TDL lexicon entries and builds a mapping from surface forms
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+
+import structlog
 
 from tgirl.lingo.tdl_parser import (
     TdlConj,
@@ -18,7 +19,7 @@ from tgirl.lingo.tdl_parser import (
     TdlString,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)

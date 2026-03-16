@@ -7,11 +7,12 @@ structures, include directives, and section markers.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 
 # === AST nodes ===
@@ -320,7 +321,7 @@ def tokenize_tdl(text: str) -> list[TdlToken]:
             j = i
             while j < len(text) and (
                 text[j].isalnum()
-                or text[j] in '_-*+/\'.'
+                or text[j] in '_-*+/\'.!'
             ):
                 # Don't consume '.' at end (statement terminator)
                 # unless it's part of an identifier like "a.b"

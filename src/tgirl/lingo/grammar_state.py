@@ -8,16 +8,19 @@ compatibility. V1 provides coherence signal only (no hard masking).
 from __future__ import annotations
 
 import collections
-import logging
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import mlx.core as mx
+import structlog
 
 from tgirl.lingo.lexicon import Lexicon, TokenLexemeMap
 from tgirl.lingo.types import TypeHierarchy
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    import mlx.core as mx
+
+logger = structlog.get_logger(__name__)
 
 
 class CoherenceTracker:
@@ -82,6 +85,8 @@ class LingoGrammarState:
 
     def get_valid_mask_mx(self, tokenizer_vocab_size: int) -> mx.array:
         """Return boolean mask of valid next tokens. V1: all True."""
+        import mlx.core as mx
+
         return mx.ones(tokenizer_vocab_size, dtype=mx.bool_)
 
     def is_accepting(self) -> bool:
