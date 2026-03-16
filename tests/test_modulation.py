@@ -287,20 +287,20 @@ class TestEnvelopeConfig:
         assert len(cfg.conditioners) == 11
 
     def test_matrix_weights_all_rows(self) -> None:
-        """All matrix rows match the ADSR design doc values."""
+        """All matrix rows match the tuned default values."""
         # fmt: off
         expected = [
-            [ 0.3,   0.2,   0.0,   0.0,   0.0,   0.0,   0.0],  # freedom
-            [ 0.1,   0.1,   0.0,   0.0,   0.0,   0.0,   0.0],  # entropy
-            [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # confidence
+            [ 0.5,   0.2,   0.0,   0.0,   0.0,   0.0,   0.0],  # freedom
+            [ 0.01,  0.1,   0.0,   0.0,   0.0,   0.0,   0.0],  # entropy
+            [-0.02,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # confidence
             [ 0.0,   0.0,   0.0,  -0.1,   0.0,   0.0,   0.0],  # overlap
-            [ 0.0,   0.0,   0.0,   0.0, -20.0,   0.0,   0.0],  # depth
+            [ 0.0,   0.0,   0.0,   0.0, -80.0,   0.0,   0.0],  # depth
             [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # position
-            [ 0.3,   0.35, 10.0,  -0.05,  0.0,   0.0,   0.0],  # attack
-            [ 0.0,   0.2,   5.0,   0.0,   0.0,   0.0,   0.0],  # decay
-            [-0.15, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # sustain
-            [-0.05,  0.3,  10.0,  -0.05, -50.0,  0.0,   0.0],  # release
-            [ 0.0,   0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # cycle
+            [ 0.10,  0.05, 10.0,  -0.05,  0.0,   0.0,   0.0],  # attack
+            [ 0.02,  0.0,   5.0,   0.0,   0.0,   0.0,   0.0],  # decay
+            [-0.04, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # sustain
+            [-0.02,  0.1,  10.0,  -0.05, -80.0,  0.0,   0.0],  # release
+            [-0.05,  0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # cycle
         ]
         # fmt: on
         for i, (actual, exp) in enumerate(

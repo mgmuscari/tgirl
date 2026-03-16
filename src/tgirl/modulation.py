@@ -154,17 +154,23 @@ def condition_source(
 DEFAULT_MATRIX: list[list[float]] = [
     # temp   top_p  rep    eps    open   back*  pres
     # *back (col 5) reserved -- zeroed, not wired in v1
-    [ 0.3,   0.2,   0.0,   0.0,   0.0,   0.0,   0.0],  # 0: freedom
-    [ 0.1,   0.1,   0.0,   0.0,   0.0,   0.0,   0.0],  # 1: entropy
-    [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 2: confidence
+    #
+    # Temperature regime: base=0.05, attack peaks at ~0.15,
+    # sustain drops to ~0.01. Matches old GrammarTemperatureHook's
+    # near-deterministic behavior during constrained generation.
+    # The ADSR shape modulates within a narrow band — the model
+    # needs precision for argument values, not exploration.
+    [ 0.5,   0.2,   0.0,   0.0,   0.0,   0.0,   0.0],  # 0: freedom (scaled by freedom ~0.00005)
+    [ 0.01,  0.1,   0.0,   0.0,   0.0,   0.0,   0.0],  # 1: entropy
+    [-0.02,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 2: confidence (high uncertainty → raise temp)
     [ 0.0,   0.0,   0.0,  -0.1,   0.0,   0.0,   0.0],  # 3: overlap
-    [ 0.0,   0.0,   0.0,   0.0, -20.0,   0.0,   0.0],  # 4: depth
+    [ 0.0,   0.0,   0.0,   0.0, -80.0,   0.0,   0.0],  # 4: depth (stronger opener penalty)
     [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 5: position
-    [ 0.3,   0.35, 10.0,  -0.05,  0.0,   0.0,   0.0],  # 6: attack
-    [ 0.0,   0.2,   5.0,   0.0,   0.0,   0.0,   0.0],  # 7: decay
-    [-0.15, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # 8: sustain
-    [-0.05,  0.3,  10.0,  -0.05, -50.0,  0.0,   0.0],  # 9: release
-    [ 0.0,   0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # 10: cycle
+    [ 0.10,  0.05, 10.0,  -0.05,  0.0,   0.0,   0.0],  # 6: attack (+0.10 → temp ~0.15)
+    [ 0.02,  0.0,   5.0,   0.0,   0.0,   0.0,   0.0],  # 7: decay
+    [-0.04, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # 8: sustain (-0.04 → temp ~0.01)
+    [-0.02,  0.1,  10.0,  -0.05, -80.0,  0.0,   0.0],  # 9: release
+    [-0.05,  0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # 10: cycle (drops temp too)
 ]
 # fmt: on
 
@@ -194,7 +200,7 @@ class EnvelopeConfig:
     """Complete modulation matrix configuration."""
 
     # Base values (destinations start here, modulations are added)
-    base_temperature: float = 0.3
+    base_temperature: float = 0.05
     base_top_p: float = 0.9
     base_repetition_bias: float = -20.0
     base_epsilon: float = 0.1
