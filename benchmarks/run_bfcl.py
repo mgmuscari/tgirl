@@ -214,6 +214,15 @@ def run_benchmark(args: argparse.Namespace) -> None:
             stop_token_ids.append(ids[0])
     log.info("stop_token_ids", ids=stop_token_ids)
 
+    # --- 2c. Extract tool call primer tokens ---
+    from tgirl.sample import extract_tool_call_primer
+    added_tokens = getattr(hf_tokenizer, 'added_tokens_encoder', None)
+    tool_call_primer = extract_tool_call_primer(
+        tokenizer_encode=hf_tokenizer.encode,
+        added_tokens=added_tokens,
+    )
+    log.info("tool_call_primer", tokens=tool_call_primer)
+
     # --- 3. Session config + transition policy ---
     transition_policy = make_transition_policy(
         args.transition_policy,
@@ -305,6 +314,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             mlx_grammar_guide_factory=mlx_grammar_factory,
             transition_policy=transition_policy,
             stop_token_ids=stop_token_ids,
+            tool_call_primer_tokens=tool_call_primer,
         )
 
         t0 = time.monotonic()
