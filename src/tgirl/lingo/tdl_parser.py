@@ -329,7 +329,7 @@ def tokenize_tdl(text: str) -> list[TdlToken]:
                     # Check if next char continues the identifier
                     if j + 1 < len(text) and (
                         text[j + 1].isalnum()
-                        or text[j + 1] in '_-*+/'
+                        or text[j + 1] in '_-*+/!'
                     ):
                         j += 1
                     else:
