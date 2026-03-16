@@ -1516,33 +1516,33 @@ class TestRepetitionPenaltyHook:
 
 
 class TestDetectCycle:
-    """Unit tests for _detect_cycle."""
+    """Unit tests for detect_cycle."""
 
     def test_no_cycle_in_short_sequence(self) -> None:
-        from tgirl.sample import _detect_cycle
-        assert _detect_cycle([1, 2, 3]) is None
+        from tgirl.sample import detect_cycle
+        assert detect_cycle([1, 2, 3]) is None
 
     def test_detects_period_1(self) -> None:
-        from tgirl.sample import _detect_cycle
-        assert _detect_cycle([5, 5, 5, 5]) == 1
+        from tgirl.sample import detect_cycle
+        assert detect_cycle([5, 5, 5, 5]) == 1
 
     def test_detects_period_2(self) -> None:
-        from tgirl.sample import _detect_cycle
-        assert _detect_cycle([1, 2, 1, 2, 1, 2]) == 2
+        from tgirl.sample import detect_cycle
+        assert detect_cycle([1, 2, 1, 2, 1, 2]) == 2
 
     def test_detects_period_3(self) -> None:
-        from tgirl.sample import _detect_cycle
-        assert _detect_cycle([7, 397, 318, 7, 397, 318]) == 3
+        from tgirl.sample import detect_cycle
+        assert detect_cycle([7, 397, 318, 7, 397, 318]) == 3
 
     def test_no_cycle_when_not_repeating(self) -> None:
-        from tgirl.sample import _detect_cycle
-        assert _detect_cycle([1, 2, 3, 4, 5, 6]) is None
+        from tgirl.sample import detect_cycle
+        assert detect_cycle([1, 2, 3, 4, 5, 6]) is None
 
     def test_respects_max_period(self) -> None:
-        from tgirl.sample import _detect_cycle
+        from tgirl.sample import detect_cycle
         # Cycle of length 3, but max_period=2
-        assert _detect_cycle([1, 2, 3, 1, 2, 3], max_period=2) is None
-        assert _detect_cycle([1, 2, 3, 1, 2, 3], max_period=3) == 3
+        assert detect_cycle([1, 2, 3, 1, 2, 3], max_period=2) is None
+        assert detect_cycle([1, 2, 3, 1, 2, 3], max_period=3) == 3
 
     def test_respects_window_size(self) -> None:
         import torch

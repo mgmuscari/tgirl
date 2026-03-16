@@ -593,6 +593,49 @@ class TestComputeTransitionSignalMlx:
         assert "for p" not in source
 
 
+class TestCycleGate:
+    """Cycle gate removes cycling tokens from valid_mask after K repetitions."""
+
+    def test_no_gating_without_cycle(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import apply_cycle_gate
+
+        mask = mx.ones((10,), dtype=mx.bool_)
+        history = [1, 2, 3, 4, 5]
+        result = apply_cycle_gate(mask, history, hold_count=3)
+        assert mx.array_equal(result, mask)
+
+    def test_gates_after_k_repetitions(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import apply_cycle_gate
+
+        mask = mx.ones((10,), dtype=mx.bool_)
+        history = [3, 4, 5, 3, 4, 5, 3, 4, 5]
+        result = apply_cycle_gate(mask, history, hold_count=3)
+        assert not bool(result[3].item())
+        assert not bool(result[4].item())
+        assert not bool(result[5].item())
+        assert bool(result[0].item())
+
+    def test_no_gating_below_hold_count(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import apply_cycle_gate
+
+        mask = mx.ones((10,), dtype=mx.bool_)
+        history = [3, 4, 5, 3, 4, 5]
+        result = apply_cycle_gate(mask, history, hold_count=3)
+        assert bool(result[3].item())
+
+    def test_period_1_cycle(self) -> None:
+        import mlx.core as mx
+        from tgirl.sample_mlx import apply_cycle_gate
+
+        mask = mx.ones((10,), dtype=mx.bool_)
+        history = [5, 5, 5, 5, 5, 5]
+        result = apply_cycle_gate(mask, history, hold_count=3)
+        assert not bool(result[5].item())
+
+
 class TestRepetitionPenaltyHookMlx:
     """RepetitionPenaltyHookMlx penalizes recently repeated tokens."""
 

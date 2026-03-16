@@ -35,6 +35,46 @@ from tgirl.types import (
 logger = structlog.get_logger()
 
 
+def extract_tool_call_primer(
+    tokenizer_encode: Callable[[str], list[int]],
+    added_tokens: dict[str, int] | None = None,
+) -> list[int]:
+    """Extract tool call primer token IDs from tokenizer metadata.
+
+    Finds the model's native tool-call delimiter tokens by checking
+    for known special tokens (e.g., <tool_call> for Qwen, <|python_tag|>
+    for Llama). Returns the token IDs to inject into context before
+    constrained generation, priming the model to produce structured output.
+
+    For base models with no tool-call tokens, returns an empty list
+    (the system prompt's generic delimiters provide the only signal).
+    """
+    if added_tokens is None:
+        return []
+
+    # Strategy 1: <tool_call> (Qwen, most modern instruct models)
+    if "<tool_call>" in added_tokens:
+        return [added_tokens["<tool_call>"]]
+
+    # Strategy 2: <|python_tag|> (Llama)
+    if "<|python_tag|>" in added_tokens:
+        return [added_tokens["<|python_tag|>"]]
+
+    # Strategy 3: [TOOL_CALL] or similar
+    for token_str in ["[TOOL_CALL]", "<|function_call|>", "<tool>"]:
+        if token_str in added_tokens:
+            return [added_tokens[token_str]]
+
+    # Strategy 4: no known tool tokens — try encoding our default delimiter
+    # If the model has seen <tool> in training, the encoded tokens will
+    # activate the right representations even without a special token
+    primer = tokenizer_encode("<tool>")
+    if primer:
+        return primer
+
+    return []
+
+
 def compute_transition_signal_torch(
     token_position: int,
     logits: torch.Tensor,
@@ -134,7 +174,16 @@ class GrammarTemperatureHook:
         return ModelIntervention(temperature=temp)
 
 
-def _detect_cycle(tokens: list[int], max_period: int = 16) -> int | None:
+def _is_mod_matrix_hook(hook: object) -> bool:
+    """Check if hook is a ModMatrixHook (avoids circular import)."""
+    t = type(hook)
+    return (
+        t.__qualname__ == "ModMatrixHook"
+        and t.__module__ == "tgirl.modulation"
+    )
+
+
+def detect_cycle(tokens: list[int], max_period: int = 16) -> int | None:
     """Detect repeating cycle in token suffix.
 
     Checks if the last 2k tokens consist of the same k-length sequence
@@ -251,7 +300,7 @@ class RepetitionPenaltyHook:
                 penalized[tid] = self.bias * (count - self.max_repeats)
 
         # 2. Cycle detection: penalize all tokens in a detected cycle
-        cycle_len = _detect_cycle(token_history, self.max_period)
+        cycle_len = detect_cycle(token_history, self.max_period)
         if cycle_len is not None and self.cycle_bias != 0.0:
             cycle_tokens = set(token_history[-cycle_len:])
             for tid in cycle_tokens:
@@ -699,11 +748,13 @@ class SamplingSession:
         mlx_grammar_guide_factory: Callable | None = None,
         transition_policy: TransitionPolicy | None = None,
         stop_token_ids: list[int] | None = None,
+        tool_call_primer_tokens: list[int] | None = None,
     ) -> None:
         from tgirl.rerank import ToolRouter
         from tgirl.state_machine import DelimiterTransitionPolicy
 
         self._stop_token_ids = stop_token_ids
+        self._tool_call_primer_tokens = tool_call_primer_tokens
         self._registry = registry
         self._forward_fn = forward_fn
         self._decode = tokenizer_decode
@@ -992,6 +1043,13 @@ class SamplingSession:
             grammar_output = generate_grammar(snapshot)
             grammar_state = self._grammar_guide_factory(grammar_output.text)
 
+            # Inject tool call primer tokens into context so the model
+            # recognizes it's entering a structured output regime. These
+            # are the model's native tool-call delimiters (e.g., <tool_call>
+            # for Qwen), extracted from tokenizer metadata at init time.
+            if self._tool_call_primer_tokens:
+                token_history.extend(self._tool_call_primer_tokens)
+
             # Run constrained generation (dispatch by backend)
             if self._is_mlx:
                 from tgirl.sample_mlx import (
@@ -1040,6 +1098,19 @@ class SamplingSession:
                                     vocab_size=self._embeddings_mlx.shape[0],
                                     margin=hook.margin,
                                     bias=hook.bias,
+                                )
+                            )
+                        elif _is_mod_matrix_hook(hook):
+                            from tgirl.modulation import (
+                                ModMatrixHookMlx,
+                            )
+
+                            self._mlx_hooks.append(
+                                ModMatrixHookMlx(
+                                    config=hook.config,
+                                    tokenizer_decode=self._decode,
+                                    vocab_size=self._embeddings_mlx.shape[0],
+                                    max_tokens=hook.max_tokens,
                                 )
                             )
                         # Skip other torch-only hooks

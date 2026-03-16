@@ -175,12 +175,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
     )
     from tgirl.cache import CacheStats, make_mlx_forward_fn
     from tgirl.format import ChatTemplateFormatter
+    from tgirl.modulation import EnvelopeConfig, ModMatrixHook
     from tgirl.outlines_adapter import (
         make_outlines_grammar_factory,
         make_outlines_grammar_factory_mlx,
     )
     from tgirl.registry import ToolRegistry
-    from tgirl.sample import GrammarTemperatureHook, SamplingSession
+    from tgirl.sample import SamplingSession
     from tgirl.transport import TransportConfig
     from tgirl.types import RerankConfig, SessionConfig
 
@@ -213,6 +214,15 @@ def run_benchmark(args: argparse.Namespace) -> None:
             stop_token_ids.append(ids[0])
     log.info("stop_token_ids", ids=stop_token_ids)
 
+    # --- 2c. Extract tool call primer tokens ---
+    from tgirl.sample import extract_tool_call_primer
+    added_tokens = getattr(hf_tokenizer, 'added_tokens_encoder', None)
+    tool_call_primer = extract_tool_call_primer(
+        tokenizer_encode=hf_tokenizer.encode,
+        added_tokens=added_tokens,
+    )
+    log.info("tool_call_primer", tokens=tool_call_primer)
+
     # --- 3. Session config + transition policy ---
     transition_policy = make_transition_policy(
         args.transition_policy,
@@ -223,17 +233,15 @@ def run_benchmark(args: argparse.Namespace) -> None:
     session_config = SessionConfig(
         max_tool_cycles=10,
         freeform_max_tokens=512,
-        constrained_max_tokens=128,
+        constrained_max_tokens=512,
         session_timeout=30.0,
     )
-    from tgirl.sample import NestingDepthHook, RepetitionPenaltyHook
     session_hooks = [
-        GrammarTemperatureHook(base_temperature=0.5),
-        RepetitionPenaltyHook(window=8, max_repeats=2),
-        NestingDepthHook(
-            max_tokens=session_config.constrained_max_tokens,
+        ModMatrixHook(
+            config=EnvelopeConfig(base_temperature=0.5),
             tokenizer_decode=hf_tokenizer.decode,
             vocab_size=embeddings.shape[0],
+            max_tokens=session_config.constrained_max_tokens,
         ),
     ]
     transport_config = TransportConfig(valid_ratio_threshold=0.5)
@@ -306,6 +314,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             mlx_grammar_guide_factory=mlx_grammar_factory,
             transition_policy=transition_policy,
             stop_token_ids=stop_token_ids,
+            tool_call_primer_tokens=tool_call_primer,
         )
 
         t0 = time.monotonic()
@@ -381,8 +390,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
             "bfcl_output": bfcl_output,
             "ground_truth": ground_truth_by_id.get(entry_id),
             "hyperparams": {
-                "base_temperature": session_hooks[0].base_temperature,
-                "scaling_exponent": session_hooks[0].scaling_exponent,
+                "base_temperature": session_hooks[0].config.base_temperature,
+                "modulation_matrix_hash": hash(session_hooks[0].config.matrix_flat),
                 "ot_epsilon": transport_config.epsilon,
                 "ot_valid_ratio_threshold": transport_config.valid_ratio_threshold,
                 "ot_max_iterations": transport_config.max_iterations,

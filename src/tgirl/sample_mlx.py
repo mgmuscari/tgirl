@@ -26,6 +26,57 @@ from tgirl.types import ModelIntervention
 logger = structlog.get_logger()
 
 
+def apply_cycle_gate(
+    valid_mask: mx.array,
+    token_history: list[int],
+    hold_count: int = 3,
+    max_period: int = 16,
+) -> mx.array:
+    """Remove cycling tokens from valid_mask after K repetitions.
+
+    Gated reverb for token repetition: detects suffix cycles in
+    token_history and hard-gates the cycling tokens (sets them to
+    False in the mask) after hold_count full cycle repetitions.
+
+    Args:
+        valid_mask: Current valid token mask (bool, shape (vocab_size,)).
+        token_history: Generated tokens so far (constrained gen only).
+        hold_count: Number of full cycle repetitions before gate closes.
+        max_period: Maximum cycle period to detect.
+
+    Returns:
+        Modified valid_mask with cycling tokens removed, or original
+        mask if no cycle detected or insufficient repetitions.
+    """
+    from tgirl.sample import detect_cycle
+
+    n = len(token_history)
+    cycle_len = detect_cycle(token_history, max_period)
+    if cycle_len is None:
+        return valid_mask
+
+    # Count how many full repetitions of the cycle exist at the suffix
+    repetitions = 0
+    for i in range(1, n // cycle_len + 1):
+        start = n - i * cycle_len
+        if start < 0:
+            break
+        if token_history[start : start + cycle_len] == token_history[-cycle_len:]:
+            repetitions += 1
+        else:
+            break
+
+    if repetitions < hold_count:
+        return valid_mask
+
+    # Gate closes: remove cycling tokens from valid_mask
+    cycle_tokens = set(token_history[-cycle_len:])
+    gate_mask = mx.ones(valid_mask.shape, dtype=mx.bool_)
+    indices = mx.array(list(cycle_tokens))
+    gate_mask[indices] = False
+    return valid_mask & gate_mask
+
+
 def compute_transition_signal_mlx(
     token_position: int,
     logits: mx.array,
@@ -206,7 +257,7 @@ class RepetitionPenaltyHookMlx:
         token_history: list[int],
         logits: mx.array,
     ) -> ModelIntervention:
-        from tgirl.sample import _detect_cycle
+        from tgirl.sample import detect_cycle
 
         penalized: dict[int, float] = {}
 
@@ -220,7 +271,7 @@ class RepetitionPenaltyHookMlx:
                 penalized[tid] = self.bias * (count - self.max_repeats)
 
         # 2. Cycle detection: penalize all tokens in a detected cycle
-        cycle_len = _detect_cycle(token_history, self.max_period)
+        cycle_len = detect_cycle(token_history, self.max_period)
         if cycle_len is not None and self.cycle_bias != 0.0:
             cycle_tokens = set(token_history[-cycle_len:])
             for tid in cycle_tokens:
@@ -441,6 +492,10 @@ def run_constrained_generation_mlx(
             stop_mask[indices] = False
             valid_mask = valid_mask & stop_mask
 
+        # Cycle gate: hard-remove cycling tokens from valid_mask after
+        # K repetitions (gated reverb — the tail stops, not fades).
+        valid_mask = apply_cycle_gate(valid_mask, tokens)
+
         valid_count = int(mx.sum(valid_mask).item())
         grammar_valid_counts.append(valid_count)
         _t2 = time.monotonic()
@@ -482,9 +537,22 @@ def run_constrained_generation_mlx(
         _t4 = time.monotonic()
 
         # 5. OT redistribution — pure MLX
+        # Use per-token epsilon if set by a hook
+        if merged.transport_epsilon is not None:
+            token_transport_config = TransportConfig(
+                epsilon=merged.transport_epsilon,
+                max_iterations=transport_config.max_iterations,
+                convergence_threshold=transport_config.convergence_threshold,
+                valid_ratio_threshold=transport_config.valid_ratio_threshold,
+                invalid_mass_threshold=transport_config.invalid_mass_threshold,
+                max_problem_size=transport_config.max_problem_size,
+            )
+        else:
+            token_transport_config = transport_config
+
         ot_start = time.monotonic()
         ot_result = redistribute_logits_mlx(
-            adjusted, valid_mask, embeddings, config=transport_config
+            adjusted, valid_mask, embeddings, config=token_transport_config
         )
         ot_elapsed_ms = (time.monotonic() - ot_start) * 1000
         ot_computation_total_ms += ot_elapsed_ms

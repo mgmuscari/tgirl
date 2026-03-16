@@ -288,6 +288,7 @@ class ModelIntervention(BaseModel):
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
     logit_bias: dict[int, float] | None = None
+    transport_epsilon: float | None = None
     activation_steering: Any | None = None  # Reserved for ESTRADIOL
 
 
