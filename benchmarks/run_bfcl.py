@@ -231,7 +231,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     log.info("transition_policy", policy=args.transition_policy)
 
     session_config = SessionConfig(
-        max_tool_cycles=10,
+        max_tool_cycles=1,
         freeform_max_tokens=512,
         constrained_max_tokens=512,
         session_timeout=30.0,
