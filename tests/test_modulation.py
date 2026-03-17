@@ -104,7 +104,7 @@ class TestPhaseDetection:
     """Tests for EnvelopeState.detect_phase with hysteresis."""
 
     def _make_state(self, **kwargs) -> EnvelopeState:
-        defaults = {"prev_smoothed": [0.0] * 12}
+        defaults = {"prev_smoothed": [0.0] * 9}
         defaults.update(kwargs)
         return EnvelopeState(**defaults)
 
@@ -190,7 +190,7 @@ class TestPhaseDetection:
         - inner close paren triggers release (depth 2->1, depth <= 1)
         - outer close paren triggers release (depth 1->0)
         """
-        state = self._make_state(prev_smoothed=[0.0] * 12)
+        state = self._make_state(prev_smoothed=[0.0] * 9)
 
         # Opening '(' — depth 0 -> 1: attack
         state.advance_phase(freedom=0.8, depth=1)
@@ -229,7 +229,7 @@ class TestPhaseDetection:
 
     def test_advance_phase_tracks_peak_freedom(self) -> None:
         """Peak freedom is tracked during attack phase."""
-        state = self._make_state(prev_smoothed=[0.0] * 12)
+        state = self._make_state(prev_smoothed=[0.0] * 9)
         state.advance_phase(freedom=0.5, depth=1)
         assert state.peak_freedom == 0.5
         state.advance_phase(freedom=0.8, depth=1)
@@ -245,16 +245,16 @@ class TestEnvelopeConfig:
     """Tests for EnvelopeConfig and default matrix."""
 
     def test_default_matrix_shape(self) -> None:
-        assert len(DEFAULT_MATRIX) == 12
+        assert len(DEFAULT_MATRIX) == 9
         for row in DEFAULT_MATRIX:
             assert len(row) == 7
 
     def test_default_matrix_flat_length(self) -> None:
-        assert len(DEFAULT_MATRIX_FLAT) == 12 * 7
+        assert len(DEFAULT_MATRIX_FLAT) == 9 * 7
 
     def test_config_matrix_shape(self) -> None:
         cfg = EnvelopeConfig()
-        assert cfg.matrix_shape == (12, 7)
+        assert cfg.matrix_shape == (9, 7)
 
     def test_config_is_frozen(self) -> None:
         cfg = EnvelopeConfig()
@@ -284,27 +284,28 @@ class TestEnvelopeConfig:
 
     def test_conditioners_count(self) -> None:
         cfg = EnvelopeConfig()
-        assert len(cfg.conditioners) == 12
+        assert len(cfg.conditioners) == 9
 
-    def test_backward_compat_matrix_flat_auto_pad(self) -> None:
-        """Old 11-row (77-value) matrix_flat auto-pads to 84 with warning."""
+    def test_backward_compat_12row_matrix_migrates(self) -> None:
+        """Old 12-row (84-value) matrix_flat migrates to 63 (9 rows)."""
+        old_flat = tuple([0.0] * 84)
+        cfg = EnvelopeConfig(matrix_flat=old_flat)
+        assert len(cfg.matrix_flat) == 63
+
+    def test_backward_compat_conditioners_trim(self) -> None:
+        """Old 12-entry conditioners trim to 9."""
+        old_conds = tuple([SourceConditionerConfig()] * 12)
+        cfg = EnvelopeConfig(conditioners=old_conds)
+        assert len(cfg.conditioners) == 9
+
+    def test_backward_compat_11row_matrix_migrates(self) -> None:
+        """Old 11-row (77-value) matrix_flat migrates to 63."""
         old_flat = tuple([0.0] * 77)
         cfg = EnvelopeConfig(matrix_flat=old_flat)
-        assert len(cfg.matrix_flat) == 84
-        # Last 7 values should be zeros (the padded row)
-        assert cfg.matrix_flat[77:] == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-
-    def test_backward_compat_conditioners_auto_pad(self) -> None:
-        """Old 11-entry conditioners auto-pads to 12 with warning."""
-        old_conds = tuple([SourceConditionerConfig()] * 11)
-        cfg = EnvelopeConfig(conditioners=old_conds)
-        assert len(cfg.conditioners) == 12
-        # Last entry should be the coherence conditioner
-        assert cfg.conditioners[11].range_min == 0.0
-        assert cfg.conditioners[11].range_max == 1.0
+        assert len(cfg.matrix_flat) == 63
 
     def test_invalid_matrix_flat_length_raises(self) -> None:
-        """Non-77 and non-84 matrix_flat lengths raise ValueError."""
+        """Non-migratable matrix_flat lengths raise ValueError."""
         import pytest
         with pytest.raises(ValueError, match="matrix_flat has 50 values"):
             EnvelopeConfig(matrix_flat=tuple([0.0] * 50))
@@ -319,12 +320,9 @@ class TestEnvelopeConfig:
             [ 0.0,   0.0,   0.0,  -0.1,   0.0,   0.0,   0.0],  # overlap
             [ 0.0,   0.0,   0.0,   0.0, -80.0,   0.0,   0.0],  # depth
             [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # position
-            [ 0.10,  0.05, 10.0,  -0.05,  0.0,   0.0,   0.0],  # attack
-            [ 0.02,  0.0,   5.0,   0.0,   0.0,   0.0,   0.0],  # decay
-            [-0.04, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # sustain
-            [-0.02,  0.1,  10.0,  -0.05, -80.0,  0.0,   0.0],  # release
+            [ 0.10,  0.05, 10.0,  -0.05, -80.0,  0.0,   0.0],  # envelope
             [-0.05,  0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # cycle
-            [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # linguistic_coherence
+            [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # coherence
         ]
         # fmt: on
         for i, (actual, exp) in enumerate(
@@ -457,7 +455,7 @@ class TestModMatrixHookMlx:
         """Verify mod matrix is an mx.array (native MLX matmul)."""
         hook = _make_hook()
         assert isinstance(hook._mod_matrix, mx.array)
-        assert hook._mod_matrix.shape == (12, 7)
+        assert hook._mod_matrix.shape == (9, 7)
 
     def test_temperature_clamped_to_range(self) -> None:
         """Temperature is clamped within config range."""
@@ -505,11 +503,11 @@ class TestModMatrixHookMlx:
         assert abs(r1.top_p - r2.top_p) < 1e-6
 
     def test_coherence_fn_nonzero_with_nonzero_row_changes_temperature(self) -> None:
-        """coherence_fn=0.8 with non-zero row 11 produces different temperature."""
-        # Build a config with non-zero weights in row 11
+        """coherence_fn=0.8 with non-zero row 8 produces different temperature."""
+        # Build a config with non-zero weights in row 8 (coherence)
         custom_matrix = list(DEFAULT_MATRIX_FLAT)
-        # Row 11, col 0 (temperature) = 0.5
-        custom_matrix[11 * 7 + 0] = 0.5
+        # Row 8, col 0 (temperature) = 0.5
+        custom_matrix[8 * 7 + 0] = 0.5
         custom_flat = tuple(custom_matrix)
 
         def decode(ids: list[int]) -> str:
@@ -540,9 +538,9 @@ class TestModMatrixHookMlx:
 
     def test_torch_coherence_fn_parity(self) -> None:
         """Torch ModMatrixHook with coherence_fn produces same results as MLX."""
-        # Non-zero row 11 for observable effect
+        # Non-zero row 8 (coherence) for observable effect
         custom_matrix = list(DEFAULT_MATRIX_FLAT)
-        custom_matrix[11 * 7 + 0] = 0.3  # temperature
+        custom_matrix[8 * 7 + 0] = 0.3  # temperature
         custom_flat = tuple(custom_matrix)
         config = EnvelopeConfig(matrix_flat=custom_flat)
 
@@ -707,14 +705,14 @@ class TestEnvelopeTelemetry:
             phase="attack",
             phase_position=0,
             depth=1,
-            source_vector=[0.5] * 12,
+            source_vector=[0.5] * 9,
             modulation_vector=[0.1] * 7,
             final_temperature=0.3,
             final_epsilon=0.1,
         )
         assert t.phase == "attack"
         assert t.depth == 1
-        assert len(t.source_vector) == 12
+        assert len(t.source_vector) == 9
         assert len(t.modulation_vector) == 7
 
     def test_telemetry_json_serializable(self) -> None:
@@ -722,7 +720,7 @@ class TestEnvelopeTelemetry:
             phase="sustain",
             phase_position=5,
             depth=2,
-            source_vector=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            source_vector=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 0.0, 0.0],
             modulation_vector=[0.3, 0.9, -20.0, 0.1, 0.0, 0.0, 0.0],
             final_temperature=0.45,
             final_epsilon=0.08,

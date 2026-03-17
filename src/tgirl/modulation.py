@@ -46,7 +46,11 @@ class EnvelopeState:
     prev_depth: int = 0
     prev_freedom: float = 1.0
     peak_freedom: float = 0.0
-    prev_smoothed: list[float] = field(default_factory=lambda: [0.0] * 12)
+    prev_smoothed: list[float] = field(default_factory=lambda: [0.0] * 9)
+    # Continuous ADSR envelope (one-pole filter)
+    envelope_value: float = 0.0
+    envelope_target: float = 0.0
+    envelope_coeff: float = 0.5
     # Hysteresis state
     pending_phase: str | None = None  # candidate phase waiting for confirmation
     pending_count: int = 0  # consecutive tokens meeting transition condition
@@ -101,21 +105,37 @@ class EnvelopeState:
             self.pending_count = 0
             return self.phase
 
-    def advance_phase(self, freedom: float, depth: int) -> None:
-        """Update phase state after a token."""
+    def advance_phase(
+        self,
+        freedom: float,
+        depth: int,
+        attack_coeff: float = 0.5,
+        decay_coeff: float = 0.85,
+        sustain_level: float = 0.3,
+        release_coeff: float = 0.5,
+    ) -> None:
+        """Update phase state and tick envelope."""
         new_phase = self.detect_phase(freedom, depth)
         if new_phase != self.phase:
-            # Attack and release are immediate — bypass min_phase_duration.
-            # Only non-immediate transitions (decay) are subject to it.
             immediate = new_phase in ("attack", "release")
             if not immediate and self.phase_position < self.min_phase_duration:
-                # Too soon -- hold current phase
                 pass
             else:
                 self.phase = new_phase
                 self.phase_position = 0
                 if new_phase == "attack":
                     self.peak_freedom = freedom
+                    self.envelope_target = 1.0
+                    self.envelope_coeff = attack_coeff
+                elif new_phase == "decay":
+                    self.envelope_target = sustain_level
+                    self.envelope_coeff = decay_coeff
+                elif new_phase == "sustain":
+                    self.envelope_target = sustain_level
+                    self.envelope_coeff = 1.0  # hold
+                elif new_phase == "release":
+                    self.envelope_target = 0.0
+                    self.envelope_coeff = release_coeff
         else:
             self.phase_position += 1
         # Track peak freedom during attack
@@ -123,6 +143,12 @@ class EnvelopeState:
             self.peak_freedom = max(self.peak_freedom, freedom)
         self.prev_depth = depth
         self.prev_freedom = freedom
+        # Tick envelope: one-pole filter
+        self.envelope_value = (
+            self.envelope_target
+            + (self.envelope_value - self.envelope_target)
+            * self.envelope_coeff
+        )
 
 
 @dataclass(frozen=True)
@@ -158,23 +184,21 @@ DEFAULT_MATRIX: list[list[float]] = [
     # temp   top_p  rep    eps    open   back*  pres
     # *back (col 5) reserved -- zeroed, not wired in v1
     #
-    # Temperature regime: base=0.05, attack peaks at ~0.15,
-    # sustain drops to ~0.01. Matches old GrammarTemperatureHook's
-    # near-deterministic behavior during constrained generation.
-    # The ADSR shape modulates within a narrow band — the model
-    # needs precision for argument values, not exploration.
-    [ 0.5,   0.2,   0.0,   0.0,   0.0,   0.0,   0.0],  # 0: freedom (scaled by freedom ~0.00005)
+    # 9 sources: 6 structural signals + 1 continuous ADSR envelope
+    # + cycle detection + linguistic coherence.
+    # The envelope (row 6) replaces the old 4 binary phase gates.
+    # When envelope is high (attack peak), temp rises, rep bias
+    # increases, opener penalty engages. As it decays through
+    # sustain, effects diminish proportionally.
+    [ 0.5,   0.2,   0.0,   0.0,   0.0,   0.0,   0.0],  # 0: freedom
     [ 0.01,  0.1,   0.0,   0.0,   0.0,   0.0,   0.0],  # 1: entropy
-    [-0.02,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 2: confidence (high uncertainty → raise temp)
+    [-0.02,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 2: confidence
     [ 0.0,   0.0,   0.0,  -0.1,   0.0,   0.0,   0.0],  # 3: overlap
-    [ 0.0,   0.0,   0.0,   0.0, -80.0,   0.0,   0.0],  # 4: depth (stronger opener penalty)
+    [ 0.0,   0.0,   0.0,   0.0, -80.0,   0.0,   0.0],  # 4: depth
     [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 5: position
-    [ 0.10,  0.05, 10.0,  -0.05,  0.0,   0.0,   0.0],  # 6: attack (+0.10 → temp ~0.15)
-    [ 0.02,  0.0,   5.0,   0.0,   0.0,   0.0,   0.0],  # 7: decay
-    [-0.04, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # 8: sustain (-0.04 → temp ~0.01)
-    [-0.02,  0.1,  10.0,  -0.05, -80.0,  0.0,   0.0],  # 9: release
-    [-0.05,  0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # 10: cycle (drops temp too)
-    [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 11: linguistic_coherence (zero = no-op)
+    [ 0.10,  0.05, 10.0,  -0.05, -80.0,  0.0,   0.0],  # 6: envelope (continuous ADSR)
+    [-0.05,  0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # 7: cycle
+    [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # 8: coherence (zero = no-op)
 ]
 # fmt: on
 
@@ -191,12 +215,9 @@ DEFAULT_CONDITIONERS: tuple[SourceConditionerConfig, ...] = (
     SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 3: overlap
     SourceConditionerConfig(range_min=0.0, range_max=10.0),  # 4: depth
     SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 5: position
-    SourceConditionerConfig(),  # 6: phase_attack (0 or 1)
-    SourceConditionerConfig(),  # 7: phase_decay
-    SourceConditionerConfig(),  # 8: phase_sustain
-    SourceConditionerConfig(),  # 9: phase_release
-    SourceConditionerConfig(),  # 10: cycle_detected
-    SourceConditionerConfig(range_min=0.0, range_max=1.0),  # 11: linguistic_coherence
+    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 6: envelope (continuous 0-1)
+    SourceConditionerConfig(),  # 7: cycle_detected
+    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 8: linguistic_coherence
 )
 
 
@@ -220,43 +241,68 @@ class EnvelopeConfig:
     repetition_bias_range: tuple[float, float] = (-100.0, 0.0)
     epsilon_range: tuple[float, float] = (0.01, 1.0)
 
-    # Source conditioners (12 entries)
+    # Source conditioners (9 entries)
     conditioners: tuple[SourceConditionerConfig, ...] = field(
         default_factory=lambda: DEFAULT_CONDITIONERS,
     )
 
-    # The matrix itself -- shape (12, 7), stored as flat tuple
+    # The matrix itself -- shape (9, 7), stored as flat tuple
     matrix_flat: tuple[float, ...] = field(
         default_factory=lambda: DEFAULT_MATRIX_FLAT,
     )
 
+    # ADSR envelope shape parameters
+    attack_coeff: float = 0.5      # ~3-4 tokens to peak
+    decay_coeff: float = 0.85      # ~10 tokens to sustain
+    sustain_level: float = 0.3     # steady-state during constrained gen
+    release_coeff: float = 0.5     # ~3-4 tokens to zero
+
     def __post_init__(self) -> None:
-        rows, cols = 12, 7
+        rows, cols = 9, 7
         expected_flat = rows * cols
-        # Backward compatibility: auto-pad old 11-row configs
-        if len(self.matrix_flat) == 77 and expected_flat == 84:
+        # Backward compatibility: auto-migrate old 12-row (84-value) configs
+        if len(self.matrix_flat) == 84 and expected_flat == 63:
             logger.warning(
-                "EnvelopeConfig: padding matrix_flat from 77 to 84 (11→12 rows)"
+                "EnvelopeConfig: migrating matrix_flat from 84 to 63 "
+                "(12→9 rows, binary gates→continuous envelope)"
             )
-            object.__setattr__(
-                self, "matrix_flat",
-                tuple(list(self.matrix_flat) + [0.0] * cols),
+            old = list(self.matrix_flat)
+            # Keep rows 0-5, take row 6 (attack) as envelope row,
+            # keep row 10 (cycle) and row 11 (coherence)
+            new = old[:42]  # rows 0-5 (6*7=42)
+            new.extend(old[42:49])  # row 6 (attack) → envelope
+            new.extend(old[70:77])  # row 10 (cycle) → row 7
+            new.extend(old[77:84])  # row 11 (coherence) → row 8
+            object.__setattr__(self, "matrix_flat", tuple(new))
+        elif len(self.matrix_flat) == 77:
+            # Very old 11-row config — migrate to 9
+            logger.warning(
+                "EnvelopeConfig: migrating matrix_flat from 77 to 63"
             )
+            old = list(self.matrix_flat)
+            new = old[:42]  # rows 0-5
+            new.extend(old[42:49])  # row 6 (attack) → envelope
+            new.extend(old[63:70])  # row 9 (was release/cycle area)
+            new.extend([0.0] * 7)  # coherence (zero)
+            object.__setattr__(self, "matrix_flat", tuple(new))
         elif len(self.matrix_flat) != expected_flat:
             raise ValueError(
                 f"matrix_flat has {len(self.matrix_flat)} values, "
                 f"expected {expected_flat} for shape ({rows}, {cols})"
             )
-        if len(self.conditioners) == 11 and rows == 12:
+        # Conditioner backward compat
+        if len(self.conditioners) in (11, 12) and rows == 9:
             logger.warning(
-                "EnvelopeConfig: padding conditioners from 11 to 12"
+                "EnvelopeConfig: trimming conditioners to 9"
             )
-            object.__setattr__(
-                self, "conditioners",
-                tuple(list(self.conditioners) + [
-                    SourceConditionerConfig(range_min=0.0, range_max=1.0),
-                ]),
-            )
+            old = list(self.conditioners)
+            new = old[:6]  # rows 0-5
+            new.append(
+                SourceConditionerConfig(range_min=0.0, range_max=1.0)
+            )  # envelope
+            new.append(old[10] if len(old) > 10 else SourceConditionerConfig())  # cycle
+            new.append(old[11] if len(old) > 11 else SourceConditionerConfig(range_min=0.0, range_max=1.0))  # coherence
+            object.__setattr__(self, "conditioners", tuple(new))
         elif len(self.conditioners) != rows:
             raise ValueError(
                 f"conditioners has {len(self.conditioners)} entries, "
@@ -265,13 +311,13 @@ class EnvelopeConfig:
 
     @property
     def matrix_shape(self) -> tuple[int, int]:
-        return (12, 7)
+        return (9, 7)
 
 
 class ModMatrixHookMlx:
     """Phase-aware modulation matrix for constrained generation.
 
-    Routes 12 source signals through a (12, 7) matrix to produce
+    Routes 9 source signals through a (9, 7) matrix to produce
     7 parameter modulations per token. Replaces GrammarTemperatureHook
     and NestingDepthHook with a single configurable hook.
     """
@@ -289,7 +335,7 @@ class ModMatrixHookMlx:
         self.config = config
         self.max_tokens = max_tokens
         self._coherence_fn = coherence_fn
-        self._state = EnvelopeState(prev_smoothed=[0.0] * 12)
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 9)
         self.last_telemetry: EnvelopeTelemetry | None = None
 
         # Build mod matrix as mx.array from flat config
@@ -314,7 +360,7 @@ class ModMatrixHookMlx:
 
     def reset(self) -> None:
         """Reset state for new constrained generation pass."""
-        self._state = EnvelopeState(prev_smoothed=[0.0] * 12)
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 9)
         self.last_telemetry = None
 
     def advance(self, token_id: int) -> None:
@@ -347,9 +393,14 @@ class ModMatrixHookMlx:
         )
         confidence = float(mx.max(log_probs).item())
 
-        # 2. Detect phase
-        self._state.advance_phase(freedom, self._state.depth)
-        phase = self._state.phase
+        # 2. Detect phase and tick envelope
+        self._state.advance_phase(
+            freedom, self._state.depth,
+            attack_coeff=cfg.attack_coeff,
+            decay_coeff=cfg.decay_coeff,
+            sustain_level=cfg.sustain_level,
+            release_coeff=cfg.release_coeff,
+        )
 
         # 3. Cycle detection
         cycle = (
@@ -362,7 +413,7 @@ class ModMatrixHookMlx:
         coherence = self._coherence_fn() if self._coherence_fn else 0.0
 
         # 5. Build source vector (conditioned)
-        # n=12 Python scalars — documented deviation, sub-microsecond
+        # n=9 Python scalars — documented deviation, sub-microsecond
         raw_sources = [
             freedom,
             entropy,
@@ -370,10 +421,7 @@ class ModMatrixHookMlx:
             overlap,
             float(self._state.depth),
             position / self.max_tokens,
-            1.0 if phase == "attack" else 0.0,
-            1.0 if phase == "decay" else 0.0,
-            1.0 if phase == "sustain" else 0.0,
-            1.0 if phase == "release" else 0.0,
+            self._state.envelope_value,
             cycle,
             coherence,
         ]
@@ -458,7 +506,7 @@ class ModMatrixHookMlx:
             float(modulations[i].item()) for i in range(7)
         ]
         self.last_telemetry = EnvelopeTelemetry(
-            phase=phase,
+            phase=self._state.phase,
             phase_position=self._state.phase_position,
             depth=self._state.depth,
             source_vector=list(conditioned),
@@ -499,7 +547,7 @@ class ModMatrixHook:
         self.config = config
         self.max_tokens = max_tokens
         self._coherence_fn = coherence_fn
-        self._state = EnvelopeState(prev_smoothed=[0.0] * 12)
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 9)
 
         # Build mod matrix as torch.Tensor
         rows, cols = config.matrix_shape
@@ -523,7 +571,7 @@ class ModMatrixHook:
 
     def reset(self) -> None:
         """Reset state for new constrained generation pass."""
-        self._state = EnvelopeState(prev_smoothed=[0.0] * 12)
+        self._state = EnvelopeState(prev_smoothed=[0.0] * 9)
 
     def advance(self, token_id: int) -> None:
         """Update depth after token sampled."""
@@ -568,9 +616,14 @@ class ModMatrixHook:
             _torch.max(log_probs).item()
         )
 
-        # 2. Detect phase
-        self._state.advance_phase(freedom, self._state.depth)
-        phase = self._state.phase
+        # 2. Detect phase and tick envelope
+        self._state.advance_phase(
+            freedom, self._state.depth,
+            attack_coeff=cfg.attack_coeff,
+            decay_coeff=cfg.decay_coeff,
+            sustain_level=cfg.sustain_level,
+            release_coeff=cfg.release_coeff,
+        )
 
         # 3. Cycle detection
         cycle = (
@@ -590,10 +643,7 @@ class ModMatrixHook:
             overlap,
             float(self._state.depth),
             position / self.max_tokens,
-            1.0 if phase == "attack" else 0.0,
-            1.0 if phase == "decay" else 0.0,
-            1.0 if phase == "sustain" else 0.0,
-            1.0 if phase == "release" else 0.0,
+            self._state.envelope_value,
             cycle,
             coherence,
         ]
