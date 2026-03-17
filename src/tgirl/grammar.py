@@ -427,12 +427,16 @@ def generate_routing_grammar(
 def generate(
     snapshot: RegistrySnapshot,
     config: GrammarConfig | None = None,
+    tokenizer_decode: Callable[[list[int]], str] | None = None,
+    vocab_size: int | None = None,
 ) -> GrammarOutput:
     """Generate a grammar from a registry snapshot.
 
     Args:
         snapshot: Immutable registry snapshot.
         config: Grammar generation configuration.
+        tokenizer_decode: Token ID decoder for reachable set computation.
+        vocab_size: Vocabulary size for reachable set scan.
 
     Returns:
         Complete grammar output with text and metadata.
@@ -461,6 +465,13 @@ def generate(
     # Render grammar text
     text = _render_grammar(snapshot, cfg)
 
+    # Compute reachable set if tokenizer provided
+    reachable: frozenset[int] | None = None
+    if tokenizer_decode is not None and vocab_size is not None:
+        reachable = compute_reachable_set(
+            text, tokenizer_decode, vocab_size
+        )
+
     # Compute snapshot hash (exclude timestamp for determinism)
     hash_data = snapshot.model_dump_json(exclude={"timestamp"})
     snapshot_hash = hashlib.sha256(hash_data.encode()).hexdigest()[:16]
@@ -471,6 +482,7 @@ def generate(
         snapshot_hash=snapshot_hash,
         tool_quotas=dict(snapshot.quotas),
         cost_remaining=snapshot.cost_remaining,
+        reachable_tokens=reachable,
     )
 
 

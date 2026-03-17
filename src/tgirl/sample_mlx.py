@@ -430,6 +430,7 @@ def run_constrained_generation_mlx(
     grammar_guide_factory: Callable | None = None,
     grammar_text: str | None = None,
     stop_token_ids: list[int] | None = None,
+    reachable_tokens: frozenset[int] | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
@@ -552,7 +553,9 @@ def run_constrained_generation_mlx(
 
         ot_start = time.monotonic()
         ot_result = redistribute_logits_mlx(
-            adjusted, valid_mask, embeddings, config=token_transport_config
+            adjusted, valid_mask, embeddings,
+            config=token_transport_config,
+            reachable_tokens=reachable_tokens,
         )
         ot_elapsed_ms = (time.monotonic() - ot_start) * 1000
         ot_computation_total_ms += ot_elapsed_ms
