@@ -770,10 +770,31 @@ class SamplingSession:
         self._formatter = formatter
         self._last_user_content: str | None = None
         self._backend = backend
-        self._transition_policy = transition_policy or DelimiterTransitionPolicy(
-            delimiter=self._config.tool_open_delimiter,
-            tokenizer_decode=self._decode,
-        )
+        if transition_policy is not None:
+            self._transition_policy = transition_policy
+        else:
+            from tgirl.state_machine import (
+                CompositeTransitionPolicy,
+                LatchedTransitionPolicy,
+            )
+
+            _delimiter = DelimiterTransitionPolicy(
+                delimiter=self._config.tool_open_delimiter,
+                tokenizer_decode=self._decode,
+            )
+            if isinstance(getattr(registry, '_tools', None), dict) and registry._tools:
+                # Compose: delimiter fires for instruct models,
+                # latch fires on high confidence for base models (OR mode)
+                _latched = LatchedTransitionPolicy(
+                    tokenizer_decode=self._decode,
+                )
+                self._transition_policy = CompositeTransitionPolicy(
+                    policies=[_delimiter, _latched],
+                    mode="or",
+                )
+            else:
+                self._transition_policy = _delimiter
+        self._tool_name_token_ids: set[int] | None = None
         # Set on first forward call if backend="auto"
         self._is_mlx: bool | None = (
             True if backend == "mlx"
@@ -974,6 +995,17 @@ class SamplingSession:
                     vocab_size=_signal_vocab_sz,
                     sampled_token_id=token_id,
                 )
+                # Stop token in freeform + force_tool_call → transition
+                if (
+                    self._stop_token_ids
+                    and token_id in self._stop_token_ids
+                    and getattr(self._config, 'force_tool_call', False)
+                ):
+                    # Model tried to stop — it's done reasoning
+                    freeform_tokens.pop()  # remove the stop token
+                    delimiter_found = True
+                    break
+
                 decision = self._transition_policy.evaluate(
                     SessionState.FREEFORM,
                     signal,
@@ -984,10 +1016,34 @@ class SamplingSession:
                     break
 
             if freeform_tokens:
-                output_parts.append(self._decode(freeform_tokens))
+                # If forcing transition, truncate to last sentence boundary
+                if not delimiter_found and getattr(
+                    self._config, 'force_tool_call', False
+                ):
+                    _freeform_text = self._decode(freeform_tokens)
+                    # Find last sentence terminal
+                    _terminals = '.!?\n'
+                    _last_term = -1
+                    for _ci, _ch in enumerate(_freeform_text):
+                        if _ch in _terminals:
+                            _last_term = _ci
+                    if _last_term >= 0:
+                        _freeform_text = _freeform_text[: _last_term + 1]
+                    output_parts.append(_freeform_text)
+                else:
+                    output_parts.append(self._decode(freeform_tokens))
 
-            if timed_out or not delimiter_found:
-                break  # No tool call or timeout, session ends
+            if timed_out:
+                break
+
+            # If freeform budget exhausted without delimiter/latch,
+            # force transition when force_tool_call=True — the model
+            # reasoned but never signaled. Budget exhaustion = implicit latch.
+            if not delimiter_found:
+                if getattr(self._config, 'force_tool_call', False):
+                    delimiter_found = True
+                else:
+                    break
 
             if cycle_count >= self._config.max_tool_cycles:
                 break

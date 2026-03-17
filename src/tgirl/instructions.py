@@ -131,8 +131,8 @@ def generate_system_prompt(
         Complete system prompt string.
     """
     sections = [
-        "You are a tool-calling assistant. You call tools using "
-        "s-expressions wrapped in delimiters."
+        "You are a tool-calling assistant. Think briefly about "
+        "which tool to call and with what arguments, then call it."
         if tool_open
         else "You call tools using s-expressions. "
         "Reply with ONLY one s-expression, nothing else.",
@@ -149,9 +149,8 @@ def generate_system_prompt(
             f"  Wrap every tool call in {tool_open}...{tool_close} delimiters:",
             f"  {tool_open}(tool_name arg1 arg2){tool_close}",
             "",
-            "  When you want to call a tool, output the delimiter, then the "
-            "s-expression, then the closing delimiter. You may include "
-            "natural language before the tool call.",
+            "  Reason briefly (1-2 sentences), then call the tool. "
+            "Do not solve the problem yourself — use the tool.",
             "",
         ])
 

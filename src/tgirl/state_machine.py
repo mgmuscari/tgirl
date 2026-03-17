@@ -494,6 +494,106 @@ class ConfidenceTransitionPolicy:
         self._overlap_history.clear()
 
 
+class LatchedTransitionPolicy:
+    """Latch on high confidence, transition on sentence terminal.
+
+    Two-phase regime transition for models that don't emit delimiters:
+    1. LATCH: when token entropy drops below threshold (distribution is
+       sharp — the model knows what it wants to do), set a one-way latch
+    2. COMPLETE: wait for a sentence terminal token, then transition
+    3. FALLBACK: if max_freeform_after_latch tokens pass without terminal,
+       force transition anyway
+
+    Confidence is measured by distribution sharpness (low entropy = high
+    confidence), not by matching tool name strings in the output.
+
+    The terminal character set is configurable for polyglot support:
+    English {'.', '!', '?'}, Chinese {'。', '！', '？'}, etc.
+    """
+
+    def __init__(
+        self,
+        entropy_threshold: float = 2.0,
+        terminal_chars: set[str] | None = None,
+        max_freeform_after_latch: int = 64,
+        tokenizer_decode: Callable[[list[int]], str] | None = None,
+    ) -> None:
+        self._entropy_threshold = entropy_threshold
+        self._terminals = terminal_chars or {'.', '!', '?'}
+        self._max_after_latch = max_freeform_after_latch
+        self._decode = tokenizer_decode
+        self._latched = False
+        self._tokens_since_latch = 0
+
+    def evaluate(
+        self,
+        current_state: SessionState,
+        signal: TransitionSignal,
+        **kwargs: object,
+    ) -> TransitionDecision:
+        if current_state != SessionState.FREEFORM:
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="not in freeform state",
+                confidence=0.0,
+            )
+
+        # Decode token text for terminal detection
+        token_text = str(kwargs.get("token_text", ""))
+        token_id = kwargs.get("token_id")
+        if token_id is not None and self._decode is not None:
+            token_text = self._decode([int(token_id)])
+
+        # Phase 1: latch on low entropy (high confidence)
+        if not self._latched and signal.token_entropy < self._entropy_threshold:
+            self._latched = True
+            self._tokens_since_latch = 0
+
+        if not self._latched:
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="not latched (entropy too high)",
+                confidence=0.0,
+            )
+
+        self._tokens_since_latch += 1
+
+        # Phase 3: budget exhaustion fallback
+        if self._tokens_since_latch >= self._max_after_latch:
+            return TransitionDecision(
+                should_transition=True,
+                target_state=SessionState.ROUTE,
+                reason="budget exhaustion after latch",
+                confidence=1.0,
+            )
+
+        # Phase 2: terminal detection
+        stripped = token_text.strip()
+        if stripped:
+            last_char = stripped[-1]
+            if last_char in self._terminals:
+                return TransitionDecision(
+                    should_transition=True,
+                    target_state=SessionState.ROUTE,
+                    reason="sentence terminal after latch",
+                    confidence=0.9,
+                )
+
+        return TransitionDecision(
+            should_transition=False,
+            target_state=None,
+            reason="latched, awaiting terminal",
+            confidence=signal.token_entropy,
+        )
+
+    def reset(self) -> None:
+        """Clear latch state for next cycle."""
+        self._latched = False
+        self._tokens_since_latch = 0
+
+
 class CompositeTransitionPolicy:
     """Combine multiple policies with OR or AND logic.
 
@@ -523,21 +623,26 @@ class CompositeTransitionPolicy:
                 confidence=0.0,
             )
 
-        decisions = [
-            p.evaluate(current_state, signal, **kwargs) for p in self.policies
-        ]
-
         if self.mode == "or":
-            for d in decisions:
+            # Short-circuit: return first policy that triggers
+            max_confidence = 0.0
+            for p in self.policies:
+                d = p.evaluate(current_state, signal, **kwargs)
                 if d.should_transition:
                     return d
+                max_confidence = max(max_confidence, d.confidence)
             return TransitionDecision(
                 should_transition=False,
                 target_state=None,
                 reason="no policy triggered (OR mode)",
-                confidence=max(d.confidence for d in decisions),
+                confidence=max_confidence,
             )
-        else:  # "and"
+
+        # AND mode: evaluate all
+        decisions = [
+            p.evaluate(current_state, signal, **kwargs) for p in self.policies
+        ]
+        if True:  # "and"
             if all(d.should_transition for d in decisions):
                 # Use highest confidence decision
                 best = max(decisions, key=lambda d: d.confidence)

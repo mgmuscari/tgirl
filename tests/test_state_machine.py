@@ -487,6 +487,233 @@ class TestImmediateTransitionPolicy:
         assert isinstance(ImmediateTransitionPolicy(), TransitionPolicy)
 
 
+class TestLatchedTransitionPolicy:
+    """LatchedTransitionPolicy latches on high confidence, transitions on terminal."""
+
+    @staticmethod
+    def _signal(pos: int = 0, entropy: float = 5.0) -> "TransitionSignal":
+        from tgirl.state_machine import TransitionSignal
+        return TransitionSignal(
+            token_position=pos,
+            grammar_mask_overlap=0.0,
+            token_entropy=entropy,
+            token_log_prob=0.0,
+            grammar_freedom=0.0,
+        )
+
+    def test_no_transition_when_entropy_high(self) -> None:
+        """High entropy (uncertain) never latches."""
+        from tgirl.state_machine import (
+            LatchedTransitionPolicy,
+            SessionState,
+        )
+
+        policy = LatchedTransitionPolicy(entropy_threshold=2.0)
+        for i in range(10):
+            decision = policy.evaluate(
+                SessionState.FREEFORM,
+                self._signal(i, entropy=5.0),  # high entropy = uncertain
+                token_text="hello ",
+            )
+            assert decision.should_transition is False
+
+    def test_latch_but_no_terminal_no_transition(self) -> None:
+        """Low entropy sets latch but no transition until terminal."""
+        from tgirl.state_machine import (
+            LatchedTransitionPolicy,
+            SessionState,
+        )
+
+        policy = LatchedTransitionPolicy(entropy_threshold=2.0)
+        decision = policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(0, entropy=1.0),  # low entropy = confident
+            token_text="calculate",
+        )
+        assert decision.should_transition is False
+
+    def test_transition_on_terminal_after_latch(self) -> None:
+        """After latch, sentence terminal triggers transition."""
+        from tgirl.state_machine import (
+            LatchedTransitionPolicy,
+            SessionState,
+        )
+
+        policy = LatchedTransitionPolicy(entropy_threshold=2.0)
+        # Step 1: latch (low entropy)
+        policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(0, entropy=0.5),
+            token_text="calculate",
+        )
+        # Step 2: more freeform (entropy rises, doesn't matter — latched)
+        policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(1, entropy=4.0),
+            token_text=" the BMI",
+        )
+        # Step 3: terminal
+        decision = policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(2, entropy=3.0),
+            token_text=".",
+        )
+        assert decision.should_transition is True
+        assert decision.target_state == SessionState.ROUTE
+
+    def test_budget_exhaustion_forces_transition(self) -> None:
+        """After latch, max_freeform_after_latch forces transition."""
+        from tgirl.state_machine import (
+            LatchedTransitionPolicy,
+            SessionState,
+        )
+
+        policy = LatchedTransitionPolicy(
+            entropy_threshold=2.0,
+            max_freeform_after_latch=4,
+        )
+        # Latch (low entropy)
+        policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(0, entropy=0.5),
+            token_text="use",
+        )
+        # 3 more tokens without terminal
+        for i in range(1, 4):
+            decision = policy.evaluate(
+                SessionState.FREEFORM,
+                self._signal(i, entropy=5.0),
+                token_text="word",
+            )
+        # 4th token after latch = budget exhaustion
+        assert decision.should_transition is True
+        assert "budget" in decision.reason.lower()
+
+    def test_custom_terminals(self) -> None:
+        """Custom terminal set is respected."""
+        from tgirl.state_machine import (
+            LatchedTransitionPolicy,
+            SessionState,
+        )
+
+        policy = LatchedTransitionPolicy(
+            entropy_threshold=2.0,
+            terminal_chars={'。', '！'},
+        )
+        # Latch
+        policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(0, entropy=0.5),
+            token_text="use",
+        )
+        # English period does NOT trigger
+        decision = policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(1, entropy=3.0),
+            token_text=".",
+        )
+        assert decision.should_transition is False
+
+        # Chinese period DOES trigger
+        decision = policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(2, entropy=3.0),
+            token_text="。",
+        )
+        assert decision.should_transition is True
+
+    def test_only_evaluates_in_freeform(self) -> None:
+        from tgirl.state_machine import (
+            LatchedTransitionPolicy,
+            SessionState,
+        )
+
+        policy = LatchedTransitionPolicy(entropy_threshold=2.0)
+        decision = policy.evaluate(
+            SessionState.CONSTRAINED,
+            self._signal(0, entropy=0.1),
+            token_text=".",
+        )
+        assert decision.should_transition is False
+
+    def test_reset_clears_latch(self) -> None:
+        from tgirl.state_machine import (
+            LatchedTransitionPolicy,
+            SessionState,
+        )
+
+        policy = LatchedTransitionPolicy(entropy_threshold=2.0)
+        # Latch
+        policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(0, entropy=0.5),
+            token_text="use",
+        )
+        # Reset
+        policy.reset()
+        # Terminal should NOT trigger (latch cleared)
+        decision = policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(1, entropy=5.0),
+            token_text=".",
+        )
+        assert decision.should_transition is False
+
+    def test_conforms_to_protocol(self) -> None:
+        from tgirl.state_machine import LatchedTransitionPolicy, TransitionPolicy
+
+        assert isinstance(
+            LatchedTransitionPolicy(entropy_threshold=2.0),
+            TransitionPolicy,
+        )
+
+    def test_composes_with_delimiter_in_composite(self) -> None:
+        """Works as fallback in CompositeTransitionPolicy."""
+        from tgirl.state_machine import (
+            CompositeTransitionPolicy,
+            DelimiterTransitionPolicy,
+            LatchedTransitionPolicy,
+            SessionState,
+        )
+
+        def decode(ids: list[int]) -> str:
+            return chr(65 + ids[0]) if ids else ""
+
+        policy = CompositeTransitionPolicy(
+            policies=[
+                DelimiterTransitionPolicy(
+                    delimiter="Z",
+                    tokenizer_decode=decode,
+                ),
+                LatchedTransitionPolicy(entropy_threshold=2.0),
+            ],
+            mode="or",
+        )
+        # Neither delimiter nor low entropy — no transition
+        decision = policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(0, entropy=5.0),
+            token_id=0,
+            token_text="hello",
+        )
+        assert decision.should_transition is False
+
+        # Low entropy latches + terminal — latched policy triggers
+        policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(1, entropy=0.5),
+            token_id=1,
+            token_text="calculate",
+        )
+        decision = policy.evaluate(
+            SessionState.FREEFORM,
+            self._signal(2, entropy=3.0),
+            token_id=2,
+            token_text=".",
+        )
+        assert decision.should_transition is True
+
+
 class TestSamplingSessionTransitionPolicy:
     """Phase 1B: SamplingSession accepts transition_policy param."""
 
@@ -580,12 +807,12 @@ class TestSamplingSessionTransitionPolicy:
 
         return SamplingSession(**kwargs)
 
-    def test_default_transition_policy_is_delimiter(self) -> None:
-        """SamplingSession defaults to DelimiterTransitionPolicy when none specified."""
-        from tgirl.state_machine import DelimiterTransitionPolicy
+    def test_default_transition_policy_is_composite(self) -> None:
+        """SamplingSession defaults to CompositeTransitionPolicy when tools registered."""
+        from tgirl.state_machine import CompositeTransitionPolicy
 
         session = self._make_session_with_policy()
-        assert isinstance(session._transition_policy, DelimiterTransitionPolicy)
+        assert isinstance(session._transition_policy, CompositeTransitionPolicy)
 
     def test_custom_transition_policy_accepted(self) -> None:
         """SamplingSession accepts a custom transition policy."""
