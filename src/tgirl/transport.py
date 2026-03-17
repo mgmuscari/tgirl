@@ -228,6 +228,7 @@ def redistribute_logits(
     max_iterations: int = 20,
     convergence_threshold: float = 1e-6,
     config: TransportConfig | None = None,
+    reachable_tokens: frozenset[int] | None = None,
 ) -> TransportResult:
     """Redistribute probability mass from invalid to valid tokens using OT.
 
@@ -274,61 +275,119 @@ def redistribute_logits(
 
     # Full OT path
     vocab_size = logits.shape[0]
-    invalid_indices = torch.where(~valid_mask)[0]
-    valid_indices = torch.where(valid_mask)[0]
 
-    # Check problem size to avoid OOM on large cost matrices
-    problem_size = len(invalid_indices) * len(valid_indices)
-    if problem_size > cfg.max_problem_size:
+    # Project to reachable subset if provided
+    if reachable_tokens is not None and len(reachable_tokens) < vocab_size:
+        reachable_idx = torch.tensor(
+            sorted(reachable_tokens), dtype=torch.long
+        )
+        valid_mask_R = valid_mask[reachable_idx]
+        valid_indices_R = torch.where(valid_mask_R)[0]
+        invalid_indices_R = torch.where(~valid_mask_R)[0]
+
+        problem_size = len(invalid_indices_R) * len(valid_indices_R)
+        if (
+            problem_size > cfg.max_problem_size
+            or len(valid_indices_R) == 0
+            or len(invalid_indices_R) == 0
+        ):
+            masked = _standard_masking(logits, valid_mask)
+            return TransportResult(
+                logits=masked,
+                wasserstein_distance=0.0,
+                bypassed=True,
+                bypass_reason="problem_size_exceeded",
+                iterations=0,
+            )
+
+        # Source/target from full-vocab softmax (YP1)
+        probs_full = torch.softmax(logits, dim=-1)
+        full_invalid_idx = reachable_idx[invalid_indices_R]
+        full_valid_idx = reachable_idx[valid_indices_R]
+
+        source_mass = probs_full[full_invalid_idx]
+        source_mass = source_mass / source_mass.sum().clamp(min=1e-30)
+        source_mass = torch.clamp(source_mass, min=1e-30)
+
+        target_capacity = probs_full[full_valid_idx]
+        target_capacity = target_capacity / target_capacity.sum().clamp(
+            min=1e-30
+        )
+        target_capacity = torch.clamp(target_capacity, min=1e-30)
+
+        embeddings_R = embeddings[reachable_idx]
+        cost = _compute_cost_submatrix(
+            embeddings_R, invalid_indices_R, valid_indices_R
+        )
+
         logger.debug(
-            "transport_bypass",
-            reason="problem_size_exceeded",
-            problem_size=problem_size,
-            max_problem_size=cfg.max_problem_size,
+            "transport_sinkhorn_start",
+            n_invalid=len(invalid_indices_R),
+            n_valid=len(valid_indices_R),
+            reachable_size=len(reachable_tokens),
+            epsilon=cfg.epsilon,
         )
-        masked = _standard_masking(logits, valid_mask)
-        return TransportResult(
-            logits=masked,
-            wasserstein_distance=0.0,
-            bypassed=True,
-            bypass_reason="problem_size_exceeded",
-            iterations=0,
+        plan, wasserstein, iterations = _sinkhorn_log_domain(
+            cost, source_mass, target_capacity,
+            cfg.epsilon, cfg.max_iterations, cfg.convergence_threshold,
         )
 
-    # Compute source mass (probability on invalid tokens)
-    probs = torch.softmax(logits, dim=-1)
-    source_mass = probs[invalid_indices]
-    source_mass = source_mass / source_mass.sum()  # normalize to valid dist
-    source_mass = torch.clamp(source_mass, min=1e-30)
+        total_invalid_mass = probs_full[full_invalid_idx].sum()
+        plan = plan * total_invalid_mass
+        result_logits = _apply_transport_plan(
+            plan, full_valid_idx, logits, vocab_size
+        )
+    else:
+        # No projection — original full-vocab path
+        invalid_indices = torch.where(~valid_mask)[0]
+        valid_indices = torch.where(valid_mask)[0]
 
-    # Target capacity: proportional to valid token probabilities
-    target_capacity = probs[valid_indices]
-    target_capacity = target_capacity / target_capacity.sum()
-    target_capacity = torch.clamp(target_capacity, min=1e-30)
+        problem_size = len(invalid_indices) * len(valid_indices)
+        if problem_size > cfg.max_problem_size:
+            logger.debug(
+                "transport_bypass",
+                reason="problem_size_exceeded",
+                problem_size=problem_size,
+            )
+            masked = _standard_masking(logits, valid_mask)
+            return TransportResult(
+                logits=masked,
+                wasserstein_distance=0.0,
+                bypassed=True,
+                bypass_reason="problem_size_exceeded",
+                iterations=0,
+            )
 
-    # Compute cost submatrix
-    cost = _compute_cost_submatrix(embeddings, invalid_indices, valid_indices)
+        probs = torch.softmax(logits, dim=-1)
+        source_mass = probs[invalid_indices]
+        source_mass = source_mass / source_mass.sum()
+        source_mass = torch.clamp(source_mass, min=1e-30)
 
-    # Run Sinkhorn
-    logger.debug(
-        "transport_sinkhorn_start",
-        n_invalid=len(invalid_indices),
-        n_valid=len(valid_indices),
-        epsilon=cfg.epsilon,
-    )
-    plan, wasserstein, iterations = _sinkhorn_log_domain(
-        cost, source_mass, target_capacity,
-        cfg.epsilon, cfg.max_iterations, cfg.convergence_threshold,
-    )
+        target_capacity = probs[valid_indices]
+        target_capacity = target_capacity / target_capacity.sum()
+        target_capacity = torch.clamp(target_capacity, min=1e-30)
 
-    # Scale plan by total invalid mass
-    total_invalid_mass = probs[invalid_indices].sum()
-    plan = plan * total_invalid_mass
+        cost = _compute_cost_submatrix(
+            embeddings, invalid_indices, valid_indices
+        )
 
-    # Apply transport plan
-    result_logits = _apply_transport_plan(
-        plan, valid_indices, logits, vocab_size
-    )
+        logger.debug(
+            "transport_sinkhorn_start",
+            n_invalid=len(invalid_indices),
+            n_valid=len(valid_indices),
+            epsilon=cfg.epsilon,
+        )
+        plan, wasserstein, iterations = _sinkhorn_log_domain(
+            cost, source_mass, target_capacity,
+            cfg.epsilon, cfg.max_iterations, cfg.convergence_threshold,
+        )
+
+        total_invalid_mass = probs[invalid_indices].sum()
+        plan = plan * total_invalid_mass
+
+        result_logits = _apply_transport_plan(
+            plan, valid_indices, logits, vocab_size
+        )
 
     logger.debug(
         "transport_complete",
