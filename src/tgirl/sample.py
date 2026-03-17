@@ -493,6 +493,7 @@ def run_constrained_generation(
     grammar_guide_factory: Callable[[str], GrammarState] | None = None,
     grammar_text: str | None = None,
     stop_token_ids: list[int] | None = None,
+    reachable_tokens: frozenset[int] | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
@@ -587,7 +588,9 @@ def run_constrained_generation(
         # 5. OT redistribution
         ot_start = time.monotonic()
         ot_result = redistribute_logits(
-            adjusted, valid_mask, embeddings, config=transport_config
+            adjusted, valid_mask, embeddings,
+            config=transport_config,
+            reachable_tokens=reachable_tokens,
         )
         ot_elapsed_ms = (time.monotonic() - ot_start) * 1000
         ot_computation_total_ms += ot_elapsed_ms
@@ -1096,7 +1099,20 @@ class SamplingSession:
                     type_grammars=snapshot.type_grammars,
                 )
 
-            grammar_output = generate_grammar(snapshot)
+            # Compute reachable set for OT projection (skip for tiny vocabs)
+            _vocab_sz = (
+                self._embeddings.shape[0]
+                if hasattr(self._embeddings, "shape")
+                else 0
+            )
+            if _vocab_sz >= 1000:
+                grammar_output = generate_grammar(
+                    snapshot,
+                    tokenizer_decode=self._decode,
+                    vocab_size=_vocab_sz,
+                )
+            else:
+                grammar_output = generate_grammar(snapshot)
             grammar_state = self._grammar_guide_factory(grammar_output.text)
 
             # Inject tool call primer tokens into context so the model
@@ -1189,6 +1205,7 @@ class SamplingSession:
                     max_tokens=self._config.constrained_max_tokens,
                     context_tokens=token_history,
                     stop_token_ids=self._stop_token_ids,
+                    reachable_tokens=grammar_output.reachable_tokens,
                 )
             else:
                 gen_result = run_constrained_generation(
@@ -1201,6 +1218,7 @@ class SamplingSession:
                     max_tokens=self._config.constrained_max_tokens,
                     context_tokens=token_history,
                     stop_token_ids=self._stop_token_ids,
+                    reachable_tokens=grammar_output.reachable_tokens,
                 )
 
             token_history.extend(gen_result.tokens)

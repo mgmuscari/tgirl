@@ -192,6 +192,7 @@ def redistribute_logits_mlx(
     max_iterations: int = 20,
     convergence_threshold: float = 1e-6,
     config: TransportConfig | None = None,
+    reachable_tokens: frozenset[int] | None = None,
 ) -> TransportResultMlx:
     """Redistribute probability mass from invalid to valid tokens using OT (MLX-native).
 
@@ -220,65 +221,138 @@ def redistribute_logits_mlx(
             iterations=0,
         )
 
-    # Full OT path — vectorized index construction (no O(vocab) .item())
+    # Full OT path
     vocab_size = logits.shape[0]
-    mx.eval(valid_mask)  # materialize mask before numpy conversion
-    mask_np = np.array(valid_mask)
-    valid_indices = mx.array(np.where(mask_np)[0].astype(np.int32))
-    invalid_indices = mx.array(np.where(~mask_np)[0].astype(np.int32))
 
-    # Check problem size
-    problem_size = len(invalid_indices) * len(valid_indices)
-    if problem_size > cfg.max_problem_size:
+    # Project to reachable subset if provided
+    if reachable_tokens is not None and len(reachable_tokens) < vocab_size:
+        reachable_idx = mx.array(sorted(reachable_tokens))
+        valid_mask_R = valid_mask[reachable_idx]
+
+        # Materialize projected mask
+        mx.eval(valid_mask_R)
+        mask_np_R = np.array(valid_mask_R)
+        valid_indices_R = mx.array(
+            np.where(mask_np_R)[0].astype(np.int32)
+        )
+        invalid_indices_R = mx.array(
+            np.where(~mask_np_R)[0].astype(np.int32)
+        )
+
+        # Check problem size on projected tensors
+        problem_size = len(invalid_indices_R) * len(valid_indices_R)
+        if (
+            problem_size > cfg.max_problem_size
+            or len(valid_indices_R) == 0
+            or len(invalid_indices_R) == 0
+        ):
+            masked = _standard_masking_mlx(logits, valid_mask)
+            return TransportResultMlx(
+                logits=masked,
+                wasserstein_distance=0.0,
+                bypassed=True,
+                bypass_reason="problem_size_exceeded",
+                iterations=0,
+            )
+
+        # Source/target mass from full-vocab softmax (YP1)
+        probs_full = mx.softmax(logits, axis=-1)
+        full_invalid_idx = reachable_idx[invalid_indices_R]
+        full_valid_idx = reachable_idx[valid_indices_R]
+
+        source_mass = probs_full[full_invalid_idx]
+        sm_sum = mx.sum(source_mass)
+        source_mass = source_mass / mx.maximum(sm_sum, mx.array(1e-30))
+        source_mass = mx.clip(source_mass, 1e-30, None)
+
+        target_capacity = probs_full[full_valid_idx]
+        tc_sum = mx.sum(target_capacity)
+        target_capacity = target_capacity / mx.maximum(
+            tc_sum, mx.array(1e-30)
+        )
+        target_capacity = mx.clip(target_capacity, 1e-30, None)
+
+        # Cost submatrix on projected embeddings
+        embeddings_R = embeddings[reachable_idx]
+        cost = _compute_cost_submatrix_mlx(
+            embeddings_R, invalid_indices_R, valid_indices_R
+        )
+
         logger.debug(
-            "transport_bypass_mlx",
-            reason="problem_size_exceeded",
-            problem_size=problem_size,
-            max_problem_size=cfg.max_problem_size,
+            "transport_sinkhorn_start_mlx",
+            n_invalid=len(invalid_indices_R),
+            n_valid=len(valid_indices_R),
+            reachable_size=len(reachable_tokens),
+            epsilon=cfg.epsilon,
         )
-        masked = _standard_masking_mlx(logits, valid_mask)
-        return TransportResultMlx(
-            logits=masked,
-            wasserstein_distance=0.0,
-            bypassed=True,
-            bypass_reason="problem_size_exceeded",
-            iterations=0,
+        plan, wasserstein, iterations = _sinkhorn_log_domain_mlx(
+            cost, source_mass, target_capacity,
+            cfg.epsilon, cfg.max_iterations, cfg.convergence_threshold,
         )
 
-    # Source mass (probability on invalid tokens)
-    probs = mx.softmax(logits, axis=-1)
-    source_mass = probs[invalid_indices]
-    source_mass = source_mass / mx.sum(source_mass)
-    source_mass = mx.clip(source_mass, 1e-30, None)
+        # Scale and apply — remap to full vocab
+        total_invalid_mass = mx.sum(probs_full[full_invalid_idx])
+        plan = plan * total_invalid_mass
+        result_logits = _apply_transport_plan_mlx(
+            plan, full_valid_idx, logits, vocab_size
+        )
+    else:
+        # No projection — original full-vocab path
+        mx.eval(valid_mask)
+        mask_np = np.array(valid_mask)
+        valid_indices = mx.array(
+            np.where(mask_np)[0].astype(np.int32)
+        )
+        invalid_indices = mx.array(
+            np.where(~mask_np)[0].astype(np.int32)
+        )
 
-    # Target capacity
-    target_capacity = probs[valid_indices]
-    target_capacity = target_capacity / mx.sum(target_capacity)
-    target_capacity = mx.clip(target_capacity, 1e-30, None)
+        problem_size = len(invalid_indices) * len(valid_indices)
+        if problem_size > cfg.max_problem_size:
+            logger.debug(
+                "transport_bypass_mlx",
+                reason="problem_size_exceeded",
+                problem_size=problem_size,
+            )
+            masked = _standard_masking_mlx(logits, valid_mask)
+            return TransportResultMlx(
+                logits=masked,
+                wasserstein_distance=0.0,
+                bypassed=True,
+                bypass_reason="problem_size_exceeded",
+                iterations=0,
+            )
 
-    # Compute cost submatrix
-    cost = _compute_cost_submatrix_mlx(embeddings, invalid_indices, valid_indices)
+        probs = mx.softmax(logits, axis=-1)
+        source_mass = probs[invalid_indices]
+        source_mass = source_mass / mx.sum(source_mass)
+        source_mass = mx.clip(source_mass, 1e-30, None)
 
-    # Run Sinkhorn
-    logger.debug(
-        "transport_sinkhorn_start_mlx",
-        n_invalid=len(invalid_indices),
-        n_valid=len(valid_indices),
-        epsilon=cfg.epsilon,
-    )
-    plan, wasserstein, iterations = _sinkhorn_log_domain_mlx(
-        cost, source_mass, target_capacity,
-        cfg.epsilon, cfg.max_iterations, cfg.convergence_threshold,
-    )
+        target_capacity = probs[valid_indices]
+        target_capacity = target_capacity / mx.sum(target_capacity)
+        target_capacity = mx.clip(target_capacity, 1e-30, None)
 
-    # Scale plan by total invalid mass
-    total_invalid_mass = mx.sum(probs[invalid_indices])
-    plan = plan * total_invalid_mass
+        cost = _compute_cost_submatrix_mlx(
+            embeddings, invalid_indices, valid_indices
+        )
 
-    # Apply transport plan
-    result_logits = _apply_transport_plan_mlx(
-        plan, valid_indices, logits, vocab_size
-    )
+        logger.debug(
+            "transport_sinkhorn_start_mlx",
+            n_invalid=len(invalid_indices),
+            n_valid=len(valid_indices),
+            epsilon=cfg.epsilon,
+        )
+        plan, wasserstein, iterations = _sinkhorn_log_domain_mlx(
+            cost, source_mass, target_capacity,
+            cfg.epsilon, cfg.max_iterations, cfg.convergence_threshold,
+        )
+
+        total_invalid_mass = mx.sum(probs[invalid_indices])
+        plan = plan * total_invalid_mass
+
+        result_logits = _apply_transport_plan_mlx(
+            plan, valid_indices, logits, vocab_size
+        )
 
     logger.debug(
         "transport_complete_mlx",

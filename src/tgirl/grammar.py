@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.resources
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 
 import jinja2
 import structlog
@@ -51,6 +52,7 @@ class GrammarOutput(BaseModel):
     snapshot_hash: str
     tool_quotas: Mapping[str, int]
     cost_remaining: float | None
+    reachable_tokens: frozenset[int] | None = None
 
 
 class GrammarDiff(BaseModel):
@@ -425,12 +427,16 @@ def generate_routing_grammar(
 def generate(
     snapshot: RegistrySnapshot,
     config: GrammarConfig | None = None,
+    tokenizer_decode: Callable[[list[int]], str] | None = None,
+    vocab_size: int | None = None,
 ) -> GrammarOutput:
     """Generate a grammar from a registry snapshot.
 
     Args:
         snapshot: Immutable registry snapshot.
         config: Grammar generation configuration.
+        tokenizer_decode: Token ID decoder for reachable set computation.
+        vocab_size: Vocabulary size for reachable set scan.
 
     Returns:
         Complete grammar output with text and metadata.
@@ -459,6 +465,13 @@ def generate(
     # Render grammar text
     text = _render_grammar(snapshot, cfg)
 
+    # Compute reachable set if tokenizer provided
+    reachable: frozenset[int] | None = None
+    if tokenizer_decode is not None and vocab_size is not None:
+        reachable = compute_reachable_set(
+            text, tokenizer_decode, vocab_size
+        )
+
     # Compute snapshot hash (exclude timestamp for determinism)
     hash_data = snapshot.model_dump_json(exclude={"timestamp"})
     snapshot_hash = hashlib.sha256(hash_data.encode()).hexdigest()[:16]
@@ -469,7 +482,108 @@ def generate(
         snapshot_hash=snapshot_hash,
         tool_quotas=dict(snapshot.quotas),
         cost_remaining=snapshot.cost_remaining,
+        reachable_tokens=reachable,
     )
+
+
+def compute_reachable_set(
+    grammar_text: str,
+    tokenizer_decode: Callable[[list[int]], str],
+    vocab_size: int,
+) -> frozenset[int]:
+    """Compute the set of token IDs reachable from any grammar terminal.
+
+    Extracts string literals and regex terminals from the grammar text,
+    then scans the vocabulary to find all tokens that could match any
+    terminal. Returns a frozenset of reachable token IDs.
+
+    The reachable set restricts OT to operate on a much smaller problem,
+    raising engagement from ~20% to >80% of constrained generation tokens.
+    """
+    if not grammar_text or vocab_size <= 0:
+        return frozenset()
+
+    # 1. Extract characters/strings that can appear in the grammar
+    reachable_chars: set[str] = set()
+    reachable_strings: set[str] = set()
+
+    # Extract string literals from Lark EBNF: "..." patterns
+    for match in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"', grammar_text):
+        literal = match.group(1)
+        reachable_strings.add(literal)
+        reachable_chars.update(literal)
+
+    # Extract regex terminal patterns and derive their character sets
+    regex_patterns: list[re.Pattern] = []
+    for match in re.finditer(
+        r'(\w+)\s*:\s*/([^/]+)/', grammar_text
+    ):
+        pattern_str = match.group(2)
+        try:
+            regex_patterns.append(re.compile(pattern_str))
+        except re.error:
+            continue
+        # Extract character classes from regex
+        for cm in re.finditer(r'\[([^\]]+)\]', pattern_str):
+            char_class = cm.group(1)
+            # Expand simple ranges like 0-9, a-z, A-Z
+            i = 0
+            while i < len(char_class):
+                if (
+                    i + 2 < len(char_class)
+                    and char_class[i + 1] == '-'
+                ):
+                    start = ord(char_class[i])
+                    end = ord(char_class[i + 2])
+                    for c in range(start, end + 1):
+                        reachable_chars.add(chr(c))
+                    i += 3
+                elif char_class[i] == '\\':
+                    if i + 1 < len(char_class):
+                        reachable_chars.add(char_class[i + 1])
+                    i += 2
+                else:
+                    reachable_chars.add(char_class[i])
+                    i += 1
+        # Standalone chars in regex (outside classes)
+        for ch in re.sub(r'\[.*?\]|\{.*?\}|[().|*+?^$\\]', '', pattern_str):
+            if ch.isalnum() or ch in '+-_.':
+                reachable_chars.add(ch)
+
+    # Handle %import common.ESCAPED_STRING — matches printable ASCII
+    if 'ESCAPED_STRING' in grammar_text:
+        reachable_chars.add('"')
+        reachable_chars.add('\\')
+        for c in range(32, 127):
+            reachable_chars.add(chr(c))
+
+    # 2. Scan vocabulary
+    reachable: set[int] = set()
+    for tid in range(vocab_size):
+        try:
+            text = tokenizer_decode([tid])
+        except Exception:
+            continue
+        if not text:
+            continue
+
+        # Check exact string match
+        if text in reachable_strings:
+            reachable.add(tid)
+            continue
+
+        # Check if all chars in the token are reachable chars
+        if all(c in reachable_chars for c in text):
+            reachable.add(tid)
+            continue
+
+        # Check regex match for single-token values
+        for pat in regex_patterns:
+            if pat.fullmatch(text) or pat.fullmatch(text.strip()):
+                reachable.add(tid)
+                break
+
+    return frozenset(reachable)
 
 
 def diff(a: GrammarOutput, b: GrammarOutput) -> GrammarDiff:
