@@ -15,7 +15,7 @@
 
 **Postulate 2: Inference Loop Primacy.** Capability emerges from the inference loop, not the model. A probabilistic state machine switching between grammatical modes allows any language model to transition between introspection, seeking input, and output generation. Intelligence is a property of the clock, not the pendulum.
 
-**Evidence.** tgirl achieves 80% AST accuracy on BFCL v4 with Qwen3.5-9B (base, no instruct tuning) — matching Opus 4.5, 14pp above the model's reported 66% — through inference-time grammar constraints, ADSR modulation, and optimal transport alone. The 0.8B variant achieves 48% on the full set. Neither model has ever seen a tool call in training. The inference loop made them capable. For domains where output structure is formally specifiable, injecting that knowledge at inference time is strictly more efficient than scaling.
+**Evidence.** tgirl achieves 80% AST accuracy on BFCL v4 with Qwen3.5-9B (instruct, 4-bit quantized) — matching Opus 4.5, +14pp above the model's reported 66% — through inference-time grammar constraints, ADSR modulation, and optimal transport. The 0.8B instruct variant achieves 48% on the full set. Both are post-trained models with native tool-calling support; tgirl's grammar constraints eliminate structural errors and sharpen the model's existing knowledge through formal constraint surfaces. The inference loop amplifies competence that the model already possesses but cannot reliably express. For domains where output structure is formally specifiable, injecting that knowledge at inference time is strictly more efficient than scaling.
 
 ---
 

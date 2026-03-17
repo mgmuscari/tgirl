@@ -10,7 +10,7 @@
 
 tgirl is a **grammar-aware inference engine** — it takes any polyglot language model and boosts performance through inference-time grammar constraints, auto-tuning hyperparameters, and optimal transport logit redistribution. For domains where output structure is formally specifiable (programming languages, tool calling, grammatical natural language, structured data), injecting structural knowledge at inference time is strictly better than scaling models. Grammar constraints eliminate structural errors by construction. OT preserves the model's semantic intent. The ADSR modulation matrix auto-tunes per-token parameters.
 
-**Evidence:** Qwen3.5-9B (base, no instruct tuning) achieves 80% AST accuracy on BFCL v4 with tgirl — matching Opus 4.5, 14pp above the model's reported 66%. The model has never seen a tool call in its life. The inference loop made it capable.
+**Evidence:** Qwen3.5-9B (instruct, 4-bit quantized on Apple Silicon) achieves 80% AST accuracy on BFCL v4 with tgirl — matching Opus 4.5, +14pp above the model's reported 66%. The model has native tool-calling support from post-training (SFT + RL), but cannot reliably produce structurally correct output without tgirl's grammar constraints. The inference loop amplifies competence the model already possesses.
 
 **Target:** Grammar-agnostic inference engine supporting CFGs for programming languages (Python, Rust, JS, etc.), HPSG for natural language, tool-calling grammars for agentic behavior, and schema grammars for structured output. Any grammar × any model × any hardware. This translates directly to codegen benchmarks (HumanEval, MBPP, SWE-bench), tool-calling benchmarks (BFCL), and structured output benchmarks.
 
@@ -251,11 +251,11 @@ Results tracked per phase. The goal is grammar-agnostic performance gains across
 
 | Benchmark | Model | Metric | Value |
 |-----------|-------|--------|-------|
-| BFCL v4 simple_python | Qwen3.5-9B (base, no instruct) | AST accuracy | **80%** (314/391) — matches Opus 4.5 |
+| BFCL v4 simple_python | Qwen3.5-9B (instruct, 4-bit MLX) | AST accuracy | **80%** (314/391) — matches Opus 4.5 |
 | BFCL v4 simple_python | Qwen3.5-9B | vs. reported baseline | +14pp (66% → 80%) |
-| BFCL v4 simple_python | Qwen3.5-0.8B (base) | AST accuracy | 48% (182/382) |
+| BFCL v4 simple_python | Qwen3.5-0.8B (instruct, 4-bit MLX) | AST accuracy | 48% (182/382) |
 | BFCL v4 simple_python | Qwen3.5-0.8B (ADSR tuned) | AST accuracy (50-entry subset) | ~80% |
-| Showcase (8 tools, 15 requests) | Qwen3.5-0.8B | Routing accuracy | 13/15 |
+| Showcase (8 tools, 15 requests) | Qwen3.5-0.8B (instruct, 4-bit MLX) | Routing accuracy | 13/15 |
 
 ### Target Benchmarks (Phase 3+)
 
