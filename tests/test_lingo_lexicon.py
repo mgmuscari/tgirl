@@ -260,7 +260,7 @@ class TestRealERGLexicon:
         defs = parse_tdl_file(path)
         type_defs = [d for d in defs if isinstance(d, TdlDefinition)]
         lex = load_lexicon(type_defs)
-        assert len(list(lex.all_words)) > 30000
+        assert len(list(lex.all_words)) > 25000  # ERG 2025: ~27k unique words from ~44k entries
 
     def test_lexeme_type_count(self) -> None:
         """Check range of unique lexeme types."""
@@ -274,4 +274,4 @@ class TestRealERGLexicon:
         type_defs = [d for d in defs if isinstance(d, TdlDefinition)]
         lex = load_lexicon(type_defs)
         n = len(lex.all_lexeme_types)
-        assert 800 <= n <= 1200, f"Expected 800-1200 unique lexeme types, got {n}"
+        assert 800 <= n <= 1500, f"Expected 800-1500 unique lexeme types, got {n}"

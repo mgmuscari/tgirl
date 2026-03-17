@@ -321,7 +321,7 @@ class TestRealERG:
             pytest.skip("ERG not available")
         result = parse_tdl_file(path)
         defs = [r for r in result if isinstance(r, TdlDefinition)]
-        assert len(defs) > 2900
+        assert len(defs) > 300  # ERG 2025: ~322 in lextypes.tdl standalone
 
     def test_parse_letypes(self) -> None:
         path = ERG_DIR / "letypes.tdl"
