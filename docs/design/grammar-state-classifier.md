@@ -80,38 +80,127 @@ This gives us (features, label) pairs for supervised training. The instruct mode
 
 **Self-supervised alternative:** Run the base model with forced transition at every possible position. Measure which positions produce correct tool calls. The classifier learns to predict positions that lead to correct output.
 
+## Transition Policy: Latch-on-Confidence, Complete-on-Terminal
+
+The classifier doesn't trigger an immediate hard cut. Instead it uses a two-phase transition:
+
+### Phase 1: Latch
+
+The classifier monitors per-token signals during freeform generation. When confidence that a tool call is needed exceeds threshold, a **latch** is set. The latch is a one-way flag — once set, transition *will* happen. The model continues generating in freeform mode.
+
+### Phase 2: Complete on Grammar Terminal
+
+After the latch is set, the SCU monitors for a **sentence terminal** in the active grammar mode:
+
+- **English (current):** `.` `!` `?` followed by whitespace, or `\n\n` (paragraph break)
+- **Polyglot (future):** terminal symbols from the active NL grammar — `。` (Chinese/Japanese), `।` (Hindi/Devanagari), `‎.` (Arabic), etc. The LinGO grammar or equivalent defines what constitutes a sentence boundary in the active language.
+- **Budget exhaustion (fallback):** if `max_freeform_tokens` is reached with latch set, force transition immediately regardless of terminal. The model had its chance to complete the sentence.
+
+This preserves reasoning coherence — the model finishes "...I need to use the calculate_bmi function." before the grammar takes over. No mid-sentence cuts.
+
+### Phase 3: Transition
+
+On terminal detection (or budget exhaustion):
+1. Truncate any trailing incomplete content
+2. Inject tool-call primer tokens (already implemented)
+3. Switch SCU state to CONSTRAINED
+4. GSU activates target grammar
+5. STB begins constrained redistribution
+
+```
+freeform: "We need to calculate BMI. The function requires weight and height."
+                                    ^ latch set (tool-name confidence high)
+                                                                          ^ terminal detected
+→ inject primer → constrained mode → "(calculate_bmi :weight 70 :height 1.75)"
+```
+
+### Implementation
+
+```python
+class LatchedTransitionPolicy(TransitionPolicy):
+    """Latch on high confidence, transition on sentence terminal."""
+
+    def __init__(
+        self,
+        confidence_threshold: float = 0.3,
+        terminal_tokens: set[str] | None = None,
+        max_freeform_after_latch: int = 64,
+    ) -> None:
+        self._threshold = confidence_threshold
+        self._terminals = terminal_tokens or {'.', '!', '?'}
+        self._max_after_latch = max_freeform_after_latch
+        self._latched = False
+        self._tokens_since_latch = 0
+
+    def evaluate(
+        self,
+        signal: TransitionSignal,
+        logits: Tensor,
+        token_text: str,
+        tool_token_mass: float,
+    ) -> str | None:
+        """Returns target grammar name or None."""
+        # Check for latch condition
+        if not self._latched and tool_token_mass > self._threshold:
+            self._latched = True
+            self._tokens_since_latch = 0
+
+        if not self._latched:
+            return None
+
+        self._tokens_since_latch += 1
+
+        # Budget exhaustion — force transition
+        if self._tokens_since_latch >= self._max_after_latch:
+            return "tool_grammar"
+
+        # Terminal detection
+        stripped = token_text.strip()
+        if stripped and stripped[-1] in self._terminals:
+            return "tool_grammar"
+
+        return None
+```
+
+### Polyglot Terminal Detection
+
+The terminal set is grammar-mode-dependent. When the GSU manages multiple NL grammars, each grammar provides its own sentence boundary tokens:
+
+```python
+class GrammarTerminals:
+    """Sentence-terminal tokens for a grammar mode."""
+    english = {'.', '!', '?'}
+    chinese = {'。', '！', '？'}
+    japanese = {'。', '！', '？'}
+    hindi = {'।', '!', '?'}
+    arabic = {'.', '!', '؟'}
+    # ... extensible per grammar
+```
+
+The active NL grammar in the GSU determines which terminal set the `LatchedTransitionPolicy` uses. This scales to any language the Grammar Matrix supports.
+
 ## Integration Points
 
 ### SCU
 
-New policy: `ClassifierTransitionPolicy`
+`LatchedTransitionPolicy` replaces or composes with `DelimiterTransitionPolicy`. For instruct models, the delimiter policy fires first (the model emits delimiters voluntarily). For base models, the latched policy takes over when delimiters never come.
+
+`CompositeTransitionPolicy` already supports chaining — add the latched policy as a fallback:
 
 ```python
-class ClassifierTransitionPolicy(TransitionPolicy):
-    """Transitions based on learned classifier, not delimiters."""
-
-    def __init__(
-        self,
-        classifier: GrammarStateClassifier,
-        threshold: float = 0.7,
-    ) -> None: ...
-
-    def should_transition(
-        self,
-        signal: TransitionSignal,
-        logits: Tensor,  # new: needs logit access
-    ) -> str | None:
-        """Returns target grammar name or None."""
-        ...
+policy = CompositeTransitionPolicy([
+    DelimiterTransitionPolicy(...),   # instruct models emit delimiters
+    LatchedTransitionPolicy(...),     # base models: latch + terminal
+])
 ```
 
 ### CSG
 
-The classifier's output becomes a new CSG signal: `transition_probability`. This feeds the modulation matrix and the SCU simultaneously.
+The classifier's output (`tool_token_mass`) becomes a new CSG signal. This feeds the modulation matrix and the SCU simultaneously. The modulation matrix can begin adjusting parameters (lowering temperature, tightening top_p) as soon as the latch is set, smoothing the transition.
 
 ### GSU
 
-When the classifier triggers a transition, the GSU activates the target grammar and the STB begins constrained redistribution. The tool-call primer tokens (already implemented) are injected to seed the constrained generation.
+When the latched policy triggers, the GSU activates the target grammar and the STB begins constrained redistribution. The tool-call primer tokens (already implemented) are injected to seed the constrained generation.
 
 ## Performance Budget
 
