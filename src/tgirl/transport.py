@@ -257,21 +257,37 @@ def redistribute_logits(
     logits = logits.clone()
 
     # Check bypass conditions
-    should_bypass, bypass_reason = _check_bypass(logits, valid_mask, cfg)
-    if should_bypass:
-        logger.debug(
-            "transport_bypass",
-            reason=bypass_reason,
-            n_valid=valid_mask.sum().item(),
+    # With reachable set: only forced_decode on full vocab,
+    # other bypasses checked on projected tensors
+    if reachable_tokens is None or len(reachable_tokens) >= logits.shape[0]:
+        should_bypass, bypass_reason = _check_bypass(
+            logits, valid_mask, cfg
         )
-        masked = _standard_masking(logits, valid_mask)
-        return TransportResult(
-            logits=masked,
-            wasserstein_distance=0.0,
-            bypassed=True,
-            bypass_reason=bypass_reason,
-            iterations=0,
-        )
+        if should_bypass:
+            logger.debug(
+                "transport_bypass",
+                reason=bypass_reason,
+                n_valid=valid_mask.sum().item(),
+            )
+            masked = _standard_masking(logits, valid_mask)
+            return TransportResult(
+                logits=masked,
+                wasserstein_distance=0.0,
+                bypassed=True,
+                bypass_reason=bypass_reason,
+                iterations=0,
+            )
+    else:
+        n_valid = int(valid_mask.sum().item())
+        if n_valid <= 1:
+            masked = _standard_masking(logits, valid_mask)
+            return TransportResult(
+                logits=masked,
+                wasserstein_distance=0.0,
+                bypassed=True,
+                bypass_reason="forced_decode",
+                iterations=0,
+            )
 
     # Full OT path
     vocab_size = logits.shape[0]
@@ -284,13 +300,48 @@ def redistribute_logits(
         valid_mask_R = valid_mask[reachable_idx]
         valid_indices_R = torch.where(valid_mask_R)[0]
         invalid_indices_R = torch.where(~valid_mask_R)[0]
+        n_valid_R = len(valid_indices_R)
+        n_invalid_R = len(invalid_indices_R)
+        n_reachable = len(reachable_tokens)
 
-        problem_size = len(invalid_indices_R) * len(valid_indices_R)
-        if (
-            problem_size > cfg.max_problem_size
-            or len(valid_indices_R) == 0
-            or len(invalid_indices_R) == 0
-        ):
+        if n_valid_R == 0 or n_invalid_R == 0:
+            masked = _standard_masking(logits, valid_mask)
+            return TransportResult(
+                logits=masked,
+                wasserstein_distance=0.0,
+                bypassed=True,
+                bypass_reason="forced_decode",
+                iterations=0,
+            )
+
+        # Bypass checks on projected tensors
+        valid_ratio_R = n_valid_R / n_reachable if n_reachable > 0 else 1.0
+        if valid_ratio_R > cfg.valid_ratio_threshold:
+            masked = _standard_masking(logits, valid_mask)
+            return TransportResult(
+                logits=masked,
+                wasserstein_distance=0.0,
+                bypassed=True,
+                bypass_reason="valid_ratio_high",
+                iterations=0,
+            )
+
+        probs_check = torch.softmax(logits, dim=-1)
+        invalid_mass_R = float(
+            probs_check[reachable_idx[invalid_indices_R]].sum().item()
+        )
+        if invalid_mass_R < cfg.invalid_mass_threshold:
+            masked = _standard_masking(logits, valid_mask)
+            return TransportResult(
+                logits=masked,
+                wasserstein_distance=0.0,
+                bypassed=True,
+                bypass_reason="invalid_mass_low",
+                iterations=0,
+            )
+
+        problem_size = n_invalid_R * n_valid_R
+        if problem_size > cfg.max_problem_size:
             masked = _standard_masking(logits, valid_mask)
             return TransportResult(
                 logits=masked,
