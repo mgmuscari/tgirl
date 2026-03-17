@@ -251,11 +251,14 @@ Results tracked per phase. The goal is grammar-agnostic performance gains across
 
 | Benchmark | Model | Metric | Value |
 |-----------|-------|--------|-------|
-| BFCL v4 simple_python | Qwen3.5-9B (instruct, 4-bit MLX) | AST accuracy | **80%** (314/391) — matches Opus 4.5 |
+| BFCL v4 simple_python | Qwen3.5-9B-Base (4-bit MLX) | AST accuracy | **81%** (278/345) — **base model, no instruct** |
+| BFCL v4 simple_python | Qwen3.5-9B (instruct, 4-bit MLX) | AST accuracy | 80% (314/391) — matches Opus 4.5 |
 | BFCL v4 simple_python | Qwen3.5-9B | vs. reported baseline | +14pp (66% → 80%) |
+| BFCL v4 simple_python | Qwen3.5-0.8B-Base (4-bit MLX) | AST accuracy | 46% (153/334) — **base model, no instruct** |
 | BFCL v4 simple_python | Qwen3.5-0.8B (instruct, 4-bit MLX) | AST accuracy | 48% (182/382) |
-| BFCL v4 simple_python | Qwen3.5-0.8B (ADSR tuned) | AST accuracy (50-entry subset) | ~80% |
 | Showcase (8 tools, 15 requests) | Qwen3.5-0.8B (instruct, 4-bit MLX) | Routing accuracy | 13/15 |
+
+**Key finding:** Base models match or exceed instruct models on constrained tool calling. The 9B-Base (81%) beats the 9B-Instruct (80%) despite zero post-training. Alignment narrows the distribution in ways that compete with grammar constraints. The base model's broader distribution is more amenable to optimal transport redistribution. The main cost of no instruct training is a lower tool-call rate (86% vs 98%) — the model is less likely to *decide* to call a tool, but more accurate *when it does*. The grammar state classifier (docs/design/grammar-state-classifier.md) addresses the tool-call rate gap.
 
 ### Target Benchmarks (Phase 3+)
 
