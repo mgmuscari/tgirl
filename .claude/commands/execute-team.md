@@ -84,9 +84,17 @@ After both teammates are spawned:
       - Check: `claude --version` (v2.1.46+ may fix this)"
   4. Do NOT fall back to solo implementation. Do NOT continue.
 
-### 6. Monitor progress and detect stalls
+### 6. Actively manage progress
 
-Wait for messages from both teammates. Track:
+You are the **tech lead**, not a passive observer. You have full architectural context, the PRP, the plan review, and CLAUDE.md. Participate:
+
+- **Validate review findings** — When the code-reviewer flags an issue, assess whether it's blocking, significant, or noise. Message the proposer with your assessment if the reviewer's severity seems wrong.
+- **Intervene on workarounds** — If the proposer stubs something out, defers a decision, or implements a workaround instead of the real fix, call it out. Per CLAUDE.md: no "fix later" shims, no cross-framework conversions, no Python-fu on tensor data.
+- **Unblock the team** — If the proposer hits a technical obstacle (e.g., a hook not firing, a type error, a missing API), investigate it yourself and provide the answer rather than letting them spin.
+- **Verify quality** — Spot-check commits. Read diffs for critical tasks. Don't rubber-stamp.
+- **Enforce TDD** — If a commit has implementation without tests, or tests that don't fail before implementation, flag it.
+
+Track:
 - Implementation progress (which PRP tasks are complete)
 - Review findings (categorized by severity)
 - Whether Blocking issues were resolved

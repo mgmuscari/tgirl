@@ -104,7 +104,7 @@ class TestPhaseDetection:
     """Tests for EnvelopeState.detect_phase with hysteresis."""
 
     def _make_state(self, **kwargs) -> EnvelopeState:
-        defaults = {"prev_smoothed": [0.0] * 11}
+        defaults = {"prev_smoothed": [0.0] * 12}
         defaults.update(kwargs)
         return EnvelopeState(**defaults)
 
@@ -190,7 +190,7 @@ class TestPhaseDetection:
         - inner close paren triggers release (depth 2->1, depth <= 1)
         - outer close paren triggers release (depth 1->0)
         """
-        state = self._make_state(prev_smoothed=[0.0] * 11)
+        state = self._make_state(prev_smoothed=[0.0] * 12)
 
         # Opening '(' — depth 0 -> 1: attack
         state.advance_phase(freedom=0.8, depth=1)
@@ -229,7 +229,7 @@ class TestPhaseDetection:
 
     def test_advance_phase_tracks_peak_freedom(self) -> None:
         """Peak freedom is tracked during attack phase."""
-        state = self._make_state(prev_smoothed=[0.0] * 11)
+        state = self._make_state(prev_smoothed=[0.0] * 12)
         state.advance_phase(freedom=0.5, depth=1)
         assert state.peak_freedom == 0.5
         state.advance_phase(freedom=0.8, depth=1)
@@ -245,16 +245,16 @@ class TestEnvelopeConfig:
     """Tests for EnvelopeConfig and default matrix."""
 
     def test_default_matrix_shape(self) -> None:
-        assert len(DEFAULT_MATRIX) == 11
+        assert len(DEFAULT_MATRIX) == 12
         for row in DEFAULT_MATRIX:
             assert len(row) == 7
 
     def test_default_matrix_flat_length(self) -> None:
-        assert len(DEFAULT_MATRIX_FLAT) == 11 * 7
+        assert len(DEFAULT_MATRIX_FLAT) == 12 * 7
 
     def test_config_matrix_shape(self) -> None:
         cfg = EnvelopeConfig()
-        assert cfg.matrix_shape == (11, 7)
+        assert cfg.matrix_shape == (12, 7)
 
     def test_config_is_frozen(self) -> None:
         cfg = EnvelopeConfig()
@@ -284,7 +284,30 @@ class TestEnvelopeConfig:
 
     def test_conditioners_count(self) -> None:
         cfg = EnvelopeConfig()
-        assert len(cfg.conditioners) == 11
+        assert len(cfg.conditioners) == 12
+
+    def test_backward_compat_matrix_flat_auto_pad(self) -> None:
+        """Old 11-row (77-value) matrix_flat auto-pads to 84 with warning."""
+        old_flat = tuple([0.0] * 77)
+        cfg = EnvelopeConfig(matrix_flat=old_flat)
+        assert len(cfg.matrix_flat) == 84
+        # Last 7 values should be zeros (the padded row)
+        assert cfg.matrix_flat[77:] == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    def test_backward_compat_conditioners_auto_pad(self) -> None:
+        """Old 11-entry conditioners auto-pads to 12 with warning."""
+        old_conds = tuple([SourceConditionerConfig()] * 11)
+        cfg = EnvelopeConfig(conditioners=old_conds)
+        assert len(cfg.conditioners) == 12
+        # Last entry should be the coherence conditioner
+        assert cfg.conditioners[11].range_min == 0.0
+        assert cfg.conditioners[11].range_max == 1.0
+
+    def test_invalid_matrix_flat_length_raises(self) -> None:
+        """Non-77 and non-84 matrix_flat lengths raise ValueError."""
+        import pytest
+        with pytest.raises(ValueError, match="matrix_flat has 50 values"):
+            EnvelopeConfig(matrix_flat=tuple([0.0] * 50))
 
     def test_matrix_weights_all_rows(self) -> None:
         """All matrix rows match the tuned default values."""
@@ -301,6 +324,7 @@ class TestEnvelopeConfig:
             [-0.04, -0.1, -10.0,   0.1,   0.0,   0.0,   0.0],  # sustain
             [-0.02,  0.1,  10.0,  -0.05, -80.0,  0.0,   0.0],  # release
             [-0.05,  0.0, -30.0,   0.0,   0.0,   0.0,   0.0],  # cycle
+            [ 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0],  # linguistic_coherence
         ]
         # fmt: on
         for i, (actual, exp) in enumerate(
@@ -433,7 +457,7 @@ class TestModMatrixHookMlx:
         """Verify mod matrix is an mx.array (native MLX matmul)."""
         hook = _make_hook()
         assert isinstance(hook._mod_matrix, mx.array)
-        assert hook._mod_matrix.shape == (11, 7)
+        assert hook._mod_matrix.shape == (12, 7)
 
     def test_temperature_clamped_to_range(self) -> None:
         """Temperature is clamped within config range."""
@@ -460,6 +484,95 @@ class TestModMatrixHookMlx:
         for tid in hook._opener_ids:
             assert tid in result.logit_bias
             assert result.logit_bias[tid] < 0.0
+
+    def test_coherence_fn_none_produces_same_output(self) -> None:
+        """coherence_fn=None defaults to 0.0, producing same output as before."""
+        hook_without = _make_hook()  # coherence_fn=None by default
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        r1 = hook_without.pre_forward(0, valid_mask, [], logits)
+
+        # Explicit coherence_fn returning 0.0 should match
+        hook_with_zero = ModMatrixHookMlx(
+            config=EnvelopeConfig(),
+            tokenizer_decode=lambda ids: "".join({10: "(", 11: ")"}.get(i, "x") for i in ids),
+            vocab_size=100,
+            max_tokens=128,
+            coherence_fn=lambda: 0.0,
+        )
+        r2 = hook_with_zero.pre_forward(0, valid_mask, [], logits)
+        assert abs(r1.temperature - r2.temperature) < 1e-6
+        assert abs(r1.top_p - r2.top_p) < 1e-6
+
+    def test_coherence_fn_nonzero_with_nonzero_row_changes_temperature(self) -> None:
+        """coherence_fn=0.8 with non-zero row 11 produces different temperature."""
+        # Build a config with non-zero weights in row 11
+        custom_matrix = list(DEFAULT_MATRIX_FLAT)
+        # Row 11, col 0 (temperature) = 0.5
+        custom_matrix[11 * 7 + 0] = 0.5
+        custom_flat = tuple(custom_matrix)
+
+        def decode(ids: list[int]) -> str:
+            return "".join({10: "(", 11: ")"}.get(i, "x") for i in ids)
+
+        hook_no_coherence = ModMatrixHookMlx(
+            config=EnvelopeConfig(matrix_flat=custom_flat),
+            tokenizer_decode=decode,
+            vocab_size=100,
+            max_tokens=128,
+            coherence_fn=None,
+        )
+        hook_with_coherence = ModMatrixHookMlx(
+            config=EnvelopeConfig(matrix_flat=custom_flat),
+            tokenizer_decode=decode,
+            vocab_size=100,
+            max_tokens=128,
+            coherence_fn=lambda: 0.8,
+        )
+
+        logits = mx.random.normal((100,))
+        valid_mask = mx.ones((100,), dtype=mx.bool_)
+        r_none = hook_no_coherence.pre_forward(0, valid_mask, [], logits)
+        r_coherent = hook_with_coherence.pre_forward(0, valid_mask, [], logits)
+        # Row 11 col 0 = 0.5, coherence = 0.8 -> adds 0.4 to temperature modulation
+        assert r_coherent.temperature != r_none.temperature
+        assert r_coherent.temperature > r_none.temperature
+
+    def test_torch_coherence_fn_parity(self) -> None:
+        """Torch ModMatrixHook with coherence_fn produces same results as MLX."""
+        # Non-zero row 11 for observable effect
+        custom_matrix = list(DEFAULT_MATRIX_FLAT)
+        custom_matrix[11 * 7 + 0] = 0.3  # temperature
+        custom_flat = tuple(custom_matrix)
+        config = EnvelopeConfig(matrix_flat=custom_flat)
+
+        def decode(ids: list[int]) -> str:
+            return "".join({10: "(", 11: ")"}.get(i, "x") for i in ids)
+
+        torch.manual_seed(42)
+        logits_list = torch.randn(100).numpy().tolist()
+
+        mlx_hook = ModMatrixHookMlx(
+            config=config, tokenizer_decode=decode, vocab_size=100,
+            max_tokens=128, coherence_fn=lambda: 0.6,
+        )
+        torch_hook = ModMatrixHook(
+            config=config, tokenizer_decode=decode, vocab_size=100,
+            max_tokens=128, coherence_fn=lambda: 0.6,
+        )
+
+        m_logits = mx.array(logits_list)
+        m_mask = mx.ones((100,), dtype=mx.bool_)
+        r_mlx = mlx_hook.pre_forward(0, m_mask, [], m_logits)
+
+        from unittest.mock import MagicMock
+        gs = MagicMock()
+        gs.get_valid_mask.return_value = torch.ones(100)
+        t_logits = torch.tensor(logits_list)
+        r_torch = torch_hook.pre_forward(0, gs, [], t_logits)
+
+        assert abs(r_torch.temperature - r_mlx.temperature) < 0.01
+        assert abs(r_torch.top_p - r_mlx.top_p) < 0.01
 
     def test_rep_penalty_behavioral_equivalence(self) -> None:
         """Window-based counting penalizes repeated tokens at suffix."""
@@ -594,14 +707,14 @@ class TestEnvelopeTelemetry:
             phase="attack",
             phase_position=0,
             depth=1,
-            source_vector=[0.5] * 11,
+            source_vector=[0.5] * 12,
             modulation_vector=[0.1] * 7,
             final_temperature=0.3,
             final_epsilon=0.1,
         )
         assert t.phase == "attack"
         assert t.depth == 1
-        assert len(t.source_vector) == 11
+        assert len(t.source_vector) == 12
         assert len(t.modulation_vector) == 7
 
     def test_telemetry_json_serializable(self) -> None:
@@ -609,7 +722,7 @@ class TestEnvelopeTelemetry:
             phase="sustain",
             phase_position=5,
             depth=2,
-            source_vector=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 0.0, 1.0, 0.0, 0.0],
+            source_vector=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
             modulation_vector=[0.3, 0.9, -20.0, 0.1, 0.0, 0.0, 0.0],
             final_temperature=0.45,
             final_epsilon=0.08,

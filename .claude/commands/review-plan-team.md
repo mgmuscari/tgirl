@@ -82,9 +82,17 @@ After both teammates are spawned:
       - Check: `claude --version` (v2.1.46+ may fix this)"
   4. Do NOT fall back to solo review. Do NOT continue.
 
-### 6. Monitor the exchange
+### 6. Actively manage the exchange
 
-Wait for messages from both teammates. Track:
+You are the **tech lead**, not a passive observer. You have full architectural context that the teammates lack. Participate:
+
+- **Validate yield points** — When the training partner raises a concern, assess whether it's real. If it's noise, message the proposer to deprioritize it. If it's critical, message the proposer to take it seriously.
+- **Intervene on drift** — If the proposer defers a decision ("out of scope", "follow-up"), evaluate whether the deferral is appropriate or a shim. Per CLAUDE.md: no "fix later" shims.
+- **Provide context** — You've read the PRD, PRP, design docs, and CLAUDE.md. If the exchange stalls on a factual question about the codebase or architecture, answer it directly via message to the relevant teammate.
+- **Verify empirically** — If a yield point questions an assumption (e.g., "does this API exist?"), check the codebase yourself and share the finding.
+- **Enforce quality** — If the proposer accepts a yield point but the revision is superficial, push back.
+
+Track:
 - What yield points were found (from training-partner messages)
 - How the proposer responded (accepted/revised or rejected with justification)
 - Whether the exchange converged (both agents complete their tasks)
