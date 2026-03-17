@@ -205,38 +205,21 @@ def redistribute_logits_mlx(
     )
 
     # Check bypass conditions
-    # When reachable set is provided, only check forced_decode (n_valid<=1)
-    # on full vocab. Other bypasses check projected tensors instead.
-    if reachable_tokens is None or len(reachable_tokens) >= logits.shape[0]:
-        should_bypass, bypass_reason = _check_bypass_mlx(
-            logits, valid_mask, cfg
+    should_bypass, bypass_reason = _check_bypass_mlx(logits, valid_mask, cfg)
+    if should_bypass:
+        logger.debug(
+            "transport_bypass_mlx",
+            reason=bypass_reason,
+            n_valid=int(mx.sum(valid_mask).item()),
         )
-        if should_bypass:
-            logger.debug(
-                "transport_bypass_mlx",
-                reason=bypass_reason,
-                n_valid=int(mx.sum(valid_mask).item()),
-            )
-            masked = _standard_masking_mlx(logits, valid_mask)
-            return TransportResultMlx(
-                logits=masked,
-                wasserstein_distance=0.0,
-                bypassed=True,
-                bypass_reason=bypass_reason,
-                iterations=0,
-            )
-    else:
-        # With reachable set: only check forced_decode on full vocab
-        n_valid = int(mx.sum(valid_mask).item())
-        if n_valid <= 1:
-            masked = _standard_masking_mlx(logits, valid_mask)
-            return TransportResultMlx(
-                logits=masked,
-                wasserstein_distance=0.0,
-                bypassed=True,
-                bypass_reason="forced_decode",
-                iterations=0,
-            )
+        masked = _standard_masking_mlx(logits, valid_mask)
+        return TransportResultMlx(
+            logits=masked,
+            wasserstein_distance=0.0,
+            bypassed=True,
+            bypass_reason=bypass_reason,
+            iterations=0,
+        )
 
     # Full OT path
     vocab_size = logits.shape[0]
@@ -256,51 +239,13 @@ def redistribute_logits_mlx(
             np.where(~mask_np_R)[0].astype(np.int32)
         )
 
-        # Bypass checks on projected tensors
-        n_valid_R = len(valid_indices_R)
-        n_invalid_R = len(invalid_indices_R)
-        n_reachable = len(reachable_tokens)
-
-        if n_valid_R == 0 or n_invalid_R == 0:
-            masked = _standard_masking_mlx(logits, valid_mask)
-            return TransportResultMlx(
-                logits=masked,
-                wasserstein_distance=0.0,
-                bypassed=True,
-                bypass_reason="forced_decode",
-                iterations=0,
-            )
-
-        # Valid ratio on projected space
-        valid_ratio_R = n_valid_R / n_reachable if n_reachable > 0 else 1.0
-        if valid_ratio_R > cfg.valid_ratio_threshold:
-            masked = _standard_masking_mlx(logits, valid_mask)
-            return TransportResultMlx(
-                logits=masked,
-                wasserstein_distance=0.0,
-                bypassed=True,
-                bypass_reason="valid_ratio_high",
-                iterations=0,
-            )
-
-        # Invalid mass on projected space
-        probs_check = mx.softmax(logits, axis=-1)
-        invalid_mass_R = float(
-            mx.sum(probs_check[reachable_idx[invalid_indices_R]]).item()
-        )
-        if invalid_mass_R < cfg.invalid_mass_threshold:
-            masked = _standard_masking_mlx(logits, valid_mask)
-            return TransportResultMlx(
-                logits=masked,
-                wasserstein_distance=0.0,
-                bypassed=True,
-                bypass_reason="invalid_mass_low",
-                iterations=0,
-            )
-
-        # Problem size on projected tensors
-        problem_size = n_invalid_R * n_valid_R
-        if problem_size > cfg.max_problem_size:
+        # Check problem size on projected tensors
+        problem_size = len(invalid_indices_R) * len(valid_indices_R)
+        if (
+            problem_size > cfg.max_problem_size
+            or len(valid_indices_R) == 0
+            or len(invalid_indices_R) == 0
+        ):
             masked = _standard_masking_mlx(logits, valid_mask)
             return TransportResultMlx(
                 logits=masked,
