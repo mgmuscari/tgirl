@@ -235,6 +235,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         freeform_max_tokens=512,
         constrained_max_tokens=512,
         session_timeout=30.0,
+        force_tool_call=True,
     )
     session_hooks = [
         ModMatrixHook(

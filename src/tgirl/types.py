@@ -313,6 +313,8 @@ class SessionConfig(BaseModel):
     max_tool_cycles: int = 10
     session_cost_budget: float | None = None
     session_timeout: float = 300.0
+    # Transition control
+    force_tool_call: bool = False  # Force transition on freeform budget exhaustion
     # Delimiters
     tool_open_delimiter: str = "<tool>"
     tool_close_delimiter: str = "</tool>"
