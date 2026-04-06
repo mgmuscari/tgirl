@@ -754,3 +754,133 @@ BEHAVIORAL_DIMS: dict[str, dict[str, str]] = {
         "system_neg": "You emphasize user autonomy and their own judgment. You position yourself as a tool, not an authority.",
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Full calibration pipeline
+# ---------------------------------------------------------------------------
+
+
+def calibrate(
+    model: Any,
+    tokenizer: Any,
+    model_id: str,
+    layer_path: str = "model.layers",
+    output_path: str | None = None,
+    bottleneck_layer: int | None = None,
+    behavioral_dims: dict[str, dict[str, str]] | None = None,
+    queries: list[str] | None = None,
+    max_tok: int = 60,
+) -> Any:
+    """Run the full ESTRADIOL calibration pipeline.
+
+    Phases:
+      1. Bottleneck discovery (or use provided layer)
+      2. Behavioral extraction (25 dims × 6 queries × 2 poles)
+      3. Codebook SVD (auto-detect K via participation ratio)
+      4. Complement validation
+      5. Save .estradiol file
+
+    Args:
+        model: MLX model.
+        tokenizer: Tokenizer with encode()/decode().
+        model_id: Model identifier string (e.g. "Qwen/Qwen3.5-0.8B").
+        layer_path: Dot-separated path to layers list.
+        output_path: Path to save .estradiol file. None = skip saving.
+        bottleneck_layer: Override bottleneck discovery with known layer.
+        behavioral_dims: Override default 25 behavioral dims.
+        queries: Override default calibration queries.
+        max_tok: Max tokens per generation during extraction.
+
+    Returns:
+        CalibrationResult
+    """
+    from tgirl.estradiol import CalibrationResult, save_estradiol
+
+    if behavioral_dims is None:
+        behavioral_dims = BEHAVIORAL_DIMS
+    if queries is None:
+        queries = CALIBRATION_QUERIES
+
+    t0 = time.monotonic()
+
+    # Phase 1: Bottleneck
+    if bottleneck_layer is None:
+        logger.info("calibrate_phase1_bottleneck")
+        bottleneck_texts = [
+            "The quick brown fox jumps over the lazy dog.",
+            "Machine learning transforms how we process information.",
+            "Quantum mechanics describes the behavior of subatomic particles.",
+            "The Renaissance period saw a revival of classical learning.",
+            "Photosynthesis converts sunlight into chemical energy in plants.",
+            "Democracy requires active participation from all citizens.",
+            "The Pythagorean theorem relates the sides of a right triangle.",
+            "Ocean currents distribute heat around the globe.",
+            "Neural networks loosely mimic the structure of the brain.",
+            "The Industrial Revolution transformed manufacturing processes.",
+            "DNA carries the genetic instructions for all living organisms.",
+            "Financial markets reflect collective expectations about the future.",
+            "Climate change affects weather patterns across the planet.",
+            "Music theory describes how melodies and harmonies are constructed.",
+            "Antibiotics treat bacterial infections but not viral ones.",
+            "The theory of relativity changed our understanding of space and time.",
+            "Supply and demand determine prices in a market economy.",
+            "Volcanic eruptions can affect global temperatures for years.",
+            "Computer algorithms solve problems through step-by-step procedures.",
+            "The human brain contains approximately eighty-six billion neurons.",
+        ]
+        bottleneck_layer, _ranks = discover_bottleneck(
+            model, tokenizer, bottleneck_texts, layer_path=layer_path,
+        )
+    else:
+        logger.info("calibrate_phase1_skip", bottleneck_layer=bottleneck_layer)
+
+    # Navigate to layers and set up generation hook
+    layers = model
+    for attr in layer_path.split("."):
+        layers = getattr(layers, attr)
+    hook = _GenerationHook(layers, layer_idx=bottleneck_layer)
+    hook.install()
+
+    try:
+        # Phase 2: Behavioral extraction
+        logger.info("calibrate_phase2_behavioral", n_dims=len(behavioral_dims))
+        behavioral_vecs = extract_behavioral_vectors(
+            model, tokenizer, hook, behavioral_dims, queries, max_tok=max_tok,
+        )
+
+        # Phase 3: Codebook SVD
+        logger.info("calibrate_phase3_codebook")
+        V_basis, K, codebook_diag = build_codebook(behavioral_vecs)
+
+        # Phase 4: Complement validation (scaffold from behavioral SVD residual)
+        # Use the codebook basis itself as a lightweight scaffold proxy
+        logger.info("calibrate_phase4_complement")
+        complement_fracs = validate_complement(behavioral_vecs, V_basis)
+
+    finally:
+        hook.uninstall()
+
+    elapsed = time.monotonic() - t0
+
+    result = CalibrationResult(
+        V_basis=V_basis,
+        bottleneck_layer=bottleneck_layer,
+        K=K,
+        model_id=model_id,
+        trait_map=codebook_diag["trait_map"],
+        scaffold_basis=V_basis,  # scaffold = codebook basis for now
+        scaffold_rank=K,
+        timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        eff_rank=codebook_diag["eff_rank"],
+        compression_ratio=codebook_diag["compression_ratio"],
+        n_dims=len(behavioral_dims),
+        complement_fractions=complement_fracs,
+    )
+
+    if output_path is not None:
+        save_estradiol(output_path, result)
+        logger.info("calibrate_saved", path=output_path)
+
+    logger.info("calibrate_done", elapsed_s=round(elapsed, 1), K=K)
+    return result

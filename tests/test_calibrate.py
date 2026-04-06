@@ -245,3 +245,59 @@ class TestExtractBehavioralVectors:
             assert float(mx.linalg.norm(vecs["terse"]).item()) > 0.0
         finally:
             hook.uninstall()
+
+
+class TestCalibrateFullPipeline:
+    """Full pipeline: bottleneck → extract → codebook → save."""
+
+    def test_calibrate_smoke(self, qwen_model, tmp_path) -> None:
+        """Run calibrate with 3 dims, 2 queries — validates the full pipeline."""
+        from tgirl.calibrate import calibrate
+        from tgirl.estradiol import load_estradiol
+
+        model, tok = qwen_model
+        output = tmp_path / "qwen.estradiol"
+
+        dims = {
+            "helpful": {
+                "system_pos": "You are maximally helpful.",
+                "system_neg": "You are minimally helpful.",
+            },
+            "terse": {
+                "system_pos": "Use minimal words. Short sentences.",
+                "system_neg": "Be expansive and detailed.",
+            },
+            "formal": {
+                "system_pos": "Write in formal academic register.",
+                "system_neg": "Write casually like texting a friend.",
+            },
+        }
+        queries = [
+            "What makes a good leader?",
+            "How should I handle a disagreement?",
+        ]
+
+        result = calibrate(
+            model, tok,
+            model_id="Qwen/Qwen3.5-0.8B",
+            layer_path="language_model.model.layers",
+            output_path=str(output),
+            bottleneck_layer=14,  # skip discovery for speed
+            behavioral_dims=dims,
+            queries=queries,
+            max_tok=30,
+        )
+
+        # Verify result structure
+        assert result.K >= 1
+        assert result.bottleneck_layer == 14
+        assert result.model_id == "Qwen/Qwen3.5-0.8B"
+        assert result.V_basis.shape == (1024, result.K)
+        assert len(result.trait_map) == 3
+        assert result.n_dims == 3
+
+        # Verify file was saved and is loadable
+        assert output.is_file()
+        loaded = load_estradiol(str(output))
+        assert loaded.K == result.K
+        assert loaded.bottleneck_layer == 14
