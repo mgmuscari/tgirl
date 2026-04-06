@@ -119,3 +119,129 @@ class TestDiscoverBottleneck:
         assert len(ranks) == 24  # Qwen3.5-0.8B has 24 layers
         # The bottleneck should have the minimum rank
         assert ranks[bn_layer] == min(ranks)
+
+
+class TestBuildScaffold:
+    """build_scaffold constructs an orthonormal semantic basis."""
+
+    def test_scaffold_from_synthetic_vectors(self) -> None:
+        from tgirl.calibrate import build_scaffold
+
+        # 10 vectors in 64D — should compress
+        mx.random.seed(42)
+        vecs = {f"dim_{i}": mx.random.normal((64,)) for i in range(10)}
+        V_scaffold, diag = build_scaffold(vecs)
+        assert V_scaffold.shape[0] == 64
+        assert V_scaffold.shape[1] == diag["rank"]
+        assert diag["rank"] >= 1
+        # Columns should be approximately orthonormal
+        gram = V_scaffold.T @ V_scaffold
+        mx.eval(gram)
+        eye = mx.eye(diag["rank"])
+        diff = mx.max(mx.abs(gram - eye))
+        mx.eval(diff)
+        assert float(diff.item()) < 0.01
+
+
+class TestBuildCodebook:
+    """build_codebook extracts low-rank behavioral basis via SVD."""
+
+    def test_codebook_from_structured_vectors(self) -> None:
+        from tgirl.calibrate import build_codebook
+
+        # Create 20 vectors that span a ~5D subspace in 64D
+        mx.random.seed(42)
+        basis = mx.random.normal((64, 5))  # 5 true dimensions
+        coeffs = mx.random.normal((20, 5))
+        vecs = {f"dim_{i}": (coeffs[i] @ basis.T) for i in range(20)}
+
+        V_basis, K, diag = build_codebook(vecs)
+        assert V_basis.shape[0] == 64
+        assert V_basis.shape[1] == K
+        # K should be close to 5 for this structured data
+        assert 3 <= K <= 8, f"K={K}, expected ~5"
+        assert diag["compression_ratio"] < 0.7
+        assert len(diag["trait_map"]) == 20
+
+    def test_random_vectors_no_compression(self) -> None:
+        from tgirl.calibrate import build_codebook
+
+        # Random vectors should show no compression
+        mx.random.seed(99)
+        vecs = {f"dim_{i}": mx.random.normal((256,)) for i in range(15)}
+        V_basis, K, diag = build_codebook(vecs)
+        # K should be close to N (no compression)
+        assert K >= 10, f"K={K}, expected ~15 (no compression)"
+
+
+class TestValidateComplement:
+    """validate_complement checks behavioral vectors are in scaffold complement."""
+
+    def test_orthogonal_vectors_are_complement(self) -> None:
+        from tgirl.calibrate import validate_complement
+
+        # Scaffold spans first 3 dims, behavioral vectors span last 3 dims
+        V_scaffold = mx.zeros((6, 3))
+        V_scaffold = V_scaffold.at[:3, :].add(mx.eye(3))
+        mx.eval(V_scaffold)
+
+        vecs = {
+            "dim_a": mx.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            "dim_b": mx.array([0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+        }
+        fracs = validate_complement(vecs, V_scaffold)
+        assert fracs["dim_a"] > 0.99
+        assert fracs["dim_b"] > 0.99
+
+    def test_scaffold_vectors_have_low_complement(self) -> None:
+        from tgirl.calibrate import validate_complement
+
+        V_scaffold = mx.eye(4)[:, :2]  # scaffold = first 2 dims
+        vecs = {"in_scaffold": mx.array([1.0, 0.0, 0.0, 0.0])}
+        fracs = validate_complement(vecs, V_scaffold)
+        assert fracs["in_scaffold"] < 0.01
+
+
+class TestExtractBehavioralVectors:
+    """Integration: extract behavioral vectors from real model."""
+
+    def test_extract_two_dims(self, qwen_model) -> None:
+        """Extract 2 behavioral dims with 2 queries -- smoke test."""
+        from tgirl.calibrate import (
+            _GenerationHook,
+            extract_behavioral_vectors,
+        )
+
+        model, tok = qwen_model
+        layers = model
+        for attr in "language_model.model.layers".split("."):
+            layers = getattr(layers, attr)
+
+        hook = _GenerationHook(layers, layer_idx=14)
+        hook.install()
+        try:
+            dims = {
+                "helpful": {
+                    "system_pos": "You are maximally helpful.",
+                    "system_neg": "You are minimally helpful.",
+                },
+                "terse": {
+                    "system_pos": "Use minimal words. Short sentences.",
+                    "system_neg": "Be expansive and detailed.",
+                },
+            }
+            queries = [
+                "What makes a good leader?",
+                "How should I handle a disagreement?",
+            ]
+            vecs = extract_behavioral_vectors(
+                model, tok, hook, dims, queries, max_tok=30,
+            )
+            assert len(vecs) == 2
+            assert vecs["helpful"].shape == (1024,)
+            assert vecs["terse"].shape == (1024,)
+            # Vectors should be nonzero
+            assert float(mx.linalg.norm(vecs["helpful"]).item()) > 0.0
+            assert float(mx.linalg.norm(vecs["terse"]).item()) > 0.0
+        finally:
+            hook.uninstall()
