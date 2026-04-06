@@ -49,6 +49,7 @@ class InferenceContext:
     model_id: str
     stop_token_ids: list[int]
     think_end_token_id: int | None = None  # </think> token for reasoning models
+    bottleneck_hook: Any | None = None  # _BottleneckHook for probe feedback
 
 
 # --- Backend detection helpers ---
@@ -128,6 +129,8 @@ def _make_torch_grammar_factory(tokenizer: Any) -> Callable:
 def load_inference_context(
     model_id: str,
     backend: str = "auto",
+    bottleneck_layer: int | None = None,
+    layer_path: str | None = None,
 ) -> InferenceContext:
     """Load model and construct all SamplingSession dependencies.
 
@@ -139,6 +142,10 @@ def load_inference_context(
     Args:
         model_id: HuggingFace model ID or local path.
         backend: Backend to use ("auto", "mlx", "torch").
+        bottleneck_layer: Layer index for ESTRADIOL probe feedback.
+            If provided, installs a bottleneck hook for self-steering.
+        layer_path: Dot-separated path to model layers list
+            (e.g. "language_model.model.layers"). Auto-detected if None.
 
     Returns:
         InferenceContext ready for creating SamplingSession instances.
@@ -146,7 +153,7 @@ def load_inference_context(
     resolved_backend = _resolve_backend(backend)
 
     if resolved_backend == "mlx":
-        return _build_mlx_context(model_id)
+        return _build_mlx_context(model_id, bottleneck_layer, layer_path)
     return _build_torch_context(model_id)
 
 
@@ -183,13 +190,15 @@ def _resolve_backend(backend: str) -> Literal["mlx", "torch"]:
     raise ImportError(msg)
 
 
-def _build_mlx_context(model_id: str) -> InferenceContext:
+def _build_mlx_context(
+    model_id: str,
+    bottleneck_layer: int | None = None,
+    layer_path: str | None = None,
+) -> InferenceContext:
     """Build InferenceContext for MLX backend."""
     import mlx.core as mx
 
     model, mlx_tokenizer = _load_mlx_model(model_id)
-    # mlx_lm wraps the HF tokenizer — extract the fast tokenizer
-    # for llguidance compatibility (requires fast tokenizer)
     hf_tokenizer = mlx_tokenizer._tokenizer
 
     forward_fn = _make_mlx_forward(model)
@@ -207,17 +216,46 @@ def _build_mlx_context(model_id: str) -> InferenceContext:
         if len(ids) == 1 and ids[0] not in stop_ids:
             stop_ids.append(ids[0])
 
-    # Detect </think> token for reasoning models (Qwen3.5, etc.)
+    # Detect </think> token for reasoning models
     think_end_id = None
     think_ids = hf_tokenizer.encode("</think>", add_special_tokens=False)
     if len(think_ids) == 1:
         think_end_id = think_ids[0]
         logger.info("reasoning_model_detected", think_end_token_id=think_end_id)
 
+    # Install bottleneck hook for probe feedback steering
+    hook = None
+    if bottleneck_layer is not None:
+        from tgirl.cache import _BottleneckHook
+
+        if layer_path is None:
+            for candidate in ["language_model.model.layers", "model.layers"]:
+                obj = model
+                try:
+                    for attr in candidate.split("."):
+                        obj = getattr(obj, attr)
+                    layer_path = candidate
+                    break
+                except AttributeError:
+                    continue
+
+        if layer_path is not None:
+            layers = model
+            for attr in layer_path.split("."):
+                layers = getattr(layers, attr)
+            hook = _BottleneckHook(layers, layer_idx=bottleneck_layer)
+            hook.install()
+            logger.info(
+                "bottleneck_hook_installed",
+                layer=bottleneck_layer,
+                layer_path=layer_path,
+            )
+
     logger.info(
         "mlx_model_loaded",
         model_id=model_id,
         vocab_size=embeddings.shape[0],
+        self_steering=hook is not None,
     )
 
     return InferenceContext(
@@ -233,6 +271,7 @@ def _build_mlx_context(model_id: str) -> InferenceContext:
         model_id=model_id,
         stop_token_ids=stop_ids,
         think_end_token_id=think_end_id,
+        bottleneck_hook=hook,
     )
 
 
@@ -660,11 +699,22 @@ def create_app(
 
     # --- OpenAI-compatible endpoints ---
 
+    # Probe cache: persists the last bottleneck activation across turns.
+    # When a new request comes in, the cached probe steers the first token,
+    # creating behavioral continuity across the conversation.
+    _probe_cache: dict[str, Any] = {"v_probe": None}
+
     def _generate_tokens(
         request: ChatCompletionRequest,
         prompt_tokens: list[int],
     ) -> tuple[list[int], str]:
-        """Bare autoregressive generation with optional probe feedback.
+        """Autoregressive generation with probe feedback self-steering.
+
+        When ctx.bottleneck_hook is installed and estradiol_alpha > 0:
+          v_steer(n+1) = alpha * v_probe(n)
+
+        The probe from the last token is cached in _probe_cache so the
+        next turn picks up the same behavioral state.
 
         Returns (generated_token_ids, finish_reason).
         """
@@ -672,21 +722,8 @@ def create_app(
 
         max_tok = request.max_completion_tokens or request.max_tokens or 512
         temp = request.temperature
+        hook = ctx.bottleneck_hook
         alpha = request.estradiol_alpha or 0.0
-
-        # Set up probe feedback hook if alpha > 0
-        hook = None
-        v_probe_prev = None
-        if alpha > 0 and ctx.backend == "mlx":
-            from tgirl.cache import _BottleneckHook
-
-            layers = None
-            # Try common layer paths
-            model_obj = ctx._model if hasattr(ctx, "_model") else None
-            if model_obj is None:
-                # forward_fn is a closure over the model — can't extract it
-                # Probe feedback requires the model object; skip if unavailable
-                alpha = 0.0
 
         if request.seed is not None:
             mx.random.seed(request.seed)
@@ -700,14 +737,28 @@ def create_app(
                 if len(ids) == 1:
                     stop_ids.add(ids[0])
 
+        # Initialize probe from cache (behavioral continuity across turns)
+        v_probe_prev = _probe_cache.get("v_probe")
+
         generated: list[int] = []
         token_ids = list(prompt_tokens)
 
         for _ in range(max_tok):
+            # Steer: inject scaled probe from previous token (or previous turn)
+            if hook is not None and alpha > 0 and v_probe_prev is not None:
+                hook.set_raw_correction(alpha * v_probe_prev)
+            elif hook is not None:
+                hook.clear_steering()
+
             logits = ctx.forward_fn(token_ids)
-            # Handle ForwardResult or raw tensor
             if hasattr(logits, "logits"):
                 logits = logits.logits
+
+            # Capture probe for next token
+            if hook is not None:
+                v_probe_prev = hook.get_captured()
+                if v_probe_prev is not None:
+                    mx.eval(v_probe_prev)
 
             if temp > 0:
                 logits = logits / temp
@@ -716,11 +767,14 @@ def create_app(
                 next_token = int(mx.argmax(logits).item())
 
             if next_token in stop_ids:
+                # Cache the final probe for next turn
+                _probe_cache["v_probe"] = v_probe_prev
                 return generated, "stop"
 
             generated.append(next_token)
             token_ids = token_ids + [next_token]
 
+        _probe_cache["v_probe"] = v_probe_prev
         return generated, "length"
 
     @app.get("/v1/models")
@@ -807,14 +861,29 @@ def create_app(
                 token_ids = list(prompt_tokens)
                 think_end = ctx.think_end_token_id
                 in_thinking = request.enable_thinking and think_end is not None
+                hook = ctx.bottleneck_hook
+                alpha = request.estradiol_alpha or 0.0
+                v_probe_prev = _probe_cache.get("v_probe")
 
                 if request.seed is not None:
                     mx.random.seed(request.seed)
 
                 for _ in range(max_tok):
+                    # Probe feedback steering
+                    if hook is not None and alpha > 0 and v_probe_prev is not None:
+                        hook.set_raw_correction(alpha * v_probe_prev)
+                    elif hook is not None:
+                        hook.clear_steering()
+
                     logits = ctx.forward_fn(token_ids)
                     if hasattr(logits, "logits"):
                         logits = logits.logits
+
+                    if hook is not None:
+                        v_probe_prev = hook.get_captured()
+                        if v_probe_prev is not None:
+                            mx.eval(v_probe_prev)
+
                     if temp > 0:
                         logits = logits / temp
                         next_token = int(mx.random.categorical(logits).item())
@@ -833,6 +902,7 @@ def create_app(
                             )],
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
+                        _probe_cache["v_probe"] = v_probe_prev
                         break
 
                     # Detect end-of-thinking transition
@@ -878,6 +948,7 @@ def create_app(
                         )],
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
+                    _probe_cache["v_probe"] = v_probe_prev
 
                 yield "data: [DONE]\n\n"
 
