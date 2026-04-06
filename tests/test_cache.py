@@ -463,3 +463,257 @@ class TestZeroCoupling:
         assert tgirl_imports == [], (
             f"cache.py has tgirl imports: {tgirl_imports}"
         )
+
+
+@pytest.fixture(scope="module")
+def qwen_model_and_tok():
+    """Load Qwen3.5-0.8B once for all tests in this module."""
+    import mlx_lm
+
+    model, tok = mlx_lm.load("Qwen/Qwen3.5-0.8B")
+    return model, tok
+
+
+class TestBottleneckHook:
+    """_BottleneckHook captures and injects at a specific layer."""
+
+    def test_capture_shape(self, qwen_model_and_tok) -> None:
+        from tgirl.cache import _BottleneckHook
+
+        model, tok = qwen_model_and_tok
+        layers = model
+        for attr in "language_model.model.layers".split("."):
+            layers = getattr(layers, attr)
+
+        hook = _BottleneckHook(layers, layer_idx=14)
+        hook.install()
+        try:
+            tokens = mx.array([[tok.encode("Hello world")[-1]]])
+            _ = model(tokens)
+            captured = hook.get_captured()
+            assert captured is not None
+            assert captured.ndim == 1
+            # d_model for Qwen3.5-0.8B is 1024
+            assert captured.shape[0] == 1024
+        finally:
+            hook.uninstall()
+
+    def test_probe_reading_shape(self, qwen_model_and_tok) -> None:
+        from tgirl.cache import _BottleneckHook
+
+        model, tok = qwen_model_and_tok
+        layers = model
+        for attr in "language_model.model.layers".split("."):
+            layers = getattr(layers, attr)
+
+        K = 11
+        V_basis = mx.random.normal((1024, K))
+
+        hook = _BottleneckHook(layers, layer_idx=14)
+        hook.install()
+        try:
+            tokens = mx.array([[tok.encode("Hello world")[-1]]])
+            _ = model(tokens)
+            probe = hook.get_probe(V_basis)
+            assert probe is not None
+            assert probe.shape == (K,)
+        finally:
+            hook.uninstall()
+
+    def test_injection_modifies_output(self, qwen_model_and_tok) -> None:
+        from tgirl.cache import _BottleneckHook
+
+        model, tok = qwen_model_and_tok
+        layers = model
+        for attr in "language_model.model.layers".split("."):
+            layers = getattr(layers, attr)
+
+        K = 11
+        V_basis = mx.random.normal((1024, K))
+        delta = mx.ones((K,)) * 5.0  # large delta to ensure visible effect
+
+        # Run without injection
+        cache1 = model.make_cache()
+        tokens = mx.array([[tok.encode("Hello world")[-1]]])
+        logits_baseline = model(tokens, cache=cache1)
+        mx.eval(logits_baseline)
+
+        # Run with injection
+        hook = _BottleneckHook(layers, layer_idx=14)
+        hook.install()
+        try:
+            hook.set_steering(V_basis, delta)
+            cache2 = model.make_cache()
+            logits_steered = model(tokens, cache=cache2)
+            mx.eval(logits_steered)
+
+            diff = mx.max(mx.abs(logits_baseline - logits_steered))
+            mx.eval(diff)
+            assert float(diff.item()) > 0.0
+        finally:
+            hook.uninstall()
+
+    def test_uninstall_restores_original(self, qwen_model_and_tok) -> None:
+        from tgirl.cache import _BottleneckHook
+
+        model, tok = qwen_model_and_tok
+        layers = model
+        for attr in "language_model.model.layers".split("."):
+            layers = getattr(layers, attr)
+
+        original_call = type(layers[14]).__call__
+
+        hook = _BottleneckHook(layers, layer_idx=14)
+        hook.install()
+        assert type(layers[14]).__call__ is not original_call
+        hook.uninstall()
+        assert type(layers[14]).__call__ is original_call
+
+    def test_raw_correction_modifies_output(self, qwen_model_and_tok) -> None:
+        """set_raw_correction injects a (d_model,) vector directly."""
+        from tgirl.cache import _BottleneckHook
+
+        model, tok = qwen_model_and_tok
+        layers = model
+        for attr in "language_model.model.layers".split("."):
+            layers = getattr(layers, attr)
+
+        hook = _BottleneckHook(layers, layer_idx=14)
+        hook.install()
+        try:
+            tokens = mx.array([[tok.encode("Hello world")[-1]]])
+
+            # Baseline
+            cache1 = model.make_cache()
+            hook.clear_steering()
+            logits_baseline = model(tokens, cache=cache1)
+            mx.eval(logits_baseline)
+
+            # With raw correction
+            cache2 = model.make_cache()
+            hook.set_raw_correction(mx.ones((1024,)) * 0.5)
+            logits_steered = model(tokens, cache=cache2)
+            mx.eval(logits_steered)
+
+            diff = mx.max(mx.abs(logits_baseline - logits_steered))
+            mx.eval(diff)
+            assert float(diff.item()) > 0.0
+        finally:
+            hook.uninstall()
+
+    def test_probe_feedback_loop(self, qwen_model_and_tok) -> None:
+        """v_steer(n+1) = alpha * v_probe(n) produces valid output."""
+        from tgirl.cache import _BottleneckHook
+
+        model, tok = qwen_model_and_tok
+        layers = model
+        for attr in "language_model.model.layers".split("."):
+            layers = getattr(layers, attr)
+
+        hook = _BottleneckHook(layers, layer_idx=14)
+        hook.install()
+        try:
+            cache = model.make_cache()
+            token_ids = tok.encode("Hello")
+
+            # Token 0: no steering, capture probe
+            hook.clear_steering()
+            logits = model(mx.array([token_ids]), cache=cache)
+            v_probe = hook.get_captured()
+            assert v_probe is not None
+            assert v_probe.shape == (1024,)
+
+            # Token 1: steer with alpha * v_probe(0)
+            alpha = 0.1
+            hook.set_raw_correction(alpha * v_probe)
+            next_input = mx.array([[int(mx.argmax(logits[0, -1, :]).item())]])
+            logits2 = model(next_input, cache=cache)
+            v_probe2 = hook.get_captured()
+            mx.eval(logits2)
+
+            # Should still produce valid logits and a new probe
+            assert logits2.shape[-1] > 0
+            assert v_probe2 is not None
+            assert v_probe2.shape == (1024,)
+        finally:
+            hook.uninstall()
+
+
+class TestSteerableMLXForwardFn:
+    """make_steerable_mlx_forward_fn: forward with optional probe/inject."""
+
+    def test_no_steering_returns_forward_result(self, qwen_model_and_tok) -> None:
+        from tgirl.cache import ForwardResult, make_steerable_mlx_forward_fn
+
+        model, tok = qwen_model_and_tok
+        fwd = make_steerable_mlx_forward_fn(
+            model, bottleneck_layer=14,
+            layer_path="language_model.model.layers",
+        )
+        token_ids = tok.encode("Hello")
+        result = fwd(token_ids)
+        assert isinstance(result, ForwardResult)
+        assert result.probe_alpha is None  # no steering → no probe
+        assert result.logits.ndim == 1
+
+    def test_with_steering_returns_probe(self, qwen_model_and_tok) -> None:
+        from tgirl.cache import ForwardResult, make_steerable_mlx_forward_fn
+        from tgirl.estradiol import SteeringState
+
+        model, tok = qwen_model_and_tok
+        K = 11
+        V = mx.random.normal((1024, K))
+        fwd = make_steerable_mlx_forward_fn(
+            model, bottleneck_layer=14,
+            layer_path="language_model.model.layers",
+        )
+        steering = SteeringState(V_basis=V, delta_alpha=mx.zeros((K,)), bottleneck_layer=14)
+        token_ids = tok.encode("Hello")
+        result = fwd(token_ids, steering=steering)
+        assert isinstance(result, ForwardResult)
+        assert result.probe_alpha is not None
+        assert result.probe_alpha.shape == (K,)
+
+    def test_injection_modifies_logits(self, qwen_model_and_tok) -> None:
+        from tgirl.cache import make_steerable_mlx_forward_fn
+        from tgirl.estradiol import SteeringState
+
+        model, tok = qwen_model_and_tok
+        K = 11
+        V = mx.random.normal((1024, K))
+        fwd = make_steerable_mlx_forward_fn(
+            model, bottleneck_layer=14,
+            layer_path="language_model.model.layers",
+        )
+        token_ids = tok.encode("Hello")
+
+        # Baseline (no injection)
+        steering_zero = SteeringState(V_basis=V, delta_alpha=mx.zeros((K,)), bottleneck_layer=14)
+        r1 = fwd(token_ids, steering=steering_zero)
+
+        # Reset cache by passing different tokens then back
+        fwd(tok.encode("Reset"))
+
+        # With injection
+        steering_big = SteeringState(V_basis=V, delta_alpha=mx.ones((K,)) * 10.0, bottleneck_layer=14)
+        r2 = fwd(token_ids, steering=steering_big)
+
+        diff = mx.max(mx.abs(r1.logits - r2.logits))
+        mx.eval(diff)
+        assert float(diff.item()) > 0.0
+
+    def test_cache_continuation_works(self, qwen_model_and_tok) -> None:
+        from tgirl.cache import CacheStats, make_steerable_mlx_forward_fn
+
+        model, tok = qwen_model_and_tok
+        stats = CacheStats()
+        fwd = make_steerable_mlx_forward_fn(
+            model, bottleneck_layer=14,
+            layer_path="language_model.model.layers",
+            stats=stats,
+        )
+        tokens = tok.encode("Hello world")
+        fwd(tokens)
+        # Extend by one token — should be a cache hit
+        fwd(tokens + [tokens[-1]])
+        assert stats.hits >= 1

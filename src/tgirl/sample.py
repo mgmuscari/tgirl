@@ -478,6 +478,8 @@ class ConstrainedGenerationResult(BaseModel):
     backtrack_requested: bool = False
     backtrack_checkpoint: Checkpoint | None = None
     backtrack_events: list[Any] = []
+    estradiol_alphas: list[list[float]] | None = None
+    estradiol_deltas: list[list[float]] | None = None
 
 
 def run_constrained_generation(
@@ -494,6 +496,7 @@ def run_constrained_generation(
     grammar_text: str | None = None,
     stop_token_ids: list[int] | None = None,
     reachable_tokens: frozenset[int] | None = None,
+    controller: object | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
@@ -752,12 +755,14 @@ class SamplingSession:
         transition_policy: TransitionPolicy | None = None,
         stop_token_ids: list[int] | None = None,
         tool_call_primer_tokens: list[int] | None = None,
+        controller: object | None = None,
     ) -> None:
         from tgirl.rerank import ToolRouter
         from tgirl.state_machine import DelimiterTransitionPolicy
 
         self._stop_token_ids = stop_token_ids
         self._tool_call_primer_tokens = tool_call_primer_tokens
+        self._controller = controller
         self._registry = registry
         self._forward_fn = forward_fn
         self._decode = tokenizer_decode
@@ -1206,6 +1211,7 @@ class SamplingSession:
                     context_tokens=token_history,
                     stop_token_ids=self._stop_token_ids,
                     reachable_tokens=grammar_output.reachable_tokens,
+                    controller=self._controller,
                 )
             else:
                 gen_result = run_constrained_generation(
@@ -1219,6 +1225,7 @@ class SamplingSession:
                     context_tokens=token_history,
                     stop_token_ids=self._stop_token_ids,
                     reachable_tokens=grammar_output.reachable_tokens,
+                    controller=self._controller,
                 )
 
             token_history.extend(gen_result.tokens)

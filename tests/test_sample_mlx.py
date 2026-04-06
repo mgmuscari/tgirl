@@ -787,3 +787,59 @@ class TestRepetitionPenaltyHookMlx:
             logits=mx.zeros((10,)),
         )
         assert intervention.logit_bias is None
+
+
+class TestEstradiolSamplingIntegration:
+    """Controller integration in run_constrained_generation_mlx."""
+
+    def test_no_controller_unchanged(self) -> None:
+        """Without controller, result has no estradiol telemetry."""
+        from tgirl.sample import ConstrainedGenerationResult
+        from tgirl.state_machine import Checkpoint  # noqa: F401 — resolve forward ref
+
+        ConstrainedGenerationResult.model_rebuild()
+
+        # ConstrainedGenerationResult should accept estradiol fields
+        # with None defaults — verify backward compat
+        r = ConstrainedGenerationResult(
+            tokens=[1],
+            hy_source="(a)",
+            grammar_valid_counts=[10],
+            temperatures_applied=[0.3],
+            wasserstein_distances=[0.0],
+            top_p_applied=[0.9],
+            token_log_probs=[-1.0],
+            ot_computation_total_ms=0.0,
+            ot_bypassed_count=0,
+            ot_bypass_reasons=[None],
+            ot_iterations=[0],
+            grammar_generation_ms=0.0,
+        )
+        assert r.estradiol_alphas is None
+        assert r.estradiol_deltas is None
+
+    def test_result_accepts_estradiol_fields(self) -> None:
+        """ConstrainedGenerationResult can store estradiol telemetry."""
+        from tgirl.sample import ConstrainedGenerationResult
+        from tgirl.state_machine import Checkpoint  # noqa: F401
+
+        ConstrainedGenerationResult.model_rebuild()
+
+        r = ConstrainedGenerationResult(
+            tokens=[1],
+            hy_source="(a)",
+            grammar_valid_counts=[10],
+            temperatures_applied=[0.3],
+            wasserstein_distances=[0.0],
+            top_p_applied=[0.9],
+            token_log_probs=[-1.0],
+            ot_computation_total_ms=0.0,
+            ot_bypassed_count=0,
+            ot_bypass_reasons=[None],
+            ot_iterations=[0],
+            grammar_generation_ms=0.0,
+            estradiol_alphas=[[0.1, 0.2]],
+            estradiol_deltas=[[0.01, 0.02]],
+        )
+        assert r.estradiol_alphas == [[0.1, 0.2]]
+        assert r.estradiol_deltas == [[0.01, 0.02]]

@@ -431,6 +431,7 @@ def run_constrained_generation_mlx(
     grammar_text: str | None = None,
     stop_token_ids: list[int] | None = None,
     reachable_tokens: frozenset[int] | None = None,
+    controller: object | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
@@ -456,10 +457,22 @@ def run_constrained_generation_mlx(
     ot_bypass_reasons: list[str | None] = []
     ot_iterations: list[int] = []
     backtrack_events: list[BacktrackEvent] = []
+    estradiol_alphas: list[list[float]] | None = None
+    estradiol_deltas: list[list[float]] | None = None
 
     vocab_size = embeddings.shape[0]
     last_checkpoint: Checkpoint | None = None
     backtrack_requested = False
+
+    # ESTRADIOL controller setup
+    _steering: object | None = None
+    if controller is not None:
+        if hasattr(controller, "reset"):
+            controller.reset()
+        K = controller.V_basis.shape[1]
+        _steering = controller.make_steering_state(mx.zeros((K,)))
+        estradiol_alphas = []
+        estradiol_deltas = []
 
     # Reset stateful hooks for this generation pass
     for hook in hooks:
@@ -472,8 +485,17 @@ def run_constrained_generation_mlx(
     for position in range(max_tokens):
         _t0 = time.monotonic()
 
-        # 1. Forward pass (returns mx.array)
-        raw_logits = forward_fn(token_history)
+        # 1. Forward pass — steerable if controller is active
+        if controller is not None and _steering is not None:
+            _fwd_result = forward_fn(token_history, steering=_steering)
+            raw_logits = _fwd_result.logits
+            if _fwd_result.probe_alpha is not None:
+                _delta = controller.step(_fwd_result.probe_alpha)
+                _steering = controller.make_steering_state(_delta)
+                estradiol_alphas.append(controller.alpha_current.tolist())
+                estradiol_deltas.append(_delta.tolist())
+        else:
+            raw_logits = forward_fn(token_history)
         _t1 = time.monotonic()
 
         # 2. Grammar mask — pure MLX via llguidance.mlx (or fallback)
@@ -700,4 +722,6 @@ def run_constrained_generation_mlx(
             last_checkpoint if backtrack_requested else None
         ),
         backtrack_events=backtrack_events,
+        estradiol_alphas=estradiol_alphas,
+        estradiol_deltas=estradiol_deltas,
     )
