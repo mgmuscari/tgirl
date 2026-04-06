@@ -569,6 +569,75 @@ class TestBottleneckHook:
         hook.uninstall()
         assert type(layers[14]).__call__ is original_call
 
+    def test_raw_correction_modifies_output(self, qwen_model_and_tok) -> None:
+        """set_raw_correction injects a (d_model,) vector directly."""
+        from tgirl.cache import _BottleneckHook
+
+        model, tok = qwen_model_and_tok
+        layers = model
+        for attr in "language_model.model.layers".split("."):
+            layers = getattr(layers, attr)
+
+        hook = _BottleneckHook(layers, layer_idx=14)
+        hook.install()
+        try:
+            tokens = mx.array([[tok.encode("Hello world")[-1]]])
+
+            # Baseline
+            cache1 = model.make_cache()
+            hook.clear_steering()
+            logits_baseline = model(tokens, cache=cache1)
+            mx.eval(logits_baseline)
+
+            # With raw correction
+            cache2 = model.make_cache()
+            hook.set_raw_correction(mx.ones((1024,)) * 0.5)
+            logits_steered = model(tokens, cache=cache2)
+            mx.eval(logits_steered)
+
+            diff = mx.max(mx.abs(logits_baseline - logits_steered))
+            mx.eval(diff)
+            assert float(diff.item()) > 0.0
+        finally:
+            hook.uninstall()
+
+    def test_probe_feedback_loop(self, qwen_model_and_tok) -> None:
+        """v_steer(n+1) = alpha * v_probe(n) produces valid output."""
+        from tgirl.cache import _BottleneckHook
+
+        model, tok = qwen_model_and_tok
+        layers = model
+        for attr in "language_model.model.layers".split("."):
+            layers = getattr(layers, attr)
+
+        hook = _BottleneckHook(layers, layer_idx=14)
+        hook.install()
+        try:
+            cache = model.make_cache()
+            token_ids = tok.encode("Hello")
+
+            # Token 0: no steering, capture probe
+            hook.clear_steering()
+            logits = model(mx.array([token_ids]), cache=cache)
+            v_probe = hook.get_captured()
+            assert v_probe is not None
+            assert v_probe.shape == (1024,)
+
+            # Token 1: steer with alpha * v_probe(0)
+            alpha = 0.1
+            hook.set_raw_correction(alpha * v_probe)
+            next_input = mx.array([[int(mx.argmax(logits[0, -1, :]).item())]])
+            logits2 = model(next_input, cache=cache)
+            v_probe2 = hook.get_captured()
+            mx.eval(logits2)
+
+            # Should still produce valid logits and a new probe
+            assert logits2.shape[-1] > 0
+            assert v_probe2 is not None
+            assert v_probe2.shape == (1024,)
+        finally:
+            hook.uninstall()
+
 
 class TestSteerableMLXForwardFn:
     """make_steerable_mlx_forward_fn: forward with optional probe/inject."""

@@ -51,8 +51,9 @@ class _BottleneckHook:
         self._layer_type = type(self._target)
         self._original_call: Any = None
         self._captured: Any = None  # (d_model,) last-token activation
-        self._V_basis: Any = None  # (d_model, K) for injection
-        self._delta_alpha: Any = None  # (K,) correction to inject
+        self._V_basis: Any = None  # (d_model, K) for codebook injection
+        self._delta_alpha: Any = None  # (K,) correction for codebook injection
+        self._raw_correction: Any = None  # (d_model,) raw injection vector
         self._installed = False
 
     def install(self) -> None:
@@ -70,8 +71,10 @@ class _BottleneckHook:
                 # Capture last-token activation (float32)
                 hook._captured = result[:, -1, :].astype(mx.float32).reshape(-1)
 
-                # Inject if steering is configured
-                if hook._V_basis is not None and hook._delta_alpha is not None:
+                # Inject: raw correction or codebook projection
+                if hook._raw_correction is not None:
+                    result = result + hook._raw_correction.reshape(1, 1, -1)
+                elif hook._V_basis is not None and hook._delta_alpha is not None:
                     correction = hook._V_basis @ hook._delta_alpha  # (d_model,)
                     result = result + correction.reshape(1, 1, -1)
             return result
@@ -101,9 +104,14 @@ class _BottleneckHook:
         self._V_basis = V_basis
         self._delta_alpha = delta_alpha
 
+    def set_raw_correction(self, correction: Any) -> None:
+        """Set a raw (d_model,) vector to inject. Bypasses codebook."""
+        self._raw_correction = correction
+
     def clear_steering(self) -> None:
         """Disable injection."""
         self._V_basis = None
+        self._raw_correction = None
         self._delta_alpha = None
 
 
