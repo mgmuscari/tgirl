@@ -32,9 +32,25 @@ class ChatTemplateFormatter:
         self,
         messages: list[dict[str, str]],
         add_generation_prompt: bool = True,
+        **kwargs: object,
     ) -> str:
-        return self._tokenizer.apply_chat_template(  # type: ignore[union-attr]
-            messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
+        """Format messages using the tokenizer's chat template.
+
+        Extra kwargs (e.g. enable_thinking for Qwen3.5) are passed
+        through to apply_chat_template. Unsupported kwargs are silently
+        dropped to maintain compatibility across model families.
+        """
+        try:
+            return self._tokenizer.apply_chat_template(  # type: ignore[union-attr]
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                **kwargs,
+            )
+        except TypeError:
+            # Model template doesn't support these kwargs — retry without
+            return self._tokenizer.apply_chat_template(  # type: ignore[union-attr]
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )

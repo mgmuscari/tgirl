@@ -48,6 +48,7 @@ class InferenceContext:
     backend: Literal["torch", "mlx"]
     model_id: str
     stop_token_ids: list[int]
+    think_end_token_id: int | None = None  # </think> token for reasoning models
 
 
 # --- Backend detection helpers ---
@@ -206,6 +207,13 @@ def _build_mlx_context(model_id: str) -> InferenceContext:
         if len(ids) == 1 and ids[0] not in stop_ids:
             stop_ids.append(ids[0])
 
+    # Detect </think> token for reasoning models (Qwen3.5, etc.)
+    think_end_id = None
+    think_ids = hf_tokenizer.encode("</think>", add_special_tokens=False)
+    if len(think_ids) == 1:
+        think_end_id = think_ids[0]
+        logger.info("reasoning_model_detected", think_end_token_id=think_end_id)
+
     logger.info(
         "mlx_model_loaded",
         model_id=model_id,
@@ -224,6 +232,7 @@ def _build_mlx_context(model_id: str) -> InferenceContext:
         backend="mlx",
         model_id=model_id,
         stop_token_ids=stop_ids,
+        think_end_token_id=think_end_id,
     )
 
 
@@ -304,6 +313,7 @@ try:
     class ChatMessage(_PydanticBase):
         role: str
         content: str | None = None
+        reasoning_content: str | None = None  # thinking block for reasoning models
 
     class ChatCompletionRequest(_PydanticBase):
         model: str
@@ -322,8 +332,9 @@ try:
         top_logprobs: int | None = None
         logit_bias: dict[str, float] | None = None
         user: str | None = None
-        # tgirl extension: probe feedback steering
+        # tgirl extensions
         estradiol_alpha: float | None = None
+        enable_thinking: bool = True  # reasoning mode for Qwen3.5 etc.
 
     class ChatCompletionChoice(_PydanticBase):
         index: int
@@ -346,6 +357,7 @@ try:
     class DeltaMessage(_PydanticBase):
         role: str | None = None
         content: str | None = None
+        reasoning_content: str | None = None
 
     class StreamChoice(_PydanticBase):
         index: int
@@ -725,6 +737,44 @@ def create_app(
             ],
         }
 
+    def _format_prompt(
+        request: ChatCompletionRequest,
+    ) -> list[int]:
+        """Format messages and tokenize using the model's chat template."""
+        messages = [
+            {"role": m.role, "content": m.content or ""}
+            for m in request.messages
+        ]
+        try:
+            prompt_text = ctx.formatter.format_messages(
+                messages,
+                enable_thinking=request.enable_thinking,
+            )
+        except Exception:
+            prompt_text = "\n".join(
+                f"{m['role']}: {m['content']}" for m in messages
+            )
+        return ctx.tokenizer_encode(prompt_text)
+
+    def _split_reasoning(
+        token_ids: list[int],
+    ) -> tuple[str | None, str]:
+        """Split generated tokens into reasoning_content and content.
+
+        If the model produced a </think> token, everything before it
+        is reasoning_content; everything after is content. If no
+        </think> token, everything is content.
+        """
+        think_end = ctx.think_end_token_id
+        if think_end is not None and think_end in token_ids:
+            idx = token_ids.index(think_end)
+            reasoning_tokens = token_ids[:idx]
+            content_tokens = token_ids[idx + 1:]
+            reasoning = ctx.tokenizer_decode(reasoning_tokens).strip()
+            content = ctx.tokenizer_decode(content_tokens).strip()
+            return (reasoning or None), content
+        return None, ctx.tokenizer_decode(token_ids)
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest) -> Any:
         import time
@@ -733,23 +783,12 @@ def create_app(
 
         created = int(time.time())
         completion_id = f"chatcmpl-{created}"
-
-        # Format prompt
-        messages = [{"role": m.role, "content": m.content or ""} for m in request.messages]
-        try:
-            prompt_text = ctx.formatter.format(messages)
-        except Exception:
-            prompt_text = "\n".join(
-                f"{m['role']}: {m['content']}" for m in messages
-            )
-        prompt_tokens = ctx.tokenizer_encode(prompt_text)
+        prompt_tokens = _format_prompt(request)
 
         if request.stream:
             from fastapi.responses import StreamingResponse
 
             async def stream_gen():
-                import json
-
                 # First chunk: role
                 chunk = ChatCompletionChunk(
                     id=completion_id,
@@ -762,11 +801,12 @@ def create_app(
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
-                # Generate tokens
                 max_tok = request.max_completion_tokens or request.max_tokens or 512
                 temp = request.temperature
                 stop_ids = set(ctx.stop_token_ids)
                 token_ids = list(prompt_tokens)
+                think_end = ctx.think_end_token_id
+                in_thinking = request.enable_thinking and think_end is not None
 
                 if request.seed is not None:
                     mx.random.seed(request.seed)
@@ -795,20 +835,38 @@ def create_app(
                         yield f"data: {chunk.model_dump_json()}\n\n"
                         break
 
+                    # Detect end-of-thinking transition
+                    if in_thinking and next_token == think_end:
+                        in_thinking = False
+                        token_ids = token_ids + [next_token]
+                        continue  # don't emit the </think> token
+
                     token_ids = token_ids + [next_token]
                     text = ctx.tokenizer_decode([next_token])
-                    chunk = ChatCompletionChunk(
-                        id=completion_id,
-                        created=created,
-                        model=request.model,
-                        choices=[StreamChoice(
-                            index=0,
-                            delta=DeltaMessage(content=text),
-                        )],
-                    )
+
+                    if in_thinking:
+                        # Emit as reasoning_content delta
+                        chunk = ChatCompletionChunk(
+                            id=completion_id,
+                            created=created,
+                            model=request.model,
+                            choices=[StreamChoice(
+                                index=0,
+                                delta=DeltaMessage(reasoning_content=text),
+                            )],
+                        )
+                    else:
+                        chunk = ChatCompletionChunk(
+                            id=completion_id,
+                            created=created,
+                            model=request.model,
+                            choices=[StreamChoice(
+                                index=0,
+                                delta=DeltaMessage(content=text),
+                            )],
+                        )
                     yield f"data: {chunk.model_dump_json()}\n\n"
                 else:
-                    # Hit max_tokens
                     chunk = ChatCompletionChunk(
                         id=completion_id,
                         created=created,
@@ -832,7 +890,7 @@ def create_app(
         generated, finish_reason = await asyncio.to_thread(
             _generate_tokens, request, prompt_tokens,
         )
-        completion_text = ctx.tokenizer_decode(generated)
+        reasoning_content, content = _split_reasoning(generated)
 
         return ChatCompletionResponse(
             id=completion_id,
@@ -840,7 +898,11 @@ def create_app(
             model=request.model,
             choices=[ChatCompletionChoice(
                 index=0,
-                message=ChatMessage(role="assistant", content=completion_text),
+                message=ChatMessage(
+                    role="assistant",
+                    content=content,
+                    reasoning_content=reasoning_content,
+                ),
                 finish_reason=finish_reason,
             )],
             usage=CompletionUsage(

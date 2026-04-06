@@ -928,3 +928,67 @@ class TestOpenAIChatCompletions:
             "model": "test-model",
         })
         assert resp.status_code == 422
+
+    def test_reasoning_content_split(self) -> None:
+        """When think_end_token_id is set, output splits into reasoning + content."""
+        import mlx.core as mx
+        from fastapi.testclient import TestClient
+        from tgirl.serve import InferenceContext, create_app
+
+        vocab_size = 100
+        THINK_END = 99  # </think> token
+        call_count = [0]
+
+        def fake_forward(token_ids):
+            call_count[0] += 1
+            logits = mx.full((vocab_size,), -100.0)
+            if call_count[0] <= 2:
+                # First 2 tokens: reasoning (tokens 10, 11)
+                logits = logits.at[10 + call_count[0] - 1].add(mx.array(200.0))
+            elif call_count[0] == 3:
+                # Token 3: </think>
+                logits = logits.at[THINK_END].add(mx.array(200.0))
+            elif call_count[0] <= 5:
+                # Tokens 4-5: response (tokens 20, 21)
+                logits = logits.at[20 + call_count[0] - 4].add(mx.array(200.0))
+            else:
+                # EOS
+                logits = logits.at[0].add(mx.array(200.0))
+            return logits
+
+        decoded = {
+            10: "think", 11: "ing",
+            20: "ans", 21: "wer",
+        }
+
+        ctx = InferenceContext(
+            registry=MagicMock(),
+            forward_fn=fake_forward,
+            tokenizer_decode=lambda ids: "".join(decoded.get(i, "") for i in ids),
+            tokenizer_encode=lambda s: [1, 2, 3],
+            embeddings=MagicMock(),
+            grammar_guide_factory=lambda s: None,
+            mlx_grammar_guide_factory=None,
+            formatter=MagicMock(),
+            backend="mlx",
+            model_id="test-model",
+            stop_token_ids=[0],
+            think_end_token_id=THINK_END,
+        )
+        # Make formatter.format_messages work
+        ctx.formatter.format_messages = MagicMock(return_value="prompt")
+
+        app = create_app(ctx)
+        client = TestClient(app)
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 20,
+            "temperature": 0.0,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        msg = data["choices"][0]["message"]
+        assert msg["content"] == "answer"
+        assert msg["reasoning_content"] == "thinking"
