@@ -821,3 +821,110 @@ class TestGenerateRequestParams:
             # Should use default transport_config
             transport_cfg = call_args[0][3]
             assert transport_cfg is default_transport
+
+
+# --- OpenAI-compatible endpoint tests ---
+
+
+class TestOpenAIModels:
+    """GET /v1/models returns model list."""
+
+    def test_models_endpoint(self) -> None:
+        from fastapi.testclient import TestClient
+        from tgirl.serve import InferenceContext, create_app
+
+        ctx = InferenceContext(
+            registry=MagicMock(),
+            forward_fn=lambda ids: None,
+            tokenizer_decode=lambda ids: "",
+            tokenizer_encode=lambda s: [],
+            embeddings=MagicMock(),
+            grammar_guide_factory=lambda s: None,
+            mlx_grammar_guide_factory=None,
+            formatter=MagicMock(),
+            backend="mlx",
+            model_id="Qwen/Qwen3.5-0.8B",
+            stop_token_ids=[0],
+        )
+        app = create_app(ctx)
+        client = TestClient(app)
+        resp = client.get("/v1/models")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "list"
+        assert len(data["data"]) == 1
+        assert data["data"][0]["id"] == "Qwen/Qwen3.5-0.8B"
+        assert data["data"][0]["object"] == "model"
+
+
+class TestOpenAIChatCompletions:
+    """POST /v1/chat/completions — non-streaming."""
+
+    @pytest.fixture()
+    def mock_app(self):
+        """App with a mock forward_fn that returns predictable logits."""
+        import mlx.core as mx
+        from fastapi.testclient import TestClient
+        from tgirl.serve import InferenceContext, create_app
+
+        vocab_size = 100
+        call_count = [0]
+
+        def fake_forward(token_ids):
+            call_count[0] += 1
+            logits = mx.zeros((vocab_size,))
+            # Always pick token 42, then EOS (token 0) on second call
+            if call_count[0] <= 3:
+                logits = logits.at[42].add(mx.array(100.0))
+            else:
+                logits = logits.at[0].add(mx.array(100.0))  # EOS
+            return logits
+
+        ctx = InferenceContext(
+            registry=MagicMock(),
+            forward_fn=fake_forward,
+            tokenizer_decode=lambda ids: "hello world",
+            tokenizer_encode=lambda s: [1, 2, 3],
+            embeddings=MagicMock(),
+            grammar_guide_factory=lambda s: None,
+            mlx_grammar_guide_factory=None,
+            formatter=MagicMock(),
+            backend="mlx",
+            model_id="test-model",
+            stop_token_ids=[0],
+        )
+        app = create_app(ctx)
+        return TestClient(app), call_count
+
+    def test_basic_completion(self, mock_app) -> None:
+        client, _ = mock_app
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 10,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "chat.completion"
+        assert data["model"] == "test-model"
+        assert len(data["choices"]) == 1
+        assert data["choices"][0]["message"]["role"] == "assistant"
+        assert data["choices"][0]["message"]["content"] == "hello world"
+        assert data["choices"][0]["finish_reason"] in ("stop", "length")
+        assert data["usage"]["prompt_tokens"] == 3
+        assert data["usage"]["completion_tokens"] > 0
+        assert data["usage"]["total_tokens"] > 0
+
+    def test_missing_model_returns_422(self, mock_app) -> None:
+        client, _ = mock_app
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+        assert resp.status_code == 422
+
+    def test_missing_messages_returns_422(self, mock_app) -> None:
+        client, _ = mock_app
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+        })
+        assert resp.status_code == 422

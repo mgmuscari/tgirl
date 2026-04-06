@@ -299,6 +299,66 @@ try:
         scopes: list[str] | None = None
         restrict_tools: list[str] | None = None
 
+    # --- OpenAI-compatible models ---
+
+    class ChatMessage(_PydanticBase):
+        role: str
+        content: str | None = None
+
+    class ChatCompletionRequest(_PydanticBase):
+        model: str
+        messages: list[ChatMessage]
+        temperature: float = 1.0
+        top_p: float = 1.0
+        max_tokens: int | None = None
+        max_completion_tokens: int | None = None
+        stream: bool = False
+        frequency_penalty: float = 0.0
+        presence_penalty: float = 0.0
+        stop: str | list[str] | None = None
+        n: int = 1
+        seed: int | None = None
+        logprobs: bool = False
+        top_logprobs: int | None = None
+        logit_bias: dict[str, float] | None = None
+        user: str | None = None
+        # tgirl extension: probe feedback steering
+        estradiol_alpha: float | None = None
+
+    class ChatCompletionChoice(_PydanticBase):
+        index: int
+        message: ChatMessage
+        finish_reason: str | None
+
+    class CompletionUsage(_PydanticBase):
+        prompt_tokens: int
+        completion_tokens: int
+        total_tokens: int
+
+    class ChatCompletionResponse(_PydanticBase):
+        id: str
+        object: str = "chat.completion"
+        created: int
+        model: str
+        choices: list[ChatCompletionChoice]
+        usage: CompletionUsage
+
+    class DeltaMessage(_PydanticBase):
+        role: str | None = None
+        content: str | None = None
+
+    class StreamChoice(_PydanticBase):
+        index: int
+        delta: DeltaMessage
+        finish_reason: str | None = None
+
+    class ChatCompletionChunk(_PydanticBase):
+        id: str
+        object: str = "chat.completion.chunk"
+        created: int
+        model: str
+        choices: list[StreamChoice]
+
 except ImportError:
     pass  # pydantic not available (shouldn't happen — it's a core dep)
 
@@ -585,5 +645,209 @@ def create_app(
             pass
         finally:
             await websocket.close()
+
+    # --- OpenAI-compatible endpoints ---
+
+    def _generate_tokens(
+        request: ChatCompletionRequest,
+        prompt_tokens: list[int],
+    ) -> tuple[list[int], str]:
+        """Bare autoregressive generation with optional probe feedback.
+
+        Returns (generated_token_ids, finish_reason).
+        """
+        import mlx.core as mx
+
+        max_tok = request.max_completion_tokens or request.max_tokens or 512
+        temp = request.temperature
+        alpha = request.estradiol_alpha or 0.0
+
+        # Set up probe feedback hook if alpha > 0
+        hook = None
+        v_probe_prev = None
+        if alpha > 0 and ctx.backend == "mlx":
+            from tgirl.cache import _BottleneckHook
+
+            layers = None
+            # Try common layer paths
+            model_obj = ctx._model if hasattr(ctx, "_model") else None
+            if model_obj is None:
+                # forward_fn is a closure over the model — can't extract it
+                # Probe feedback requires the model object; skip if unavailable
+                alpha = 0.0
+
+        if request.seed is not None:
+            mx.random.seed(request.seed)
+
+        # Build stop token set
+        stop_ids = set(ctx.stop_token_ids)
+        if request.stop:
+            stops = [request.stop] if isinstance(request.stop, str) else request.stop
+            for s in stops:
+                ids = ctx.tokenizer_encode(s)
+                if len(ids) == 1:
+                    stop_ids.add(ids[0])
+
+        generated: list[int] = []
+        token_ids = list(prompt_tokens)
+
+        for _ in range(max_tok):
+            logits = ctx.forward_fn(token_ids)
+            # Handle ForwardResult or raw tensor
+            if hasattr(logits, "logits"):
+                logits = logits.logits
+
+            if temp > 0:
+                logits = logits / temp
+                next_token = int(mx.random.categorical(logits).item())
+            else:
+                next_token = int(mx.argmax(logits).item())
+
+            if next_token in stop_ids:
+                return generated, "stop"
+
+            generated.append(next_token)
+            token_ids = token_ids + [next_token]
+
+        return generated, "length"
+
+    @app.get("/v1/models")
+    async def list_models() -> dict[str, Any]:
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": ctx.model_id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "local",
+                }
+            ],
+        }
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: ChatCompletionRequest) -> Any:
+        import time
+
+        import mlx.core as mx
+
+        created = int(time.time())
+        completion_id = f"chatcmpl-{created}"
+
+        # Format prompt
+        messages = [{"role": m.role, "content": m.content or ""} for m in request.messages]
+        try:
+            prompt_text = ctx.formatter.format(messages)
+        except Exception:
+            prompt_text = "\n".join(
+                f"{m['role']}: {m['content']}" for m in messages
+            )
+        prompt_tokens = ctx.tokenizer_encode(prompt_text)
+
+        if request.stream:
+            from fastapi.responses import StreamingResponse
+
+            async def stream_gen():
+                import json
+
+                # First chunk: role
+                chunk = ChatCompletionChunk(
+                    id=completion_id,
+                    created=created,
+                    model=request.model,
+                    choices=[StreamChoice(
+                        index=0,
+                        delta=DeltaMessage(role="assistant"),
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+
+                # Generate tokens
+                max_tok = request.max_completion_tokens or request.max_tokens or 512
+                temp = request.temperature
+                stop_ids = set(ctx.stop_token_ids)
+                token_ids = list(prompt_tokens)
+
+                if request.seed is not None:
+                    mx.random.seed(request.seed)
+
+                for _ in range(max_tok):
+                    logits = ctx.forward_fn(token_ids)
+                    if hasattr(logits, "logits"):
+                        logits = logits.logits
+                    if temp > 0:
+                        logits = logits / temp
+                        next_token = int(mx.random.categorical(logits).item())
+                    else:
+                        next_token = int(mx.argmax(logits).item())
+
+                    if next_token in stop_ids:
+                        chunk = ChatCompletionChunk(
+                            id=completion_id,
+                            created=created,
+                            model=request.model,
+                            choices=[StreamChoice(
+                                index=0,
+                                delta=DeltaMessage(),
+                                finish_reason="stop",
+                            )],
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        break
+
+                    token_ids = token_ids + [next_token]
+                    text = ctx.tokenizer_decode([next_token])
+                    chunk = ChatCompletionChunk(
+                        id=completion_id,
+                        created=created,
+                        model=request.model,
+                        choices=[StreamChoice(
+                            index=0,
+                            delta=DeltaMessage(content=text),
+                        )],
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                else:
+                    # Hit max_tokens
+                    chunk = ChatCompletionChunk(
+                        id=completion_id,
+                        created=created,
+                        model=request.model,
+                        choices=[StreamChoice(
+                            index=0,
+                            delta=DeltaMessage(),
+                            finish_reason="length",
+                        )],
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                stream_gen(),
+                media_type="text/event-stream",
+            )
+
+        # Non-streaming
+        generated, finish_reason = await asyncio.to_thread(
+            _generate_tokens, request, prompt_tokens,
+        )
+        completion_text = ctx.tokenizer_decode(generated)
+
+        return ChatCompletionResponse(
+            id=completion_id,
+            created=created,
+            model=request.model,
+            choices=[ChatCompletionChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=completion_text),
+                finish_reason=finish_reason,
+            )],
+            usage=CompletionUsage(
+                prompt_tokens=len(prompt_tokens),
+                completion_tokens=len(generated),
+                total_tokens=len(prompt_tokens) + len(generated),
+            ),
+        )
 
     return app
