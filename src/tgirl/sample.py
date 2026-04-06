@@ -478,6 +478,8 @@ class ConstrainedGenerationResult(BaseModel):
     backtrack_requested: bool = False
     backtrack_checkpoint: Checkpoint | None = None
     backtrack_events: list[Any] = []
+    estradiol_alphas: list[list[float]] | None = None
+    estradiol_deltas: list[list[float]] | None = None
 
 
 def run_constrained_generation(
