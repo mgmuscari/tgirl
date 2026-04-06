@@ -50,6 +50,7 @@ class InferenceContext:
     stop_token_ids: list[int]
     think_end_token_id: int | None = None  # </think> token for reasoning models
     bottleneck_hook: Any | None = None  # _BottleneckHook for probe feedback
+    estradiol_file: Any | None = None  # CalibrationResult for behavioral diagnostics
 
 
 # --- Backend detection helpers ---
@@ -131,6 +132,7 @@ def load_inference_context(
     backend: str = "auto",
     bottleneck_layer: int | None = None,
     layer_path: str | None = None,
+    estradiol_path: str | None = None,
 ) -> InferenceContext:
     """Load model and construct all SamplingSession dependencies.
 
@@ -153,7 +155,7 @@ def load_inference_context(
     resolved_backend = _resolve_backend(backend)
 
     if resolved_backend == "mlx":
-        return _build_mlx_context(model_id, bottleneck_layer, layer_path)
+        return _build_mlx_context(model_id, bottleneck_layer, layer_path, estradiol_path)
     return _build_torch_context(model_id)
 
 
@@ -194,6 +196,7 @@ def _build_mlx_context(
     model_id: str,
     bottleneck_layer: int | None = None,
     layer_path: str | None = None,
+    estradiol_path: str | None = None,
 ) -> InferenceContext:
     """Build InferenceContext for MLX backend."""
     import mlx.core as mx
@@ -251,11 +254,80 @@ def _build_mlx_context(
                 layer_path=layer_path,
             )
 
+    # Load .estradiol calibration for behavioral diagnostics
+    cal = None
+    if estradiol_path is not None:
+        from tgirl.estradiol import load_estradiol
+
+        cal = load_estradiol(estradiol_path)
+        logger.info("estradiol_loaded", path=estradiol_path, K=cal.K)
+        # Use calibration's bottleneck layer if hook not already set
+        if hook is None and cal.bottleneck_layer is not None:
+            from tgirl.cache import _BottleneckHook
+
+            if layer_path is None:
+                for candidate in ["language_model.model.layers", "model.layers"]:
+                    obj = model
+                    try:
+                        for attr in candidate.split("."):
+                            obj = getattr(obj, attr)
+                        layer_path = candidate
+                        break
+                    except AttributeError:
+                        continue
+            if layer_path is not None:
+                layers = model
+                for attr in layer_path.split("."):
+                    layers = getattr(layers, attr)
+                hook = _BottleneckHook(layers, layer_idx=cal.bottleneck_layer)
+                hook.install()
+                logger.info(
+                    "bottleneck_hook_from_estradiol",
+                    layer=cal.bottleneck_layer,
+                )
+    else:
+        # Auto-detect: look for <model_id_slug>.estradiol in cwd
+        import pathlib
+
+        slug = model_id.replace("/", "_")
+        for candidate in [f"{slug}.estradiol", f"{model_id.split('/')[-1]}.estradiol"]:
+            p = pathlib.Path(candidate)
+            if p.exists():
+                from tgirl.estradiol import load_estradiol
+
+                cal = load_estradiol(str(p))
+                logger.info("estradiol_autodetected", path=str(p), K=cal.K)
+                if hook is None:
+                    from tgirl.cache import _BottleneckHook
+
+                    if layer_path is None:
+                        for lp_candidate in ["language_model.model.layers", "model.layers"]:
+                            obj = model
+                            try:
+                                for attr in lp_candidate.split("."):
+                                    obj = getattr(obj, attr)
+                                layer_path = lp_candidate
+                                break
+                            except AttributeError:
+                                continue
+                    if layer_path is not None:
+                        layers = model
+                        for attr in layer_path.split("."):
+                            layers = getattr(layers, attr)
+                        hook = _BottleneckHook(layers, layer_idx=cal.bottleneck_layer)
+                        hook.install()
+                        logger.info(
+                            "bottleneck_hook_from_estradiol",
+                            layer=cal.bottleneck_layer,
+                        )
+                break
+
     logger.info(
         "mlx_model_loaded",
         model_id=model_id,
         vocab_size=embeddings.shape[0],
         self_steering=hook is not None,
+        behavioral_diagnostics=cal is not None,
     )
 
     return InferenceContext(
@@ -272,6 +344,7 @@ def _build_mlx_context(
         stop_token_ids=stop_ids,
         think_end_token_id=think_end_id,
         bottleneck_hook=hook,
+        estradiol_file=cal,
     )
 
 
@@ -372,8 +445,8 @@ try:
         logit_bias: dict[str, float] | None = None
         user: str | None = None
         # tgirl extensions
-        estradiol_alpha: float | None = None
-        enable_thinking: bool = True  # reasoning mode for Qwen3.5 etc.
+        estradiol_alpha: float | None = None  # per-request override; uses server default
+        enable_thinking: bool = False  # set True for reasoning mode
 
     class ChatCompletionChoice(_PydanticBase):
         index: int
@@ -703,6 +776,14 @@ def create_app(
     # When a new request comes in, the cached probe steers the first token,
     # creating behavioral continuity across the conversation.
     _probe_cache: dict[str, Any] = {"v_probe": None}
+    _steering_config: dict[str, float] = {"alpha": 0.05}
+    _steering_stats: dict[str, Any] = {
+        "requests": 0,
+        "last_probe_norm": 0.0,
+        "last_correction_norm": 0.0,
+        "last_alpha": 0.0,
+        "probe_cached": False,
+    }
 
     def _generate_tokens(
         request: ChatCompletionRequest,
@@ -720,10 +801,10 @@ def create_app(
         """
         import mlx.core as mx
 
-        max_tok = request.max_completion_tokens or request.max_tokens or 512
+        max_tok = request.max_completion_tokens or request.max_tokens or 1024
         temp = request.temperature
         hook = ctx.bottleneck_hook
-        alpha = request.estradiol_alpha or 0.0
+        alpha = request.estradiol_alpha if request.estradiol_alpha is not None else _steering_config["alpha"]
 
         if request.seed is not None:
             mx.random.seed(request.seed)
@@ -739,6 +820,10 @@ def create_app(
 
         # Initialize probe from cache (behavioral continuity across turns)
         v_probe_prev = _probe_cache.get("v_probe")
+        _steering_stats["requests"] += 1
+        _steering_stats["last_alpha"] = alpha
+        _steering_stats["probe_cached"] = v_probe_prev is not None
+        correction_norms: list[float] = []
 
         generated: list[int] = []
         token_ids = list(prompt_tokens)
@@ -746,7 +831,9 @@ def create_app(
         for _ in range(max_tok):
             # Steer: inject scaled probe from previous token (or previous turn)
             if hook is not None and alpha > 0 and v_probe_prev is not None:
-                hook.set_raw_correction(alpha * v_probe_prev)
+                correction = alpha * v_probe_prev
+                hook.set_raw_correction(correction)
+                correction_norms.append(float(mx.linalg.norm(correction).item()))
             elif hook is not None:
                 hook.clear_steering()
 
@@ -759,6 +846,9 @@ def create_app(
                 v_probe_prev = hook.get_captured()
                 if v_probe_prev is not None:
                     mx.eval(v_probe_prev)
+                    _steering_stats["last_probe_norm"] = float(
+                        mx.linalg.norm(v_probe_prev).item()
+                    )
 
             if temp > 0:
                 logits = logits / temp
@@ -767,14 +857,23 @@ def create_app(
                 next_token = int(mx.argmax(logits).item())
 
             if next_token in stop_ids:
-                # Cache the final probe for next turn
                 _probe_cache["v_probe"] = v_probe_prev
+                if correction_norms:
+                    _steering_stats["last_correction_norm"] = correction_norms[-1]
+                    _steering_stats["mean_correction_norm"] = (
+                        sum(correction_norms) / len(correction_norms)
+                    )
                 return generated, "stop"
 
             generated.append(next_token)
             token_ids = token_ids + [next_token]
 
         _probe_cache["v_probe"] = v_probe_prev
+        if correction_norms:
+            _steering_stats["last_correction_norm"] = correction_norms[-1]
+            _steering_stats["mean_correction_norm"] = (
+                sum(correction_norms) / len(correction_norms)
+            )
         return generated, "length"
 
     @app.get("/v1/models")
@@ -790,6 +889,64 @@ def create_app(
                 }
             ],
         }
+
+    @app.post("/v1/steering/alpha")
+    async def set_alpha(alpha: float) -> dict[str, Any]:
+        _steering_config["alpha"] = alpha
+        logger.info("alpha_updated", alpha=alpha)
+        return {"alpha": alpha}
+
+    @app.post("/v1/steering/probe/save")
+    async def save_probe(path: str = "session_probe.npy") -> dict[str, Any]:
+        """Save the cached probe vector to disk."""
+        import mlx.core as _mx
+        import numpy as np
+
+        v = _probe_cache.get("v_probe")
+        if v is None:
+            return {"error": "no probe cached"}
+        np.save(path, np.array(v))
+        norm = float(_mx.linalg.norm(v).item())
+        logger.info("probe_saved", path=path, norm=norm)
+        return {"saved": path, "norm": norm, "shape": list(v.shape)}
+
+    @app.post("/v1/steering/probe/load")
+    async def load_probe(path: str = "session_probe.npy") -> dict[str, Any]:
+        """Load a probe vector from disk into the cache."""
+        import mlx.core as _mx
+        import numpy as np
+
+        arr = np.load(path)
+        _probe_cache["v_probe"] = _mx.array(arr)
+        norm = float(_mx.linalg.norm(_probe_cache["v_probe"]).item())
+        logger.info("probe_loaded", path=path, norm=norm)
+        return {"loaded": path, "norm": norm, "shape": list(arr.shape)}
+
+    @app.get("/v1/steering/status")
+    async def steering_status() -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "hook_installed": ctx.bottleneck_hook is not None,
+            "probe_cached": _probe_cache.get("v_probe") is not None,
+            **_steering_stats,
+        }
+        # Project cached probe onto behavioral codebook for diagnostics
+        v = _probe_cache.get("v_probe")
+        if v is not None and ctx.estradiol_file is not None:
+            import mlx.core as mx
+
+            cal = ctx.estradiol_file
+            coords = {}
+            for name, trait_vec in cal.trait_map.items():
+                # Cosine similarity with trait direction in activation space
+                full_vec = cal.V_basis @ trait_vec  # (d_model,)
+                cos = float((v @ full_vec).item()) / (
+                    float(mx.linalg.norm(v).item())
+                    * float(mx.linalg.norm(full_vec).item())
+                    + 1e-10
+                )
+                coords[name] = round(cos, 4)
+            result["behavioral_state"] = coords
+        return result
 
     def _format_prompt(
         request: ChatCompletionRequest,
@@ -855,15 +1012,19 @@ def create_app(
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
-                max_tok = request.max_completion_tokens or request.max_tokens or 512
+                max_tok = request.max_completion_tokens or request.max_tokens or 1024
                 temp = request.temperature
                 stop_ids = set(ctx.stop_token_ids)
                 token_ids = list(prompt_tokens)
                 think_end = ctx.think_end_token_id
                 in_thinking = request.enable_thinking and think_end is not None
                 hook = ctx.bottleneck_hook
-                alpha = request.estradiol_alpha or 0.0
+                alpha = request.estradiol_alpha if request.estradiol_alpha is not None else _steering_config["alpha"]
                 v_probe_prev = _probe_cache.get("v_probe")
+                generated_tokens: list[int] = []
+                _steering_stats["requests"] += 1
+                _steering_stats["last_alpha"] = alpha
+                _steering_stats["probe_cached"] = v_probe_prev is not None
 
                 if request.seed is not None:
                     mx.random.seed(request.seed)
@@ -883,6 +1044,9 @@ def create_app(
                         v_probe_prev = hook.get_captured()
                         if v_probe_prev is not None:
                             mx.eval(v_probe_prev)
+                            _steering_stats["last_probe_norm"] = float(
+                                mx.linalg.norm(v_probe_prev).item()
+                            )
 
                     if temp > 0:
                         logits = logits / temp
@@ -903,6 +1067,12 @@ def create_app(
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
                         _probe_cache["v_probe"] = v_probe_prev
+                        response_text = ctx.tokenizer_decode(generated_tokens)
+                        logger.info(
+                            "stream_complete",
+                            tokens=len(generated_tokens),
+                            response=response_text[:200],
+                        )
                         break
 
                     # Detect end-of-thinking transition
@@ -912,6 +1082,7 @@ def create_app(
                         continue  # don't emit the </think> token
 
                     token_ids = token_ids + [next_token]
+                    generated_tokens.append(next_token)
                     text = ctx.tokenizer_decode([next_token])
 
                     if in_thinking:
@@ -949,6 +1120,12 @@ def create_app(
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     _probe_cache["v_probe"] = v_probe_prev
+                    response_text = ctx.tokenizer_decode(generated_tokens)
+                    logger.info(
+                        "stream_complete_length",
+                        tokens=len(generated_tokens),
+                        response=response_text[:200],
+                    )
 
                 yield "data: [DONE]\n\n"
 
