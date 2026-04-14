@@ -192,25 +192,37 @@ def _render_ascii_table(rows: list[dict[str, Any]]) -> str:
         xs2 = [x for x in xs if x is not None]
         return sum(xs2) / len(xs2) if xs2 else float("nan")
 
+    def _fraction_stopped(group: list[dict[str, Any]]) -> float:
+        """How many turns ended with finish_reason=='stop' (as opposed to
+        'length' = hit the max_tokens ceiling). A sudden jump toward 1.0
+        at high α is a cliff signature: the steered attractor produces
+        short emissions, ending on EOS far before the budget.
+        """
+        if not group:
+            return 0.0
+        return sum(1 for r in group if r.get("finish_reason") == "stop") / len(group)
+
     lines = []
     lines.append(
-        "  α   β   skew  │  H_norm   novelty  repeat   probe_norm │  regime"
+        "  α   β   skew │  H_norm  novelty  repeat │  n_tok  stop% │  pn   │ regime"
     )
     lines.append(
-        "─" * 4
-        + "─┼─".join(["", "─" * 30, "─" * 18, "─" * 10])
+        "───────────────┼─────────────────────────┼───────────────┼───────┼────────"
     )
     for (alpha, beta, skew), group in sorted(by_key.items()):
         h = _mean([r["token_entropy"] for r in group])
         nov = _mean([r["bigram_novelty"] for r in group])
         rep = _mean([r["repeat_rate"] for r in group])
         pn = _mean([r["probe_norm"] for r in group])
+        n_tok = _mean([r["n_tokens"] for r in group])
+        stop_frac = _fraction_stopped(group)
         beta_s = f"{beta:.2f}" if beta is not None else "∞  "
         regime = _classify_regime(h)
         lines.append(
             f"  {alpha:.2f}  {beta_s}  {skew:.2f} │  "
-            f"{h:.3f}   {nov:.3f}   {rep:.3f}    {pn:.2f}    "
-            f"│  {regime}"
+            f"{h:.3f}   {nov:.3f}   {rep:.3f} │  "
+            f"{n_tok:5.0f}   {stop_frac*100:3.0f}% │  "
+            f"{pn:.2f}  │ {regime}"
         )
     return "\n".join(lines)
 
