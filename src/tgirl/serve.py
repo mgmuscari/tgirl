@@ -902,7 +902,6 @@ def create_app(
         "last_probe_norm": 0.0,
         "last_correction_norm": 0.0,
         "last_alpha": 0.0,
-        "probe_cached": False,
     }
 
     def _generate_tokens(
@@ -942,7 +941,6 @@ def create_app(
         v_probe_prev = _probe_cache.get("v_probe")
         _steering_stats["requests"] += 1
         _steering_stats["last_alpha"] = alpha
-        _steering_stats["probe_cached"] = v_probe_prev is not None
         correction_norms: list[float] = []
 
         generated: list[int] = []
@@ -1044,9 +1042,11 @@ def create_app(
 
     @app.get("/v1/steering/status")
     async def steering_status() -> dict[str, Any]:
-        # Unpack stats first, then override with live-computed fields so stale
-        # stats entries (e.g. the stats dict's own "probe_cached" that is only
-        # touched during generation) do not mask the source-of-truth cache.
+        # `probe_cached` and `hook_installed` are computed live from the
+        # source of truth (_probe_cache / ctx.bottleneck_hook), not stored
+        # in _steering_stats. Keep it that way: mirroring them into stats
+        # would reintroduce a mask-the-cache bug if any reader spread
+        # stats without an explicit override.
         result: dict[str, Any] = {
             **_steering_stats,
             "hook_installed": ctx.bottleneck_hook is not None,
@@ -1147,7 +1147,6 @@ def create_app(
                 generated_tokens: list[int] = []
                 _steering_stats["requests"] += 1
                 _steering_stats["last_alpha"] = alpha
-                _steering_stats["probe_cached"] = v_probe_prev is not None
 
                 if request.seed is not None:
                     mx.random.seed(request.seed)
