@@ -638,6 +638,151 @@ class TestBottleneckHook:
         finally:
             hook.uninstall()
 
+    # --- Band steering (β + skewed-Gaussian layer spreading) ---
+    #
+    # These tests use a tiny fake-layer list (not the real Qwen model)
+    # because band *weighting math* is architectural and doesn't need
+    # a real transformer. Semantic validity of off-bottleneck codebook
+    # injection is an empirical question handled by the smoke test,
+    # not by unit tests. .item() on MLX scalars forces materialization
+    # without an explicit mx.eval call.
+
+    def _make_fake_layers(self, n: int) -> list[Any]:
+        """Build a list of identity layers sharing one class.
+
+        The hook patches `type(target).__call__`, so the patched call
+        fires for every instance of this class — exactly what the band
+        needs to test multi-layer injection.
+        """
+
+        class FakeLayer:
+            def __init__(self, idx: int) -> None:
+                self.idx = idx
+
+            def __call__(self, x: Any) -> Any:
+                return x  # identity — leaves correction visible
+
+        return [FakeLayer(i) for i in range(n)]
+
+    def test_default_is_single_layer_injection_bit_compatible(self) -> None:
+        """Without set_band, only the bottleneck layer gets correction —
+        matches pre-band behavior bit-for-bit.
+        """
+        from tgirl.cache import _BottleneckHook
+
+        layers = self._make_fake_layers(7)
+        hook = _BottleneckHook(layers, layer_idx=3)
+        hook.install()
+        try:
+            hook.set_raw_correction(mx.ones((4,)))
+            x = mx.zeros((1, 1, 4))
+            outs = [layers[i](x) for i in range(7)]
+            max_per_layer = [float(mx.max(o).item()) for o in outs]
+            expected = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+            assert max_per_layer == pytest.approx(expected)
+        finally:
+            hook.uninstall()
+
+    def test_set_band_spreads_correction_across_layers(self) -> None:
+        """With a finite β, correction lands on the bottleneck and
+        its neighbors with weights that sum to 1 across the band.
+        """
+        from tgirl.cache import _BottleneckHook
+
+        layers = self._make_fake_layers(11)
+        hook = _BottleneckHook(layers, layer_idx=5)
+        hook.install()
+        try:
+            from tgirl.band import band_weights
+
+            hook.set_band(
+                band_weights(
+                    n_layers=len(layers),
+                    bottleneck_idx=hook._layer_idx,
+                    beta=0.7,
+                    skew=1.0,
+                )
+            )
+            hook.set_raw_correction(mx.ones((4,)))
+            x = mx.zeros((1, 1, 4))
+            outs = [layers[i](x) for i in range(11)]
+            max_per_layer = [float(mx.max(o).item()) for o in outs]
+
+            # Weights sum to 1 → max values sum to 1 too
+            assert sum(max_per_layer) == pytest.approx(1.0, abs=1e-5)
+            # Peak at bottleneck
+            assert max_per_layer[5] == pytest.approx(max(max_per_layer))
+            # Symmetric (skew=1)
+            assert max_per_layer[4] == pytest.approx(max_per_layer[6])
+            assert max_per_layer[3] == pytest.approx(max_per_layer[7])
+        finally:
+            hook.uninstall()
+
+    def test_set_band_none_restores_single_layer(self) -> None:
+        """set_band(None) after setting a finite β returns the hook
+        to single-layer injection.
+        """
+        from tgirl.cache import _BottleneckHook
+
+        layers = self._make_fake_layers(7)
+        hook = _BottleneckHook(layers, layer_idx=3)
+        hook.install()
+        try:
+            from tgirl.band import band_weights
+
+            hook.set_band(
+                band_weights(
+                    n_layers=len(layers),
+                    bottleneck_idx=hook._layer_idx,
+                    beta=0.5,
+                    skew=1.0,
+                )
+            )
+            hook.set_band(None)
+            hook.set_raw_correction(mx.ones((4,)))
+            x = mx.zeros((1, 1, 4))
+            outs = [layers[i](x) for i in range(7)]
+            max_per_layer = [float(mx.max(o).item()) for o in outs]
+            expected = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+            assert max_per_layer == pytest.approx(expected)
+        finally:
+            hook.uninstall()
+
+    def test_band_does_not_broaden_capture_site(self) -> None:
+        """Probe capture is bottleneck-only regardless of band width —
+        the band is an *injection* distribution; capture stays the
+        source of behavioral state.
+        """
+        from tgirl.cache import _BottleneckHook
+
+        layers = self._make_fake_layers(11)
+        hook = _BottleneckHook(layers, layer_idx=5)
+        hook.install()
+        try:
+            from tgirl.band import band_weights
+
+            hook.set_band(
+                band_weights(
+                    n_layers=len(layers),
+                    bottleneck_idx=hook._layer_idx,
+                    beta=0.7,
+                    skew=1.0,
+                )
+            )
+            # Each layer receives a distinct marker; capture should
+            # only record the one that hit the bottleneck layer.
+            for i, layer in enumerate(layers):
+                marker = mx.ones((1, 1, 4)) * float(i + 1)
+                _ = layer(marker)
+
+            captured = hook.get_captured()
+            assert captured is not None
+            # Last capture at layer 5 means marker=6.0 (i+1 for i=5)
+            captured_max = float(mx.max(captured).item())
+            assert captured_max == pytest.approx(6.0)
+        finally:
+            hook.uninstall()
+
 
 class TestSteerableMLXForwardFn:
     """make_steerable_mlx_forward_fn: forward with optional probe/inject."""

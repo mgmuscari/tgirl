@@ -54,6 +54,12 @@ class _BottleneckHook:
         self._V_basis: Any = None  # (d_model, K) for codebook injection
         self._delta_alpha: Any = None  # (K,) correction for codebook injection
         self._raw_correction: Any = None  # (d_model,) raw injection vector
+        # Band injection: {id(layer) -> weight}. None ⇒ single-layer
+        # (weight 1.0 at the bottleneck only). When set by set_band,
+        # correction is spread across a neighborhood of layers with
+        # mass-preserving weights that sum to 1 — so α controls total
+        # correction magnitude independently of β.
+        self._band_weights_by_id: dict[int, float] | None = None
         self._installed = False
 
     def install(self) -> None:
@@ -65,18 +71,36 @@ class _BottleneckHook:
 
         def _patched(layer_self: Any, x: Any, *args: Any, **kwargs: Any) -> Any:
             result = hook._original_call(layer_self, x, *args, **kwargs)
+
+            # Capture stays bottleneck-only regardless of band config:
+            # the band is an *injection* distribution, not a capture one.
             if layer_self is hook._target:
                 import mlx.core as mx
 
-                # Capture last-token activation (float32)
                 hook._captured = result[:, -1, :].astype(mx.float32).reshape(-1)
 
-                # Inject: raw correction or codebook projection
+            # Determine the injection weight at this layer.
+            if hook._band_weights_by_id is None:
+                # Single-layer (pre-band) default: full weight at target only.
+                weight = 1.0 if layer_self is hook._target else None
+            else:
+                weight = hook._band_weights_by_id.get(id(layer_self))
+
+            if weight is not None:
                 if hook._raw_correction is not None:
-                    result = result + hook._raw_correction.reshape(1, 1, -1)
-                elif hook._V_basis is not None and hook._delta_alpha is not None:
-                    correction = hook._V_basis @ hook._delta_alpha  # (d_model,)
-                    result = result + correction.reshape(1, 1, -1)
+                    result = result + (
+                        weight * hook._raw_correction
+                    ).reshape(1, 1, -1)
+                elif (
+                    hook._V_basis is not None
+                    and hook._delta_alpha is not None
+                ):
+                    # Codebook projection; (d_model,) correction spread
+                    # across the band per the user's "keep the codebook"
+                    # hunch that V_basis stays approximately valid in a
+                    # small neighborhood of the calibration layer.
+                    correction = hook._V_basis @ hook._delta_alpha
+                    result = result + (weight * correction).reshape(1, 1, -1)
             return result
 
         self._layer_type.__call__ = _patched
@@ -107,6 +131,27 @@ class _BottleneckHook:
     def set_raw_correction(self, correction: Any) -> None:
         """Set a raw (d_model,) vector to inject. Bypasses codebook."""
         self._raw_correction = correction
+
+    def set_band(self, weights: dict[int, float] | None) -> None:
+        """Configure multi-layer injection via a pre-computed weight map.
+
+        Args:
+            weights: ``{layer_idx: weight}``. ``None`` restores the
+                single-layer default (correction applies at the
+                bottleneck only with weight 1.0 — bit-compatible with
+                the pre-band hook). When provided, correction is
+                spread across every named layer scaled by its weight.
+                Callers typically produce this via
+                ``tgirl.band.band_weights(...)``; the hook stays
+                dependency-free per the cache.py zero-coupling
+                invariant.
+        """
+        if weights is None:
+            self._band_weights_by_id = None
+            return
+        self._band_weights_by_id = {
+            id(self._layers[idx]): w for idx, w in weights.items()
+        }
 
     def clear_steering(self) -> None:
         """Disable injection."""
