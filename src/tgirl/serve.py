@@ -602,9 +602,18 @@ def create_app(
         logger.info(event, path=path, shape=list(v.shape))
 
     async def _autosave_loop(path: str, interval_s: float) -> None:
+        # Swallow write failures so a transient I/O error (disk full,
+        # permissions, flaky fs) does not kill the task. A dead task
+        # would make `await autosave_task` in the lifespan finally
+        # re-raise its original exception, bypassing the
+        # `except CancelledError` guard and preventing the final
+        # shutdown save — the very error path persistence protects.
         while True:
             await asyncio.sleep(interval_s)
-            _write_probe(path, "probe_autosaved")
+            try:
+                _write_probe(path, "probe_autosaved")
+            except Exception:
+                logger.exception("probe_autosave_failed", path=path)
 
     @asynccontextmanager
     async def _lifespan(_app: Any):
