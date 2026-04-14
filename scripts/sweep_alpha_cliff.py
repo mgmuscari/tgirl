@@ -258,7 +258,20 @@ def main() -> int:
         "--beta",
         type=float,
         default=None,
-        help="β for all runs (None = single-layer baseline).",
+        help=(
+            "β for all runs (None = single-layer baseline). Ignored if "
+            "--beta-values is set."
+        ),
+    )
+    parser.add_argument(
+        "--beta-values",
+        default=None,
+        help=(
+            "Comma-separated β values to sweep, in addition to α. "
+            "Use 'None' for the single-layer baseline (e.g. "
+            "'None,1.0,0.5,0.25'). When set, the sweep walks the "
+            "Cartesian product (α × β)."
+        ),
     )
     parser.add_argument(
         "--skew",
@@ -296,6 +309,17 @@ def main() -> int:
 
     alpha_list = [float(v.strip()) for v in ns.alpha_values.split(",")]
 
+    def _parse_beta(tok: str) -> float | None:
+        tok = tok.strip()
+        if tok.lower() in ("none", "inf"):
+            return None
+        return float(tok)
+
+    if ns.beta_values is not None:
+        beta_list = [_parse_beta(v) for v in ns.beta_values.split(",")]
+    else:
+        beta_list = [ns.beta]
+
     workdir = Path(tempfile.mkdtemp(prefix="tgirl-sweep-"))
     print(f"workdir: {workdir}", file=sys.stderr)
 
@@ -327,30 +351,35 @@ def main() -> int:
         )
 
         for alpha in alpha_list:
-            # Reset probe cache so each α starts from the same state.
-            _http_post(f"{base_url}/v1/steering/probe/clear")
-            for turn_idx in range(1, ns.turns + 1):
-                r = _run_turn(
-                    base_url=base_url,
-                    alpha=alpha,
-                    beta=ns.beta,
-                    skew=ns.skew,
-                    prompt=ns.prompt,
-                    model=ns.model,
-                    max_tokens=ns.max_tokens,
-                    seed=ns.seed + turn_idx,
-                )
-                r["turn_idx"] = turn_idx
-                r["regime"] = _classify_regime(r.get("token_entropy"))
-                rows.append(r)
-                print(
-                    f"[α={alpha:.2f} β={ns.beta} t={turn_idx}] "
-                    f"H={r['token_entropy']} "
-                    f"nov={r['bigram_novelty']} "
-                    f"rep={r['repeat_rate']} "
-                    f"regime={r['regime']}",
-                    file=sys.stderr,
-                )
+            for beta in beta_list:
+                # Reset probe cache so each (α, β) starts from the same
+                # state — otherwise each configuration inherits a probe
+                # shaped by the previous one and the effect is confounded.
+                _http_post(f"{base_url}/v1/steering/probe/clear")
+                for turn_idx in range(1, ns.turns + 1):
+                    r = _run_turn(
+                        base_url=base_url,
+                        alpha=alpha,
+                        beta=beta,
+                        skew=ns.skew,
+                        prompt=ns.prompt,
+                        model=ns.model,
+                        max_tokens=ns.max_tokens,
+                        seed=ns.seed + turn_idx,
+                    )
+                    r["turn_idx"] = turn_idx
+                    r["regime"] = _classify_regime(r.get("token_entropy"))
+                    rows.append(r)
+                    beta_label = "∞" if beta is None else f"{beta:.2f}"
+                    print(
+                        f"[α={alpha:.2f} β={beta_label} t={turn_idx}] "
+                        f"H={r['token_entropy']} "
+                        f"nov={r['bigram_novelty']} "
+                        f"rep={r['repeat_rate']} "
+                        f"n_tok={r['n_tokens']} "
+                        f"regime={r['regime']}",
+                        file=sys.stderr,
+                    )
     except Exception as e:
         failure = e
     finally:
