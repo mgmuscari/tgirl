@@ -645,8 +645,36 @@ def create_app(
             import mlx.core as _mx
             import numpy as np
 
+            # Log the path before loading so operators can tell which
+            # file triggered a load failure (np.load's error messages
+            # don't always include the path).
+            logger.info("probe_load_attempt", path=probe_load_path)
             arr = np.load(probe_load_path)
-            _probe_cache["v_probe"] = _mx.array(arr)
+
+            # Validate shape against the model's hidden dim. A probe
+            # saved from a different model (or a stale file from an
+            # earlier checkpoint) would otherwise silently corrupt
+            # steering — broadcast-safe arithmetic hides shape drift
+            # until deep inside the bottleneck hook's forward pass,
+            # or worse, produces wrong steering with no error at all
+            # when the dims happen to match but the basis is foreign.
+            expected_dim = ctx.embeddings.shape[-1]
+            if arr.shape != (expected_dim,):
+                msg = (
+                    f"Loaded probe shape {tuple(arr.shape)} does not "
+                    f"match model hidden dim ({expected_dim},). The "
+                    f"file at {probe_load_path} was likely saved from "
+                    f"a different model. Remove --probe-load or pass a "
+                    f"probe saved from this model."
+                )
+                raise ValueError(msg)
+
+            # Cast to float32 to match the hook's native capture
+            # dtype (see _BottleneckHook where captures are cast to
+            # float32). Prevents silent dtype promotion inside the
+            # alpha * v_probe multiply, which could shift the
+            # correction magnitude calibration.
+            _probe_cache["v_probe"] = _mx.array(arr.astype(np.float32))
             logger.info(
                 "probe_loaded_at_startup",
                 path=probe_load_path,
