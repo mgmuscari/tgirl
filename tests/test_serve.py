@@ -1713,6 +1713,124 @@ class TestBandSteering:
         assert isinstance(weights_arg, dict)
         assert sum(weights_arg.values()) == pytest.approx(1.0, abs=1e-6)
 
+    def test_autotune_disabled_by_default(self) -> None:
+        """Default state: autotuner off; per-request and server-config
+        alpha/beta/temp are honored verbatim.
+        """
+        client, _ = self._make_deterministic_app_with_hook([1])
+
+        status = client.get("/v1/steering/status").json()
+        assert status.get("autotune", {}).get("enabled") is False
+
+    def test_post_autotune_enable(self) -> None:
+        """POST /v1/steering/autotune flips the controller on."""
+        client, _ = self._make_deterministic_app_with_hook([1])
+
+        resp = client.post(
+            "/v1/steering/autotune", json={"enabled": True}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is True
+
+        status = client.get("/v1/steering/status").json()
+        assert status["autotune"]["enabled"] is True
+
+    def test_autotune_drives_next_turn_alpha_after_collapse(
+        self, tmp_path: Any
+    ) -> None:
+        """After a turn whose signature classifies as loop_collapse,
+        the NEXT turn must resolve to a reduced α — proving the
+        controller's output is being threaded back into generation.
+        """
+        import mlx.core as mx
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import InferenceContext, create_app
+
+        # Forward function emits the same token forever — pure repetition,
+        # which produces token_entropy → 0 and triggers loop_collapse.
+        vocab_size = 50
+        call_count = [0]
+        sticky_token = 7
+
+        def fake_forward(token_ids: list[int]) -> Any:
+            call_count[0] += 1
+            logits = mx.zeros((vocab_size,))
+            # Always pick token 7 — unbroken repetition. EOS only after
+            # max_tokens runs out, so we get a long collapsed turn.
+            logits = logits.at[sticky_token].add(mx.array(100.0))
+            return logits
+
+        ctx = InferenceContext(
+            registry=MagicMock(),
+            forward_fn=fake_forward,
+            tokenizer_decode=lambda ids: "x",
+            tokenizer_encode=lambda s: [1, 2, 3],
+            embeddings=MagicMock(),
+            grammar_guide_factory=lambda s: None,
+            mlx_grammar_guide_factory=None,
+            formatter=MagicMock(),
+            backend="mlx",
+            model_id="test-model",
+            stop_token_ids=[0],
+        )
+        client = TestClient(create_app(ctx))
+
+        # Enable autotune, with starting α=0.7 (loop region).
+        client.post("/v1/steering/alpha", params={"alpha": 0.7})
+        client.post("/v1/steering/autotune", json={"enabled": True})
+
+        # First turn — generates 50 of the same token; collapse signature.
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 50,
+            },
+        )
+        assert resp.status_code == 200
+
+        status = client.get("/v1/steering/status").json()
+        assert status["autotune"]["enabled"] is True
+        assert status["autotune"]["last_regime"] == "loop_collapse"
+        # Controller drove next α below the starting 0.7
+        assert status["autotune"]["next_alpha"] < 0.7
+
+    def test_autotune_logs_to_jsonl_when_path_set(
+        self, tmp_path: Any
+    ) -> None:
+        """Setting log_path on the autotune endpoint causes each
+        turn's (obs, action) tuple to be appended to a JSONL file —
+        the training set for the future learned controller.
+        """
+        import json
+
+        client, _ = self._make_deterministic_app_with_hook([42, 42, 42])
+        log_path = tmp_path / "autotune.jsonl"
+        client.post(
+            "/v1/steering/autotune",
+            json={"enabled": True, "log_path": str(log_path)},
+        )
+
+        client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 5,
+            },
+        )
+
+        assert log_path.exists()
+        records = [
+            json.loads(line) for line in log_path.read_text().splitlines() if line
+        ]
+        assert len(records) == 1
+        rec = records[0]
+        assert "observables" in rec and "action" in rec
+        assert "regime" in rec["action"]
+
     def test_status_exposes_normalization_default(self) -> None:
         """Default steering normalization is 'absolute' (bit-compat with
         pre-residual-relative behavior)."""
