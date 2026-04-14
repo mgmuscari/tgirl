@@ -585,6 +585,18 @@ def create_app(
             "autosave loop has nowhere to write."
         )
         raise ValueError(msg)
+    if (
+        probe_autosave_interval_s is not None
+        and probe_autosave_interval_s <= 0
+    ):
+        # asyncio.sleep(<=0) yields immediately, turning the autosave
+        # loop into a tight write storm that pins the event loop and
+        # saturates disk. Reject at config time.
+        msg = (
+            "probe_autosave_interval_s must be positive "
+            f"(got {probe_autosave_interval_s})."
+        )
+        raise ValueError(msg)
 
     # Probe cache: persists the last bottleneck activation across turns.
     # Hoisted above `app` construction so the lifespan handler can close

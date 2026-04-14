@@ -173,6 +173,12 @@ def serve(
             "(the autosave loop needs a destination path)."
         )
         raise click.UsageError(msg)
+    if probe_autosave_interval is not None and probe_autosave_interval <= 0:
+        msg = (
+            "--probe-autosave-interval must be positive "
+            f"(got {probe_autosave_interval})."
+        )
+        raise click.UsageError(msg)
 
     click.echo(f"Loading model: {model} (backend: {backend})")
     ctx = load_inference_context(model, backend=backend)
