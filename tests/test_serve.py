@@ -992,3 +992,25 @@ class TestOpenAIChatCompletions:
         msg = data["choices"][0]["message"]
         assert msg["content"] == "answer"
         assert msg["reasoning_content"] == "thinking"
+
+
+class TestProbePersistence:
+    """Tests for CLI-driven probe vector persistence across server restarts."""
+
+    def test_create_app_loads_probe_at_startup(self, tmp_path: Any) -> None:
+        """When probe_load_path is set, lifespan startup populates the cache."""
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        probe_path = tmp_path / "session_probe.npy"
+        np.save(probe_path, np.arange(8, dtype=np.float32))
+
+        ctx = _make_mock_ctx()
+        app = create_app(ctx, probe_load_path=str(probe_path))
+
+        with TestClient(app) as client:
+            resp = client.get("/v1/steering/status")
+            assert resp.status_code == 200
+            assert resp.json()["probe_cached"] is True

@@ -547,6 +547,7 @@ def create_app(
     session_config: SessionConfig | None = None,
     transport_config: Any = None,
     hooks: list[Any] | None = None,
+    probe_load_path: str | None = None,
 ) -> Any:
     """Create FastAPI app from a pre-loaded InferenceContext.
 
@@ -558,13 +559,37 @@ def create_app(
         session_config: Optional session configuration override.
         transport_config: Optional transport configuration override.
         hooks: Optional inference hooks.
+        probe_load_path: If set, load a probe vector from this path on
+            server startup (populates the self-steering cache).
 
     Returns:
         A FastAPI application instance.
     """
+    from contextlib import asynccontextmanager
+
     from fastapi import FastAPI
 
-    app = FastAPI(title="tgirl")
+    # Probe cache: persists the last bottleneck activation across turns.
+    # Hoisted above `app` construction so the lifespan handler can close
+    # over it. Referenced by /generate, /v1/steering/*, and _generate_tokens.
+    _probe_cache: dict[str, Any] = {"v_probe": None}
+
+    @asynccontextmanager
+    async def _lifespan(_app: Any):
+        if probe_load_path is not None:
+            import mlx.core as _mx
+            import numpy as np
+
+            arr = np.load(probe_load_path)
+            _probe_cache["v_probe"] = _mx.array(arr)
+            logger.info(
+                "probe_loaded_at_startup",
+                path=probe_load_path,
+                shape=list(arr.shape),
+            )
+        yield
+
+    app = FastAPI(title="tgirl", lifespan=_lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -772,10 +797,8 @@ def create_app(
 
     # --- OpenAI-compatible endpoints ---
 
-    # Probe cache: persists the last bottleneck activation across turns.
-    # When a new request comes in, the cached probe steers the first token,
-    # creating behavioral continuity across the conversation.
-    _probe_cache: dict[str, Any] = {"v_probe": None}
+    # _probe_cache is declared at the top of create_app so the lifespan
+    # handler can close over it for probe load/save on startup/shutdown.
     _steering_config: dict[str, float] = {"alpha": 0.05}
     _steering_stats: dict[str, Any] = {
         "requests": 0,
@@ -924,10 +947,13 @@ def create_app(
 
     @app.get("/v1/steering/status")
     async def steering_status() -> dict[str, Any]:
+        # Unpack stats first, then override with live-computed fields so stale
+        # stats entries (e.g. the stats dict's own "probe_cached" that is only
+        # touched during generation) do not mask the source-of-truth cache.
         result: dict[str, Any] = {
+            **_steering_stats,
             "hook_installed": ctx.bottleneck_hook is not None,
             "probe_cached": _probe_cache.get("v_probe") is not None,
-            **_steering_stats,
         }
         # Project cached probe onto behavioral codebook for diagnostics
         v = _probe_cache.get("v_probe")
