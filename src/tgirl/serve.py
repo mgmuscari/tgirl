@@ -941,6 +941,7 @@ def create_app(
         "last_probe_norm": 0.0,
         "last_correction_norm": 0.0,
         "last_alpha": 0.0,
+        "last_coherence": None,
     }
 
     def _generate_tokens(
@@ -1020,6 +1021,9 @@ def create_app(
                     _steering_stats["mean_correction_norm"] = (
                         sum(correction_norms) / len(correction_norms)
                     )
+                from tgirl.coherence import compute_coherence
+
+                _steering_stats["last_coherence"] = compute_coherence(generated)
                 return generated, "stop"
 
             generated.append(next_token)
@@ -1031,6 +1035,9 @@ def create_app(
             _steering_stats["mean_correction_norm"] = (
                 sum(correction_norms) / len(correction_norms)
             )
+        from tgirl.coherence import compute_coherence
+
+        _steering_stats["last_coherence"] = compute_coherence(generated)
         return generated, "length"
 
     @app.get("/v1/models")
@@ -1228,6 +1235,11 @@ def create_app(
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
                         _probe_cache["v_probe"] = v_probe_prev
+                        from tgirl.coherence import compute_coherence
+
+                        _steering_stats["last_coherence"] = compute_coherence(
+                            generated_tokens
+                        )
                         response_text = ctx.tokenizer_decode(generated_tokens)
                         logger.info(
                             "stream_complete",
@@ -1281,6 +1293,11 @@ def create_app(
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     _probe_cache["v_probe"] = v_probe_prev
+                    from tgirl.coherence import compute_coherence
+
+                    _steering_stats["last_coherence"] = compute_coherence(
+                        generated_tokens
+                    )
                     response_text = ctx.tokenizer_decode(generated_tokens)
                     logger.info(
                         "stream_complete_length",
