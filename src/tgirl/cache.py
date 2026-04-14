@@ -54,6 +54,13 @@ class _BottleneckHook:
         self._V_basis: Any = None  # (d_model, K) for codebook injection
         self._delta_alpha: Any = None  # (K,) correction for codebook injection
         self._raw_correction: Any = None  # (d_model,) raw injection vector
+        # Residual-relative steering: probe direction + alpha stored
+        # separately so the correction magnitude can be rescaled
+        # against |residual_last| at forward time. Makes α a structural
+        # fraction of the residual stream being overwritten, not an
+        # absolute scalar that varies with |v_probe|.
+        self._probe_direction: Any = None  # unit (d_model,) vector
+        self._probe_alpha: float = 0.0
         # Band injection: {id(layer) -> weight}. None ⇒ single-layer
         # (weight 1.0 at the bottleneck only). When set by set_band,
         # correction is spread across a neighborhood of layers with
@@ -87,6 +94,8 @@ class _BottleneckHook:
                 weight = hook._band_weights_by_id.get(id(layer_self))
 
             if weight is not None:
+                import mlx.core as mx
+
                 if hook._raw_correction is not None:
                     result = result + (
                         weight * hook._raw_correction
@@ -101,6 +110,17 @@ class _BottleneckHook:
                     # small neighborhood of the calibration layer.
                     correction = hook._V_basis @ hook._delta_alpha
                     result = result + (weight * correction).reshape(1, 1, -1)
+                elif hook._probe_direction is not None:
+                    # Residual-relative steering: scale the unit-direction
+                    # probe by α * |residual_last| so the correction's
+                    # magnitude is proportional to the local signal power.
+                    # Makes α a structural fraction of the residual stream
+                    # rather than an absolute scalar.
+                    r_last = result[:, -1, :]
+                    r_norm = mx.linalg.norm(r_last)
+                    mag = weight * hook._probe_alpha * r_norm
+                    correction = mag * hook._probe_direction
+                    result = result + correction.reshape(1, 1, -1)
             return result
 
         self._layer_type.__call__ = _patched
@@ -131,6 +151,45 @@ class _BottleneckHook:
     def set_raw_correction(self, correction: Any) -> None:
         """Set a raw (d_model,) vector to inject. Bypasses codebook."""
         self._raw_correction = correction
+        # Mutually exclusive with residual-relative mode.
+        self._probe_direction = None
+        self._probe_alpha = 0.0
+
+    def set_probe_steering(self, v_probe: Any, alpha: float) -> None:
+        """Configure residual-relative steering.
+
+        The injected correction at each forward pass will be
+        ``alpha * |residual_last| * v_probe / |v_probe|``, scaled
+        further by any active band weight. α is a structural fraction
+        of the residual stream — stable across models, layers, and
+        contexts. ``v_probe`` supplies direction only; its magnitude
+        is stripped.
+
+        Args:
+            v_probe: (d_model,) direction vector. Any non-zero norm is
+                acceptable; the hook normalizes it. Passing the cached
+                probe vector from a prior turn is the intended use.
+            alpha: Structural fraction in ``[0, ~1]`` (higher values
+                over-steer past the residual's own magnitude; use at
+                your own risk). ``alpha=0`` disables injection.
+
+        Mutually exclusive with ``set_raw_correction`` and
+        ``set_steering`` — the last ``set_*`` call wins.
+        """
+        import mlx.core as mx
+
+        v_norm = mx.linalg.norm(v_probe)
+        # Guard against zero-vector inputs; treat as "no steering".
+        if float(v_norm.item()) == 0.0:
+            self._probe_direction = None
+            self._probe_alpha = 0.0
+        else:
+            self._probe_direction = v_probe / v_norm
+            self._probe_alpha = float(alpha)
+        # Mutually exclusive with other injection modes.
+        self._raw_correction = None
+        self._V_basis = None
+        self._delta_alpha = None
 
     def set_band(self, weights: dict[int, float] | None) -> None:
         """Configure multi-layer injection via a pre-computed weight map.
@@ -158,6 +217,8 @@ class _BottleneckHook:
         self._V_basis = None
         self._raw_correction = None
         self._delta_alpha = None
+        self._probe_direction = None
+        self._probe_alpha = 0.0
 
 
 @dataclass
