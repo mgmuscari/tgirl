@@ -1559,3 +1559,149 @@ class TestCoherenceTelemetry:
         # Allowed: key absent, OR key present with value None.
         val = status.get("last_coherence")
         assert val is None
+
+
+class TestBandSteering:
+    """β (sharpness) + skew knobs for multi-layer injection."""
+
+    def _make_deterministic_app_with_hook(
+        self, tokens_to_emit: list[int]
+    ) -> Any:
+        """Build an app whose ctx has a mock bottleneck_hook so tests
+        can inspect set_band calls. Forward_fn emits a fixed sequence
+        then EOS so generation is deterministic.
+        """
+        import mlx.core as mx
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import InferenceContext, create_app
+
+        vocab_size = max(tokens_to_emit + [1]) + 10
+        call_count = [0]
+
+        def fake_forward(token_ids: list[int]) -> Any:
+            idx = call_count[0]
+            call_count[0] += 1
+            logits = mx.zeros((vocab_size,))
+            if idx < len(tokens_to_emit):
+                logits = logits.at[tokens_to_emit[idx]].add(mx.array(100.0))
+            else:
+                logits = logits.at[0].add(mx.array(100.0))
+            return logits
+
+        mock_hook = MagicMock()
+        mock_hook.get_captured.return_value = None
+
+        ctx = InferenceContext(
+            registry=MagicMock(),
+            forward_fn=fake_forward,
+            tokenizer_decode=lambda ids: "",
+            tokenizer_encode=lambda s: [1, 2, 3],
+            embeddings=MagicMock(),
+            grammar_guide_factory=lambda s: None,
+            mlx_grammar_guide_factory=None,
+            formatter=MagicMock(),
+            backend="mlx",
+            model_id="test-model",
+            stop_token_ids=[0],
+            bottleneck_hook=mock_hook,
+        )
+        return TestClient(create_app(ctx)), mock_hook
+
+    def test_status_exposes_band_config_defaults(self) -> None:
+        """Default band config — β=None (single-layer), skew=1.0 —
+        surfaces on /v1/steering/status so operators can inspect it.
+        """
+        client, _ = self._make_deterministic_app_with_hook([1])
+
+        status = client.get("/v1/steering/status").json()
+        assert status.get("beta") is None  # single-layer default
+        assert status.get("skew") == 1.0
+
+    def test_post_beta_updates_server_default(self) -> None:
+        """POST /v1/steering/beta changes the server-wide default that
+        requests use when they don't pass their own override.
+        """
+        client, _ = self._make_deterministic_app_with_hook([1])
+
+        resp = client.post(
+            "/v1/steering/beta", params={"beta": 0.6, "skew": 1.5}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["beta"] == 0.6
+        assert data["skew"] == 1.5
+
+        status = client.get("/v1/steering/status").json()
+        assert status["beta"] == 0.6
+        assert status["skew"] == 1.5
+
+    def test_post_beta_none_clears_server_default(self) -> None:
+        """POST /v1/steering/beta with beta=null reverts to single-layer."""
+        client, _ = self._make_deterministic_app_with_hook([1])
+
+        client.post("/v1/steering/beta", params={"beta": 0.6, "skew": 1.5})
+        # Explicit null — use JSON body since query params can't express null
+        resp = client.post(
+            "/v1/steering/beta",
+            json={"beta": None, "skew": 1.0},
+        )
+        assert resp.status_code == 200
+
+        status = client.get("/v1/steering/status").json()
+        assert status["beta"] is None
+        assert status["skew"] == 1.0
+
+    def test_request_estradiol_beta_sets_band_on_hook(self) -> None:
+        """Per-request estradiol_beta triggers hook.set_band with a
+        non-None weight map before generation starts.
+        """
+        client, mock_hook = self._make_deterministic_app_with_hook([42, 42])
+        # Layers need to exist on the mock so band_weights can size.
+        mock_hook._layers = [MagicMock() for _ in range(28)]
+        mock_hook._layer_idx = 14
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 5,
+                "estradiol_beta": 0.7,
+                "estradiol_skew": 1.2,
+            },
+        )
+        assert resp.status_code == 200
+
+        # set_band should have been called with a dict when β is set.
+        set_band_calls = mock_hook.set_band.call_args_list
+        assert len(set_band_calls) >= 1
+        last = set_band_calls[-1]
+        weights_arg = last.args[0] if last.args else last.kwargs.get("weights")
+        assert isinstance(weights_arg, dict)
+        assert sum(weights_arg.values()) == pytest.approx(1.0, abs=1e-6)
+
+    def test_request_without_beta_resets_band_to_none(self) -> None:
+        """A request with no β override (and no server default) resets
+        the hook to single-layer — prevents stale band config from a
+        prior request leaking.
+        """
+        client, mock_hook = self._make_deterministic_app_with_hook([42, 42])
+        mock_hook._layers = [MagicMock() for _ in range(28)]
+        mock_hook._layer_idx = 14
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 5,
+            },
+        )
+        assert resp.status_code == 200
+
+        set_band_calls = mock_hook.set_band.call_args_list
+        assert len(set_band_calls) >= 1
+        last = set_band_calls[-1]
+        weights_arg = last.args[0] if last.args else last.kwargs.get("weights")
+        assert weights_arg is None

@@ -21,8 +21,10 @@ from tgirl.registry import ToolRegistry
 from tgirl.types import PromptFormatter, SessionConfig
 
 try:
+    from fastapi import Request as _FastAPIRequest  # noqa: F401
     from fastapi import WebSocket as _FastAPIWebSocket  # noqa: F401
 except ImportError:
+    _FastAPIRequest = None  # type: ignore[assignment,misc]
     _FastAPIWebSocket = None  # type: ignore[assignment,misc]
 
 logger = structlog.get_logger()
@@ -446,6 +448,8 @@ try:
         user: str | None = None
         # tgirl extensions
         estradiol_alpha: float | None = None  # per-request override; uses server default
+        estradiol_beta: float | None = None  # band sharpness (inverse σ, layers⁻¹). None = single-layer.
+        estradiol_skew: float | None = None  # band σ_up/σ_down ratio. None = server default (1.0).
         enable_thinking: bool = False  # set True for reasoning mode
 
     class ChatCompletionChoice(_PydanticBase):
@@ -935,7 +939,14 @@ def create_app(
 
     # _probe_cache is declared at the top of create_app so the lifespan
     # handler can close over it for probe load/save on startup/shutdown.
-    _steering_config: dict[str, float] = {"alpha": 0.05}
+    _steering_config: dict[str, Any] = {
+        "alpha": 0.05,
+        # Band steering defaults: None = single-layer (current behavior).
+        # skew=1.0 is symmetric. These act as fallbacks when a request
+        # does not override via estradiol_beta / estradiol_skew.
+        "beta": None,
+        "skew": 1.0,
+    }
     _steering_stats: dict[str, Any] = {
         "requests": 0,
         "last_probe_norm": 0.0,
@@ -943,6 +954,49 @@ def create_app(
         "last_alpha": 0.0,
         "last_coherence": None,
     }
+
+    def _apply_band_to_hook(
+        request_beta: float | None,
+        request_skew: float | None,
+    ) -> None:
+        """Resolve per-request/server band config and push to the hook.
+
+        Call before generation starts. A request with no explicit
+        override inherits the server default; an explicit ``None`` on
+        the request falls back to server default too (Pydantic can't
+        distinguish "field omitted" from "field explicitly null", but
+        practically the semantics are the same — use the server
+        default). Server default of ``beta=None`` means single-layer
+        injection (bit-compatible with the pre-band hook).
+
+        Always called so that stale band config from a prior request
+        cannot leak into the next one.
+        """
+        hook = ctx.bottleneck_hook
+        if hook is None:
+            return
+        beta = (
+            request_beta
+            if request_beta is not None
+            else _steering_config["beta"]
+        )
+        skew = (
+            request_skew
+            if request_skew is not None
+            else _steering_config["skew"]
+        )
+        if beta is None:
+            hook.set_band(None)
+            return
+        from tgirl.band import band_weights
+
+        weights = band_weights(
+            n_layers=len(hook._layers),
+            bottleneck_idx=hook._layer_idx,
+            beta=beta,
+            skew=skew,
+        )
+        hook.set_band(weights)
 
     def _generate_tokens(
         request: ChatCompletionRequest,
@@ -964,6 +1018,7 @@ def create_app(
         temp = request.temperature
         hook = ctx.bottleneck_hook
         alpha = request.estradiol_alpha if request.estradiol_alpha is not None else _steering_config["alpha"]
+        _apply_band_to_hook(request.estradiol_beta, request.estradiol_skew)
 
         if request.seed is not None:
             mx.random.seed(request.seed)
@@ -1060,6 +1115,48 @@ def create_app(
         logger.info("alpha_updated", alpha=alpha)
         return {"alpha": alpha}
 
+    @app.post("/v1/steering/beta")
+    async def set_beta(request: _FastAPIRequest) -> dict[str, Any]:
+        # Accept query params (handy for curl) or a JSON body. A JSON
+        # `beta: null` is how callers explicitly clear the band —
+        # query params can't express null cleanly. Body wins when
+        # both are present.
+        body: dict[str, Any] = {}
+        ctype = request.headers.get("content-type", "")
+        if "application/json" in ctype:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+
+        q = request.query_params
+        if "beta" in body:
+            new_beta = body["beta"]
+        elif "beta" in q:
+            new_beta = float(q["beta"])
+        else:
+            new_beta = _steering_config["beta"]
+
+        if "skew" in body:
+            new_skew = body["skew"]
+        elif "skew" in q:
+            new_skew = float(q["skew"])
+        else:
+            new_skew = _steering_config["skew"]
+
+        _steering_config["beta"] = new_beta
+        if new_skew is not None:
+            _steering_config["skew"] = new_skew
+        logger.info(
+            "beta_updated",
+            beta=_steering_config["beta"],
+            skew=_steering_config["skew"],
+        )
+        return {
+            "beta": _steering_config["beta"],
+            "skew": _steering_config["skew"],
+        }
+
     @app.post("/v1/steering/probe/save")
     async def save_probe(path: str = "session_probe.npy") -> dict[str, Any]:
         """Save the cached probe vector to disk."""
@@ -1093,10 +1190,14 @@ def create_app(
         # in _steering_stats. Keep it that way: mirroring them into stats
         # would reintroduce a mask-the-cache bug if any reader spread
         # stats without an explicit override.
+        #
+        # beta/skew are live config, not turn stats — also overriden here.
         result: dict[str, Any] = {
             **_steering_stats,
             "hook_installed": ctx.bottleneck_hook is not None,
             "probe_cached": _probe_cache.get("v_probe") is not None,
+            "beta": _steering_config["beta"],
+            "skew": _steering_config["skew"],
         }
         # Project cached probe onto behavioral codebook for diagnostics
         v = _probe_cache.get("v_probe")
@@ -1189,6 +1290,9 @@ def create_app(
                 in_thinking = request.enable_thinking and think_end is not None
                 hook = ctx.bottleneck_hook
                 alpha = request.estradiol_alpha if request.estradiol_alpha is not None else _steering_config["alpha"]
+                _apply_band_to_hook(
+                    request.estradiol_beta, request.estradiol_skew
+                )
                 v_probe_prev = _probe_cache.get("v_probe")
                 generated_tokens: list[int] = []
                 _steering_stats["requests"] += 1
