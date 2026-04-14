@@ -1548,6 +1548,38 @@ class TestCoherenceTelemetry:
         assert c["repeat_rate"] == 0.0
         assert c["bigram_novelty"] == 1.0
 
+    def test_status_exposes_last_certainty_after_completion(self) -> None:
+        """After a non-streaming completion, /v1/steering/status carries
+        the mean logit-certainty signature of the turn just finished.
+        Complements last_coherence with pre-sampling signals that the
+        autotuner will read alongside it.
+        """
+        # Deterministic EOS-on-first-token stream: 1 step produces a
+        # one-hot-shaped logit distribution (100.0 at token 0) so we
+        # can assert the certainty values concretely.
+        client = self._make_deterministic_app([])  # [] → first call returns EOS
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 10,
+            },
+        )
+        assert resp.status_code == 200
+
+        status = client.get("/v1/steering/status").json()
+        assert "last_certainty" in status, (
+            f"expected last_certainty on /v1/steering/status, got keys: "
+            f"{sorted(status.keys())}"
+        )
+        c = status["last_certainty"]
+        assert c["n_steps"] >= 1
+        # One-hot logits → certainty ≈ 1, entropy ≈ 0
+        assert c["mean_top1_prob"] == pytest.approx(1.0, abs=1e-3)
+        assert c["mean_entropy"] == pytest.approx(0.0, abs=1e-3)
+
     def test_status_has_no_coherence_before_first_turn(self) -> None:
         """Before any generation, there is nothing to report. The field
         should be absent (or explicitly None) — never a stale value from
