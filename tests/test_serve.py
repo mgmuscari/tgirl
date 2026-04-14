@@ -1681,6 +1681,40 @@ class TestBandSteering:
         assert isinstance(weights_arg, dict)
         assert sum(weights_arg.values()) == pytest.approx(1.0, abs=1e-6)
 
+    def test_status_exposes_normalization_default(self) -> None:
+        """Default steering normalization is 'absolute' (bit-compat with
+        pre-residual-relative behavior)."""
+        client, _ = self._make_deterministic_app_with_hook([1])
+
+        status = client.get("/v1/steering/status").json()
+        assert status.get("normalization") == "absolute"
+
+    def test_post_normalization_updates_server_default(self) -> None:
+        """POST /v1/steering/normalization changes the server-wide
+        steering mode used by requests that don't override per-request."""
+        client, _ = self._make_deterministic_app_with_hook([1])
+
+        resp = client.post(
+            "/v1/steering/normalization",
+            json={"mode": "residual_relative"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["mode"] == "residual_relative"
+
+        status = client.get("/v1/steering/status").json()
+        assert status["normalization"] == "residual_relative"
+
+    def test_post_normalization_rejects_unknown_mode(self) -> None:
+        """Unknown mode → 400, server state unchanged."""
+        client, _ = self._make_deterministic_app_with_hook([1])
+
+        resp = client.post(
+            "/v1/steering/normalization", json={"mode": "linear"}
+        )
+        assert resp.status_code == 400
+        status = client.get("/v1/steering/status").json()
+        assert status["normalization"] == "absolute"  # unchanged
+
     def test_probe_clear_endpoint_resets_cache(self, tmp_path: Any) -> None:
         """POST /v1/steering/probe/clear zeros the cache, so sweeps
         can reset between configurations without restarting the server.
