@@ -1072,6 +1072,52 @@ class TestProbePersistence:
         assert "--probe-load" in result.output
         assert "--probe-save-on-shutdown" in result.output
 
+    def test_create_app_autosaves_probe_on_interval(
+        self, tmp_path: Any
+    ) -> None:
+        """A non-zero autosave interval writes the probe periodically."""
+        import time
+
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        load_path = tmp_path / "in.npy"
+        save_path = tmp_path / "out.npy"
+        expected = np.arange(8, dtype=np.float32)
+        np.save(load_path, expected)
+
+        ctx = _make_mock_ctx()
+        app = create_app(
+            ctx,
+            probe_load_path=str(load_path),
+            probe_save_path=str(save_path),
+            probe_autosave_interval_s=0.05,
+        )
+
+        with TestClient(app):
+            # Wait long enough for at least one autosave tick to fire
+            # before the lifespan-shutdown final save would also run.
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and not save_path.exists():
+                time.sleep(0.02)
+            first_write_observed = save_path.exists()
+
+        assert first_write_observed, (
+            "autosave should have written within the lifespan, "
+            "not just at shutdown"
+        )
+        assert np.allclose(np.load(save_path), expected)
+
+    def test_create_app_autosave_requires_save_path(self) -> None:
+        """Autosave interval without a save path is a configuration error."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        with pytest.raises(ValueError, match="probe_save_path"):
+            create_app(ctx, probe_autosave_interval_s=0.1)
+
     def test_cli_forwards_probe_paths_to_create_app(
         self, tmp_path: Any
     ) -> None:
@@ -1113,9 +1159,22 @@ class TestProbePersistence:
                     "--tools", str(tool_file),
                     "--probe-load", load_p,
                     "--probe-save-on-shutdown", save_p,
+                    "--probe-autosave-interval", "2.5",
                 ],
             )
 
         assert result.exit_code == 0, result.output
         assert captured.get("probe_load_path") == load_p
         assert captured.get("probe_save_path") == save_p
+        assert captured.get("probe_autosave_interval_s") == 2.5
+
+    def test_cli_exposes_autosave_interval_flag(self) -> None:
+        """CLI serve --help lists --probe-autosave-interval."""
+        from click.testing import CliRunner
+
+        from tgirl.cli import serve
+
+        runner = CliRunner()
+        result = runner.invoke(serve, ["--help"])
+        assert result.exit_code == 0
+        assert "--probe-autosave-interval" in result.output

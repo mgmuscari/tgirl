@@ -141,6 +141,17 @@ def _load_single_module(file_path: str, registry: ToolRegistry) -> None:
         "Pair with --probe-load on the next start to continue the session."
     ),
 )
+@click.option(
+    "--probe-autosave-interval",
+    "probe_autosave_interval",
+    type=float,
+    default=None,
+    help=(
+        "Seconds between periodic probe saves to the --probe-save-on-shutdown "
+        "path during server lifetime. Protects against data loss mid-session. "
+        "Requires --probe-save-on-shutdown."
+    ),
+)
 def serve(
     model: str,
     port: int,
@@ -149,11 +160,19 @@ def serve(
     tools: tuple[str, ...],
     probe_load: str | None,
     probe_save_on_shutdown: str | None,
+    probe_autosave_interval: float | None,
 ) -> None:
     """Start the tgirl local inference server."""
     import uvicorn
 
     from tgirl.serve import create_app, load_inference_context
+
+    if probe_autosave_interval is not None and probe_save_on_shutdown is None:
+        msg = (
+            "--probe-autosave-interval requires --probe-save-on-shutdown "
+            "(the autosave loop needs a destination path)."
+        )
+        raise click.UsageError(msg)
 
     click.echo(f"Loading model: {model} (backend: {backend})")
     ctx = load_inference_context(model, backend=backend)
@@ -172,6 +191,7 @@ def serve(
         ctx,
         probe_load_path=probe_load,
         probe_save_path=probe_save_on_shutdown,
+        probe_autosave_interval_s=probe_autosave_interval,
     )
     click.echo(f"Starting server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)
