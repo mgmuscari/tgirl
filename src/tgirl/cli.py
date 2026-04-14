@@ -152,6 +152,18 @@ def _load_single_module(file_path: str, registry: ToolRegistry) -> None:
         "Requires --probe-save-on-shutdown."
     ),
 )
+@click.option(
+    "--auto-calibrate/--no-auto-calibrate",
+    "auto_calibrate",
+    default=True,
+    show_default=True,
+    help=(
+        "On first start, if no .estradiol calibration file is found in cwd, "
+        "run the full ESTRADIOL calibration pipeline to produce one (~30s-2min). "
+        "Without calibration the bottleneck hook does not install and steering "
+        "is silently inactive."
+    ),
+)
 def serve(
     model: str,
     port: int,
@@ -161,6 +173,7 @@ def serve(
     probe_load: str | None,
     probe_save_on_shutdown: str | None,
     probe_autosave_interval: float | None,
+    auto_calibrate: bool,
 ) -> None:
     """Start the tgirl local inference server."""
     import uvicorn
@@ -181,7 +194,9 @@ def serve(
         raise click.UsageError(msg)
 
     click.echo(f"Loading model: {model} (backend: {backend})")
-    ctx = load_inference_context(model, backend=backend)
+    ctx = load_inference_context(
+        model, backend=backend, auto_calibrate=auto_calibrate
+    )
 
     # Load tools from specified paths
     for tool_path in tools:

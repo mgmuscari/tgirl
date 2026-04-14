@@ -135,6 +135,7 @@ def load_inference_context(
     bottleneck_layer: int | None = None,
     layer_path: str | None = None,
     estradiol_path: str | None = None,
+    auto_calibrate: bool = True,
 ) -> InferenceContext:
     """Load model and construct all SamplingSession dependencies.
 
@@ -150,6 +151,12 @@ def load_inference_context(
             If provided, installs a bottleneck hook for self-steering.
         layer_path: Dot-separated path to model layers list
             (e.g. "language_model.model.layers"). Auto-detected if None.
+        estradiol_path: Explicit path to a .estradiol calibration. If
+            None, autodetect by model basename in cwd.
+        auto_calibrate: When True (default), if no estradiol file is
+            found via autodetect, run the full ESTRADIOL calibration
+            pipeline on first start and save it to disk for reuse.
+            Set False to skip calibration (steering will be disabled).
 
     Returns:
         InferenceContext ready for creating SamplingSession instances.
@@ -157,7 +164,13 @@ def load_inference_context(
     resolved_backend = _resolve_backend(backend)
 
     if resolved_backend == "mlx":
-        return _build_mlx_context(model_id, bottleneck_layer, layer_path, estradiol_path)
+        return _build_mlx_context(
+            model_id,
+            bottleneck_layer,
+            layer_path,
+            estradiol_path,
+            auto_calibrate=auto_calibrate,
+        )
     return _build_torch_context(model_id)
 
 
@@ -199,6 +212,7 @@ def _build_mlx_context(
     bottleneck_layer: int | None = None,
     layer_path: str | None = None,
     estradiol_path: str | None = None,
+    auto_calibrate: bool = True,
 ) -> InferenceContext:
     """Build InferenceContext for MLX backend."""
     import mlx.core as mx
@@ -292,7 +306,11 @@ def _build_mlx_context(
         import pathlib
 
         slug = model_id.replace("/", "_")
-        for candidate in [f"{slug}.estradiol", f"{model_id.split('/')[-1]}.estradiol"]:
+        candidates = [
+            f"{slug}.estradiol",
+            f"{model_id.split('/')[-1]}.estradiol",
+        ]
+        for candidate in candidates:
             p = pathlib.Path(candidate)
             if p.exists():
                 from tgirl.estradiol import load_estradiol
@@ -323,6 +341,60 @@ def _build_mlx_context(
                             layer=cal.bottleneck_layer,
                         )
                 break
+
+        # Bootstrap: no estradiol on disk and the user wants one. The
+        # full ESTRADIOL calibration pipeline runs once (~30s-2min on
+        # 0.8B), saves to the basename autodetect path, and returns
+        # the result so the hook can install. Without this, a fresh
+        # install silently lacks steering — every chat completion is
+        # the deterministic baseline output and the autotuner has no
+        # signal to act on.
+        if cal is None and auto_calibrate:
+            import tgirl.calibrate as _cal_mod
+
+            bootstrap_path = candidates[1]  # "<basename>.estradiol"
+            logger.info(
+                "estradiol_bootstrap_starting",
+                model_id=model_id,
+                output_path=bootstrap_path,
+            )
+            cal = _cal_mod.calibrate(
+                model=model,
+                tokenizer=hf_tokenizer,
+                model_id=model_id,
+                output_path=bootstrap_path,
+            )
+            logger.info(
+                "estradiol_bootstrap_complete",
+                path=bootstrap_path,
+                K=cal.K,
+                bottleneck_layer=cal.bottleneck_layer,
+            )
+            if hook is None and cal.bottleneck_layer is not None:
+                from tgirl.cache import _BottleneckHook
+
+                if layer_path is None:
+                    for lp_candidate in ["language_model.model.layers", "model.layers"]:
+                        obj = model
+                        try:
+                            for attr in lp_candidate.split("."):
+                                obj = getattr(obj, attr)
+                            layer_path = lp_candidate
+                            break
+                        except AttributeError:
+                            continue
+                if layer_path is not None:
+                    layers = model
+                    for attr in layer_path.split("."):
+                        layers = getattr(layers, attr)
+                    hook = _BottleneckHook(
+                        layers, layer_idx=cal.bottleneck_layer
+                    )
+                    hook.install()
+                    logger.info(
+                        "bottleneck_hook_from_bootstrap",
+                        layer=cal.bottleneck_layer,
+                    )
 
     logger.info(
         "mlx_model_loaded",

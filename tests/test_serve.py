@@ -76,7 +76,9 @@ class TestLoadInferenceContext:
                 return_value=mock_grammar_factory,
             ),
         ):
-            ctx = load_inference_context("test-model", backend="mlx")
+            ctx = load_inference_context(
+                "test-model", backend="mlx", auto_calibrate=False
+            )
             assert ctx.backend == "mlx"
             assert ctx.model_id == "test-model"
             assert ctx.forward_fn is mock_forward_fn
@@ -146,8 +148,178 @@ class TestLoadInferenceContext:
                 return_value=MagicMock(),
             ),
         ):
-            ctx = load_inference_context("test-model", backend="auto")
+            ctx = load_inference_context(
+                "test-model", backend="auto", auto_calibrate=False
+            )
             assert ctx.backend == "mlx"
+
+    def test_mlx_bootstraps_estradiol_when_missing(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """When no .estradiol file is found in cwd at startup, the
+        server runs tgirl.calibrate.calibrate to produce one. Without
+        this, the bottleneck hook never installs and steering is a
+        silent no-op (every chat completion returns the same text).
+        """
+        from tgirl.serve import load_inference_context
+
+        # Run from an empty tempdir so autodetect finds nothing.
+        monkeypatch.chdir(tmp_path)
+
+        mock_model = MagicMock()
+        mock_hf_tokenizer = MagicMock()
+        mock_hf_tokenizer.eos_token_id = 0
+        mock_hf_tokenizer.decode = MagicMock(return_value="")
+        mock_hf_tokenizer.encode = MagicMock(return_value=[])
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_hf_tokenizer
+
+        mock_embed = MagicMock()
+        mock_model.language_model.model.embed_tokens.weight.astype.return_value = (
+            mock_embed
+        )
+        mock_embed.shape = (100, 1024)
+
+        # Calibration result the bootstrap should hand back.
+        mock_cal = MagicMock()
+        mock_cal.K = 11
+        mock_cal.bottleneck_layer = 14
+
+        with (
+            patch("tgirl.serve._try_import_mlx", return_value=True),
+            patch(
+                "tgirl.serve._load_mlx_model",
+                return_value=(mock_model, mock_tokenizer),
+            ),
+            patch(
+                "tgirl.serve._make_mlx_forward", return_value=MagicMock()
+            ),
+            patch(
+                "tgirl.serve._make_mlx_grammar_factory",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "tgirl.calibrate.calibrate", return_value=mock_cal
+            ) as mock_calibrate,
+        ):
+            ctx = load_inference_context("test-model", backend="mlx")
+
+        # Bootstrap fired
+        assert mock_calibrate.called, (
+            "expected tgirl.calibrate.calibrate to be invoked when no "
+            "estradiol file is present in cwd"
+        )
+        # And the result is wired in
+        assert ctx.estradiol_file is mock_cal
+
+    def test_mlx_bootstrap_skipped_when_file_present(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """If the estradiol file already exists in cwd, the bootstrap
+        path is skipped — calibration is expensive and we trust the
+        cached file from a prior run.
+        """
+        from tgirl.serve import load_inference_context
+
+        monkeypatch.chdir(tmp_path)
+        # Place a fake estradiol file at the autodetect path.
+        # Model basename is "test-model"; autodetect looks for it.
+        (tmp_path / "test-model.estradiol").write_bytes(b"fake")
+
+        mock_model = MagicMock()
+        mock_hf_tokenizer = MagicMock()
+        mock_hf_tokenizer.eos_token_id = 0
+        mock_hf_tokenizer.decode = MagicMock(return_value="")
+        mock_hf_tokenizer.encode = MagicMock(return_value=[])
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_hf_tokenizer
+
+        mock_embed = MagicMock()
+        mock_model.language_model.model.embed_tokens.weight.astype.return_value = (
+            mock_embed
+        )
+        mock_embed.shape = (100, 1024)
+
+        mock_cal = MagicMock()
+        mock_cal.K = 11
+        mock_cal.bottleneck_layer = 14
+
+        with (
+            patch("tgirl.serve._try_import_mlx", return_value=True),
+            patch(
+                "tgirl.serve._load_mlx_model",
+                return_value=(mock_model, mock_tokenizer),
+            ),
+            patch(
+                "tgirl.serve._make_mlx_forward", return_value=MagicMock()
+            ),
+            patch(
+                "tgirl.serve._make_mlx_grammar_factory",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "tgirl.estradiol.load_estradiol", return_value=mock_cal
+            ),
+            patch(
+                "tgirl.calibrate.calibrate", return_value=mock_cal
+            ) as mock_calibrate,
+        ):
+            load_inference_context("test-model", backend="mlx")
+
+        assert not mock_calibrate.called, (
+            "calibrate must not run when an estradiol file is already on disk"
+        )
+
+    def test_mlx_bootstrap_can_be_disabled(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """auto_calibrate=False is the escape hatch. Even with no
+        estradiol file present, calibration is skipped — useful for
+        smoke runs or when the user wants to avoid the calibration
+        cost.
+        """
+        from tgirl.serve import load_inference_context
+
+        monkeypatch.chdir(tmp_path)
+
+        mock_model = MagicMock()
+        mock_hf_tokenizer = MagicMock()
+        mock_hf_tokenizer.eos_token_id = 0
+        mock_hf_tokenizer.decode = MagicMock(return_value="")
+        mock_hf_tokenizer.encode = MagicMock(return_value=[])
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_hf_tokenizer
+
+        mock_embed = MagicMock()
+        mock_model.language_model.model.embed_tokens.weight.astype.return_value = (
+            mock_embed
+        )
+        mock_embed.shape = (100, 1024)
+
+        with (
+            patch("tgirl.serve._try_import_mlx", return_value=True),
+            patch(
+                "tgirl.serve._load_mlx_model",
+                return_value=(mock_model, mock_tokenizer),
+            ),
+            patch(
+                "tgirl.serve._make_mlx_forward", return_value=MagicMock()
+            ),
+            patch(
+                "tgirl.serve._make_mlx_grammar_factory",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "tgirl.calibrate.calibrate"
+            ) as mock_calibrate,
+        ):
+            ctx = load_inference_context(
+                "test-model", backend="mlx", auto_calibrate=False
+            )
+
+        assert not mock_calibrate.called
+        assert ctx.estradiol_file is None
+        assert ctx.bottleneck_hook is None
 
     def test_mlx_backend_fails_without_mlx(self) -> None:
         """MLX backend fails with clear error when mlx unavailable."""
