@@ -748,6 +748,111 @@ class TestBottleneckHook:
         finally:
             hook.uninstall()
 
+    # --- Residual-relative steering ---
+    #
+    # set_probe_steering(v_probe, alpha) rescales the correction at
+    # forward time so its magnitude is α * |residual_last|, independent
+    # of |v_probe|. Makes α a structural fraction ("how much of the
+    # residual stream am I overwriting") rather than an absolute scalar
+    # that varies with the calibration state.
+
+    def test_probe_steering_correction_norm_is_alpha_times_residual(self) -> None:
+        """After injection, the added correction has norm α * |residual_last|
+        regardless of |v_probe|. The direction matches v_probe (unit-
+        normalized); the magnitude is residual-relative.
+        """
+        from tgirl.cache import _BottleneckHook
+
+        layers = self._make_fake_layers(3)
+        hook = _BottleneckHook(layers, layer_idx=1)
+        hook.install()
+        try:
+            # v_probe norm arbitrary (10.0); what matters is direction.
+            v_probe = mx.array([1.0, 0.0, 0.0, 0.0]) * 10.0
+            hook.set_probe_steering(v_probe, alpha=0.5)
+
+            # Residual has norm sqrt(4*(3^2)) = 6.0
+            x = mx.ones((1, 1, 4)) * 3.0
+            # After injection: correction = 0.5 * 6.0 * [1,0,0,0] = [3,0,0,0]
+            # Result: [3+3, 3, 3, 3] = [6, 3, 3, 3]
+            out = layers[1](x)
+            last = out[0, 0, :]
+            assert float(last[0].item()) == pytest.approx(6.0, rel=1e-5)
+            assert float(last[1].item()) == pytest.approx(3.0, rel=1e-5)
+        finally:
+            hook.uninstall()
+
+    def test_probe_steering_zero_alpha_is_identity(self) -> None:
+        """α=0 produces no correction regardless of v_probe magnitude."""
+        from tgirl.cache import _BottleneckHook
+
+        layers = self._make_fake_layers(3)
+        hook = _BottleneckHook(layers, layer_idx=1)
+        hook.install()
+        try:
+            hook.set_probe_steering(mx.ones((4,)) * 100.0, alpha=0.0)
+            x = mx.ones((1, 1, 4)) * 3.0
+            out = layers[1](x)
+            # No injection → output unchanged
+            assert float(mx.max(mx.abs(out - x)).item()) == pytest.approx(0.0)
+        finally:
+            hook.uninstall()
+
+    def test_probe_steering_magnitude_invariant_under_v_probe_rescale(self) -> None:
+        """Scaling v_probe by 10× changes its norm but NOT the resulting
+        correction magnitude. The direction is what matters.
+        """
+        from tgirl.cache import _BottleneckHook
+
+        layers = self._make_fake_layers(3)
+        hook = _BottleneckHook(layers, layer_idx=1)
+
+        def _max_delta(v_scale: float) -> float:
+            hook.install()
+            try:
+                hook.set_probe_steering(
+                    mx.array([1.0, 0.0, 0.0, 0.0]) * v_scale,
+                    alpha=0.3,
+                )
+                x = mx.ones((1, 1, 4)) * 2.0
+                out = layers[1](x)
+                return float(mx.max(mx.abs(out - x)).item())
+            finally:
+                hook.uninstall()
+
+        small = _max_delta(1.0)
+        large = _max_delta(100.0)
+        assert small == pytest.approx(large, rel=1e-5)
+
+    def test_probe_steering_composes_with_band(self) -> None:
+        """Band weights scale the per-layer magnitude proportionally —
+        each layer gets α * |its own residual| * band_weight * v_unit.
+        """
+        from tgirl.band import band_weights
+        from tgirl.cache import _BottleneckHook
+
+        layers = self._make_fake_layers(7)
+        hook = _BottleneckHook(layers, layer_idx=3)
+        hook.install()
+        try:
+            weights = band_weights(
+                n_layers=7, bottleneck_idx=3, beta=0.7, skew=1.0
+            )
+            hook.set_band(weights)
+            hook.set_probe_steering(
+                mx.array([1.0, 0.0, 0.0, 0.0]), alpha=0.4
+            )
+
+            x = mx.ones((1, 1, 4)) * 2.0  # |residual|=4.0
+            outs = [layers[i](x) for i in range(7)]
+
+            for i, o in enumerate(outs):
+                delta = float(mx.max(o - x).item())
+                expected = 0.4 * 4.0 * weights.get(i, 0.0)
+                assert delta == pytest.approx(expected, abs=1e-5)
+        finally:
+            hook.uninstall()
+
     def test_band_does_not_broaden_capture_site(self) -> None:
         """Probe capture is bottleneck-only regardless of band width —
         the band is an *injection* distribution; capture stays the
