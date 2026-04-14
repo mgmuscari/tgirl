@@ -658,7 +658,18 @@ def create_app(
             # until deep inside the bottleneck hook's forward pass,
             # or worse, produces wrong steering with no error at all
             # when the dims happen to match but the basis is foreign.
-            expected_dim = ctx.embeddings.shape[-1]
+            #
+            # Source the expected dim from the estradiol codebook when
+            # available: V_basis has shape (d_model, K) and survives
+            # model quantization. Fall back to embeddings.shape[-1]
+            # for the non-estradiol hook path, but note that for 4-bit
+            # quantized MLX models the embeddings trailing dim is the
+            # *packed* dim, not the true d_model — so that fallback
+            # cannot validate the quantized path.
+            if ctx.estradiol_file is not None:
+                expected_dim = int(ctx.estradiol_file.V_basis.shape[0])
+            else:
+                expected_dim = int(ctx.embeddings.shape[-1])
             if arr.shape != (expected_dim,):
                 msg = (
                     f"Loaded probe shape {tuple(arr.shape)} does not "

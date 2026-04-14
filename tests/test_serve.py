@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -1248,6 +1249,35 @@ class TestProbePersistence:
         with pytest.raises(ValueError, match="does not match model hidden dim"):
             with TestClient(app):
                 pass
+
+    def test_probe_load_uses_estradiol_v_basis_dim_when_available(
+        self, tmp_path: Any
+    ) -> None:
+        """When the ctx has an estradiol calibration, probe shape is
+        validated against V_basis.shape[0] — not embeddings.shape[-1].
+        Covers the quantized-model case where embed_tokens.weight is
+        packed and its trailing dim is NOT the true d_model.
+        """
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        # Quantized-style: embeddings trailing dim (128) != true d_model (1024).
+        ctx = _make_mock_ctx(hidden_dim=128)
+
+        fake_cal = MagicMock()
+        fake_v_basis = MagicMock()
+        fake_v_basis.shape = (1024, 10)  # (d_model, K)
+        fake_cal.V_basis = fake_v_basis
+        ctx = replace(ctx, estradiol_file=fake_cal)
+
+        probe_path = tmp_path / "probe.npy"
+        np.save(probe_path, np.arange(1024, dtype=np.float32))
+
+        app = create_app(ctx, probe_load_path=str(probe_path))
+        with TestClient(app):
+            pass  # startup load should succeed; no ValueError
 
     def test_probe_load_casts_loaded_vector_to_float32(
         self, tmp_path: Any

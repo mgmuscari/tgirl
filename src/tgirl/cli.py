@@ -1,7 +1,7 @@
 """CLI entrypoint for tgirl inference server.
 
 Usage:
-    python -m tgirl.cli serve --model <model_id> --port 8420 --tools my_tools.py
+    python -m tgirl.cli --model <model_id> --port 8420 --tools my_tools.py
 """
 
 from __future__ import annotations
