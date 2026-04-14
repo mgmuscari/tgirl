@@ -172,17 +172,27 @@ class TestLoadInferenceContext:
 
 def _make_mock_ctx(
     tools: ToolRegistry | None = None,
+    hidden_dim: int = 8,
 ) -> Any:
-    """Create a mock InferenceContext for server testing."""
+    """Create a mock InferenceContext for server testing.
+
+    hidden_dim controls ctx.embeddings.shape[-1] so tests can exercise
+    the probe-load shape validation path. Defaults to 8 because the
+    probe persistence tests save np.arange(8, dtype=float32) vectors.
+    """
     from tgirl.serve import InferenceContext
 
     registry = tools or ToolRegistry()
+    embeddings = MagicMock()
+    # vocab dim is unused by server code paths under test; only the
+    # last dim (d_model) matters for probe shape validation.
+    embeddings.shape = (1000, hidden_dim)
     return InferenceContext(
         registry=registry,
         forward_fn=lambda ids: None,
         tokenizer_decode=lambda ids: "",
         tokenizer_encode=lambda s: [],
-        embeddings=MagicMock(),
+        embeddings=embeddings,
         grammar_guide_factory=lambda s: None,
         mlx_grammar_guide_factory=None,
         formatter=MagicMock(),
@@ -1217,6 +1227,73 @@ class TestProbePersistence:
         result = runner.invoke(serve, ["--help"])
         assert result.exit_code == 0
         assert "--probe-autosave-interval" in result.output
+
+    def test_probe_load_rejects_shape_mismatch(self, tmp_path: Any) -> None:
+        """Loading a probe whose shape does not match the model's
+        hidden dim must fail loudly at startup, not silently at
+        first generation or wrong-but-no-error during steering."""
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        # Mock ctx has d_model=8; save a probe with the wrong dim.
+        wrong = np.arange(16, dtype=np.float32)
+        probe_path = tmp_path / "wrong_dim.npy"
+        np.save(probe_path, wrong)
+
+        ctx = _make_mock_ctx(hidden_dim=8)
+        app = create_app(ctx, probe_load_path=str(probe_path))
+
+        with pytest.raises(ValueError, match="does not match model hidden dim"):
+            with TestClient(app):
+                pass
+
+    def test_probe_load_casts_loaded_vector_to_float32(
+        self, tmp_path: Any
+    ) -> None:
+        """Probes saved as other dtypes must be cast to float32 at
+        load so downstream arithmetic stays in the calibrated dtype
+        the hook captures natively."""
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        # Save as float64 — explicitly non-float32 source dtype.
+        v = np.arange(8, dtype=np.float64)
+        probe_path = tmp_path / "f64.npy"
+        np.save(probe_path, v)
+
+        ctx = _make_mock_ctx(hidden_dim=8)
+
+        # Spy on what mlx.core.array receives — the fix casts the
+        # loaded ndarray to float32 before constructing the mx.array.
+        import mlx.core as _mx
+
+        captured: list[Any] = []
+        real_array = _mx.array
+
+        def spy_array(x: Any, *a: Any, **kw: Any) -> Any:
+            captured.append(x)
+            return real_array(x, *a, **kw)
+
+        with patch.object(_mx, "array", side_effect=spy_array):
+            app = create_app(ctx, probe_load_path=str(probe_path))
+            with TestClient(app):
+                pass
+
+        # The lifespan load should have called mx.array exactly once
+        # with a float32-dtype ndarray. Find that call and assert.
+        f32_calls = [
+            c for c in captured
+            if isinstance(c, np.ndarray) and c.dtype == np.float32
+        ]
+        assert f32_calls, (
+            f"expected at least one mx.array(<float32 ndarray>) call; "
+            f"captured dtypes: "
+            f"{[getattr(c, 'dtype', type(c).__name__) for c in captured]}"
+        )
 
     def test_write_is_atomic_destination_not_corrupted_on_rename_failure(
         self, tmp_path: Any
