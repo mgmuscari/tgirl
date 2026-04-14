@@ -1001,7 +1001,120 @@ def create_app(
         # Mean per-token logit-distribution signals from the most recent
         # turn — feeds the autotuner alongside last_coherence.
         "last_certainty": None,
+        # Finish disposition of the last turn: "stop" (EOS) or "length".
+        # Half the cliff signal — sycophant collapse looks like coherent
+        # short-EOS output; only finish_reason disambiguates.
+        "last_finish_reason": None,
     }
+
+    # Autotuner state. When enabled, the rule-based controller in
+    # tgirl.autotune drives (α, β, temperature) from the per-turn
+    # telemetry rather than honoring per-request overrides.
+    _autotune_state: dict[str, Any] = {
+        "enabled": False,
+        "log_path": None,
+        # Next-turn config the controller picked at the end of the
+        # most recent turn. Initialized lazily from _steering_config
+        # when autotune is first enabled.
+        "next_alpha": None,
+        "next_beta": None,
+        "next_temperature": None,
+        # Diagnostics from the most recent autotune call.
+        "last_regime": None,
+        "last_rationale": None,
+    }
+
+    def _resolve_alpha(request: Any) -> float:
+        """Per-turn α resolution. When autotune is on it owns the knob;
+        otherwise per-request override wins, then server default.
+        """
+        if _autotune_state["enabled"] and _autotune_state["next_alpha"] is not None:
+            return float(_autotune_state["next_alpha"])
+        if request.estradiol_alpha is not None:
+            return float(request.estradiol_alpha)
+        return float(_steering_config["alpha"])
+
+    def _resolve_beta_skew(request: Any) -> tuple[float | None, float]:
+        """Same precedence pattern for (β, skew)."""
+        if _autotune_state["enabled"] and _autotune_state["next_beta"] is not None:
+            return float(_autotune_state["next_beta"]), float(
+                _steering_config["skew"]
+            )
+        beta = (
+            request.estradiol_beta
+            if request.estradiol_beta is not None
+            else _steering_config["beta"]
+        )
+        skew = (
+            request.estradiol_skew
+            if request.estradiol_skew is not None
+            else _steering_config["skew"]
+        )
+        return beta, skew
+
+    def _resolve_temperature(request: Any) -> float:
+        """Autotuner can override the request's temperature too — the
+        third knob in the (α, β, temp) control space.
+        """
+        if (
+            _autotune_state["enabled"]
+            and _autotune_state["next_temperature"] is not None
+        ):
+            return float(_autotune_state["next_temperature"])
+        return float(request.temperature)
+
+    def _run_autotune_after_turn(finish_reason: str) -> None:
+        """Build Observables from the just-completed turn's stats and
+        run the controller. Logs (obs, action) to JSONL if configured.
+        """
+        if not _autotune_state["enabled"]:
+            return
+        coh = _steering_stats.get("last_coherence") or {}
+        cert = _steering_stats.get("last_certainty") or {}
+        if not coh:
+            return  # nothing to learn from a turn with no telemetry
+
+        from tgirl.autotune import (
+            Observables,
+            action_to_dict,
+            autotune,
+            observables_to_dict,
+        )
+
+        obs = Observables(
+            repeat_rate=float(coh.get("repeat_rate") or 0.0),
+            bigram_novelty=float(coh.get("bigram_novelty") or 1.0),
+            token_entropy=float(coh.get("token_entropy") or 0.0),
+            n_tokens=int(coh.get("n_tokens") or 0),
+            finish_reason=finish_reason,
+            mean_entropy=float(cert.get("mean_entropy") or 0.0),
+            mean_top1_prob=float(cert.get("mean_top1_prob") or 1.0),
+            mean_top1_margin=float(cert.get("mean_top1_margin") or 1.0),
+            alpha=float(_autotune_state.get("next_alpha") or _steering_config["alpha"]),
+            beta=_autotune_state.get("next_beta") or _steering_config["beta"],
+            temperature=float(
+                _autotune_state.get("next_temperature") or 0.0
+            ),
+        )
+        action = autotune(obs)
+        _autotune_state["next_alpha"] = action.next_alpha
+        _autotune_state["next_beta"] = action.next_beta
+        _autotune_state["next_temperature"] = action.next_temperature
+        _autotune_state["last_regime"] = action.regime
+        _autotune_state["last_rationale"] = action.rationale
+
+        log_path = _autotune_state.get("log_path")
+        if log_path:
+            import json
+            from pathlib import Path
+
+            with Path(log_path).open("a") as f:
+                f.write(
+                    json.dumps({
+                        "observables": observables_to_dict(obs),
+                        "action": action_to_dict(action),
+                    }) + "\n"
+                )
 
     def _apply_band_to_hook(
         request_beta: float | None,
@@ -1063,10 +1176,11 @@ def create_app(
         import mlx.core as mx
 
         max_tok = request.max_completion_tokens or request.max_tokens or 1024
-        temp = request.temperature
         hook = ctx.bottleneck_hook
-        alpha = request.estradiol_alpha if request.estradiol_alpha is not None else _steering_config["alpha"]
-        _apply_band_to_hook(request.estradiol_beta, request.estradiol_skew)
+        alpha = _resolve_alpha(request)
+        temp = _resolve_temperature(request)
+        _beta_resolved, _skew_resolved = _resolve_beta_skew(request)
+        _apply_band_to_hook(_beta_resolved, _skew_resolved)
 
         if request.seed is not None:
             mx.random.seed(request.seed)
@@ -1137,6 +1251,8 @@ def create_app(
 
                 _steering_stats["last_coherence"] = compute_coherence(generated)
                 _steering_stats["last_certainty"] = _mean_cert(certainty_steps)
+                _steering_stats["last_finish_reason"] = "stop"
+                _run_autotune_after_turn("stop")
                 return generated, "stop"
 
             generated.append(next_token)
@@ -1153,6 +1269,8 @@ def create_app(
 
         _steering_stats["last_coherence"] = compute_coherence(generated)
         _steering_stats["last_certainty"] = _mean_cert(certainty_steps)
+        _steering_stats["last_finish_reason"] = "length"
+        _run_autotune_after_turn("length")
         return generated, "length"
 
     @app.get("/v1/models")
@@ -1231,6 +1349,49 @@ def create_app(
         logger.info("probe_saved", path=path, norm=norm)
         return {"saved": path, "norm": norm, "shape": list(v.shape)}
 
+    @app.post("/v1/steering/autotune")
+    async def set_autotune(request: _FastAPIRequest) -> dict[str, Any]:
+        """Enable / disable the rule-based steering controller.
+
+        Body: ``{"enabled": bool, "log_path": str | null}``.
+
+        When enabled, the controller drives (α, β, temperature) from
+        the per-turn coherence + certainty telemetry and ignores
+        per-request overrides on those fields. When ``log_path`` is
+        set, every (observables, action) tuple is appended to that
+        path as JSONL — the training set for the perceptron that will
+        eventually replace the rule-based logic.
+        """
+        body: dict[str, Any] = {}
+        if "application/json" in request.headers.get("content-type", ""):
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+        if "enabled" in body:
+            _autotune_state["enabled"] = bool(body["enabled"])
+            # Initialize the controller's working knobs from the
+            # current server config so the first autotune cycle has
+            # a sensible baseline to adjust from.
+            if _autotune_state["enabled"]:
+                if _autotune_state["next_alpha"] is None:
+                    _autotune_state["next_alpha"] = _steering_config["alpha"]
+                if _autotune_state["next_beta"] is None:
+                    _autotune_state["next_beta"] = _steering_config["beta"]
+                if _autotune_state["next_temperature"] is None:
+                    _autotune_state["next_temperature"] = 0.0
+        if "log_path" in body:
+            _autotune_state["log_path"] = body["log_path"]
+        logger.info(
+            "autotune_updated",
+            enabled=_autotune_state["enabled"],
+            log_path=_autotune_state["log_path"],
+        )
+        return {
+            "enabled": _autotune_state["enabled"],
+            "log_path": _autotune_state["log_path"],
+        }
+
     @app.post("/v1/steering/normalization")
     async def set_normalization(request: _FastAPIRequest) -> Any:
         from fastapi.responses import JSONResponse
@@ -1291,6 +1452,7 @@ def create_app(
             "beta": _steering_config["beta"],
             "skew": _steering_config["skew"],
             "normalization": _steering_config["normalization"],
+            "autotune": dict(_autotune_state),
         }
         # Project cached probe onto behavioral codebook for diagnostics
         v = _probe_cache.get("v_probe")
@@ -1376,16 +1538,15 @@ def create_app(
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
                 max_tok = request.max_completion_tokens or request.max_tokens or 1024
-                temp = request.temperature
                 stop_ids = set(ctx.stop_token_ids)
                 token_ids = list(prompt_tokens)
                 think_end = ctx.think_end_token_id
                 in_thinking = request.enable_thinking and think_end is not None
                 hook = ctx.bottleneck_hook
-                alpha = request.estradiol_alpha if request.estradiol_alpha is not None else _steering_config["alpha"]
-                _apply_band_to_hook(
-                    request.estradiol_beta, request.estradiol_skew
-                )
+                alpha = _resolve_alpha(request)
+                temp = _resolve_temperature(request)
+                _beta_resolved_s, _skew_resolved_s = _resolve_beta_skew(request)
+                _apply_band_to_hook(_beta_resolved_s, _skew_resolved_s)
                 v_probe_prev = _probe_cache.get("v_probe")
                 generated_tokens: list[int] = []
                 _steering_stats["requests"] += 1
@@ -1445,6 +1606,8 @@ def create_app(
                         _steering_stats["last_certainty"] = _mean_cert_s(
                             certainty_steps_s
                         )
+                        _steering_stats["last_finish_reason"] = "stop"
+                        _run_autotune_after_turn("stop")
                         response_text = ctx.tokenizer_decode(generated_tokens)
                         logger.info(
                             "stream_complete",
@@ -1507,6 +1670,8 @@ def create_app(
                     _steering_stats["last_certainty"] = _mean_cert_s(
                         certainty_steps_s
                     )
+                    _steering_stats["last_finish_reason"] = "length"
+                    _run_autotune_after_turn("length")
                     response_text = ctx.tokenizer_decode(generated_tokens)
                     logger.info(
                         "stream_complete_length",
