@@ -1014,3 +1014,48 @@ class TestProbePersistence:
             resp = client.get("/v1/steering/status")
             assert resp.status_code == 200
             assert resp.json()["probe_cached"] is True
+
+    def test_create_app_saves_probe_at_shutdown(self, tmp_path: Any) -> None:
+        """When probe_save_path is set, lifespan shutdown writes the cache."""
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        # Prime the cache by loading, so shutdown has something to save.
+        load_path = tmp_path / "in.npy"
+        save_path = tmp_path / "out.npy"
+        expected = np.arange(8, dtype=np.float32)
+        np.save(load_path, expected)
+
+        ctx = _make_mock_ctx()
+        app = create_app(
+            ctx,
+            probe_load_path=str(load_path),
+            probe_save_path=str(save_path),
+        )
+
+        with TestClient(app):
+            pass  # exit triggers lifespan shutdown
+
+        assert save_path.exists(), "shutdown should have written the probe"
+        assert np.allclose(np.load(save_path), expected)
+
+    def test_create_app_shutdown_save_skips_when_cache_empty(
+        self, tmp_path: Any
+    ) -> None:
+        """Shutdown save is a no-op when no probe has been cached."""
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        save_path = tmp_path / "out.npy"
+        ctx = _make_mock_ctx()
+        app = create_app(ctx, probe_save_path=str(save_path))
+
+        with TestClient(app):
+            pass
+
+        assert not save_path.exists(), (
+            "shutdown should not write when cache is empty"
+        )

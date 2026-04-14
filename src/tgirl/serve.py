@@ -548,6 +548,7 @@ def create_app(
     transport_config: Any = None,
     hooks: list[Any] | None = None,
     probe_load_path: str | None = None,
+    probe_save_path: str | None = None,
 ) -> Any:
     """Create FastAPI app from a pre-loaded InferenceContext.
 
@@ -561,6 +562,9 @@ def create_app(
         hooks: Optional inference hooks.
         probe_load_path: If set, load a probe vector from this path on
             server startup (populates the self-steering cache).
+        probe_save_path: If set, save the probe cache to this path on
+            server shutdown (persists behavioral continuity across
+            restarts). No-op if the cache is empty at shutdown.
 
     Returns:
         A FastAPI application instance.
@@ -588,6 +592,23 @@ def create_app(
                 shape=list(arr.shape),
             )
         yield
+        if probe_save_path is not None:
+            v = _probe_cache.get("v_probe")
+            if v is None:
+                logger.info(
+                    "probe_save_at_shutdown_skipped",
+                    reason="cache_empty",
+                    path=probe_save_path,
+                )
+            else:
+                import numpy as np
+
+                np.save(probe_save_path, np.array(v))
+                logger.info(
+                    "probe_saved_at_shutdown",
+                    path=probe_save_path,
+                    shape=list(v.shape),
+                )
 
     app = FastAPI(title="tgirl", lifespan=_lifespan)
 
