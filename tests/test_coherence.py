@@ -82,4 +82,63 @@ class TestComputeCoherence:
         from tgirl.coherence import compute_coherence
 
         m = compute_coherence([1, 2, 3])
-        assert set(m.keys()) == {"n_tokens", "repeat_rate", "bigram_novelty"}
+        assert set(m.keys()) == {
+            "n_tokens",
+            "repeat_rate",
+            "bigram_novelty",
+            "token_entropy",
+        }
+
+    def test_token_entropy_zero_for_loop(self) -> None:
+        """Mode collapse: all tokens identical → H_norm = 0.
+        Distinguishes repetition from fracture when novelty alone
+        can't (fracture has high novelty too).
+        """
+        from tgirl.coherence import compute_coherence
+
+        m = compute_coherence([5, 5, 5, 5, 5, 5])
+        assert m["token_entropy"] == 0.0
+
+    def test_token_entropy_one_for_all_unique(self) -> None:
+        """Fracture / uniform sampling: every token novel → H_norm = 1.
+        Combined with repeat_rate ≈ 0, this is the word-salad signature.
+        """
+        from tgirl.coherence import compute_coherence
+
+        m = compute_coherence([1, 2, 3, 4, 5, 6, 7, 8])
+        assert m["token_entropy"] == pytest.approx(1.0)
+
+    def test_token_entropy_mid_range_for_structured(self) -> None:
+        """Healthy language sits in the middle band — Zipfian structure
+        gives ~0.6–0.8 H_norm for typical token streams.
+        """
+        from tgirl.coherence import compute_coherence
+
+        # 10 tokens, some repeats, typical of short coherent text.
+        m = compute_coherence([1, 2, 3, 1, 4, 5, 1, 6, 7, 8])
+        assert 0.4 < m["token_entropy"] < 1.0
+
+    def test_token_entropy_safe_default_for_short_sequences(self) -> None:
+        """n ≤ 1: no variance to measure → H_norm = 0 (not NaN)."""
+        from tgirl.coherence import compute_coherence
+
+        assert compute_coherence([]).get("token_entropy") == 0.0
+        assert compute_coherence([42]).get("token_entropy") == 0.0
+
+    def test_token_entropy_bigram_loop_is_NOT_fracture(self) -> None:
+        """The '[1,2,1,2,...]' degenerate loop has only 2 unique tokens
+        out of 6 — low entropy, exposing it as mode collapse even though
+        its repeat_rate (0.0) and bigram_novelty (0.4) could be mistaken
+        for light disorder. Entropy is the separator.
+        """
+        from tgirl.coherence import compute_coherence
+
+        m = compute_coherence([1, 2, 1, 2, 1, 2])
+        # 2 unique tokens in 6 positions: H = 1 bit, H_max = log2(6) ≈ 2.585
+        # H_norm = 1 / 2.585 ≈ 0.387
+        assert m["token_entropy"] < 0.5
+        # Confirms the signatures disagree on mode-collapse-vs-fracture:
+        # bigram_novelty > token_entropy here means "bigrams repeat
+        # but the underlying vocabulary is tiny" — exactly what a loop
+        # looks like in the feature space.
+        assert m["bigram_novelty"] > m["token_entropy"]
