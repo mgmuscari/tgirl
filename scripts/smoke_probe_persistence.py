@@ -223,11 +223,12 @@ def _continuity(
 
 
 def _build_cli_args(ns: argparse.Namespace, probe_path: Path) -> list[str]:
+    # tgirl.cli is a single click.command (not a group) — no "serve"
+    # subcommand; the flags attach directly to `python -m tgirl.cli`.
     return [
         ns.python,
         "-m",
         "tgirl.cli",
-        "serve",
         "--model",
         ns.model,
         "--tools",
@@ -246,13 +247,13 @@ def main() -> int:
     parser.add_argument(
         "--model",
         required=True,
-        help="Model ID/path passed to `tgirl serve --model`.",
+        help="Model ID/path passed to `tgirl.cli --model`.",
     )
     parser.add_argument(
         "--tools",
         default=None,
         help=(
-            "Path to tools module (required by `tgirl serve --tools`). "
+            "Path to tools module (required by `tgirl.cli --tools`). "
             "If omitted, a stub module is generated in the smoke tempdir."
         ),
     )
