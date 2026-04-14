@@ -549,6 +549,7 @@ def create_app(
     hooks: list[Any] | None = None,
     probe_load_path: str | None = None,
     probe_save_path: str | None = None,
+    probe_autosave_interval_s: float | None = None,
 ) -> Any:
     """Create FastAPI app from a pre-loaded InferenceContext.
 
@@ -565,18 +566,45 @@ def create_app(
         probe_save_path: If set, save the probe cache to this path on
             server shutdown (persists behavioral continuity across
             restarts). No-op if the cache is empty at shutdown.
+        probe_autosave_interval_s: If set, save the probe cache to
+            probe_save_path every N seconds during the server lifetime
+            in addition to the final shutdown save. Requires
+            probe_save_path to be set.
 
     Returns:
         A FastAPI application instance.
     """
+    import asyncio
     from contextlib import asynccontextmanager
 
     from fastapi import FastAPI
+
+    if probe_autosave_interval_s is not None and probe_save_path is None:
+        msg = (
+            "probe_autosave_interval_s requires probe_save_path: the "
+            "autosave loop has nowhere to write."
+        )
+        raise ValueError(msg)
 
     # Probe cache: persists the last bottleneck activation across turns.
     # Hoisted above `app` construction so the lifespan handler can close
     # over it. Referenced by /generate, /v1/steering/*, and _generate_tokens.
     _probe_cache: dict[str, Any] = {"v_probe": None}
+
+    def _write_probe(path: str, event: str) -> None:
+        import numpy as np
+
+        v = _probe_cache.get("v_probe")
+        if v is None:
+            logger.info(event + "_skipped", reason="cache_empty", path=path)
+            return
+        np.save(path, np.array(v))
+        logger.info(event, path=path, shape=list(v.shape))
+
+    async def _autosave_loop(path: str, interval_s: float) -> None:
+        while True:
+            await asyncio.sleep(interval_s)
+            _write_probe(path, "probe_autosaved")
 
     @asynccontextmanager
     async def _lifespan(_app: Any):
@@ -591,24 +619,27 @@ def create_app(
                 path=probe_load_path,
                 shape=list(arr.shape),
             )
-        yield
-        if probe_save_path is not None:
-            v = _probe_cache.get("v_probe")
-            if v is None:
-                logger.info(
-                    "probe_save_at_shutdown_skipped",
-                    reason="cache_empty",
-                    path=probe_save_path,
-                )
-            else:
-                import numpy as np
 
-                np.save(probe_save_path, np.array(v))
-                logger.info(
-                    "probe_saved_at_shutdown",
-                    path=probe_save_path,
-                    shape=list(v.shape),
-                )
+        autosave_task: asyncio.Task[None] | None = None
+        if (
+            probe_autosave_interval_s is not None
+            and probe_save_path is not None
+        ):
+            autosave_task = asyncio.create_task(
+                _autosave_loop(probe_save_path, probe_autosave_interval_s)
+            )
+
+        try:
+            yield
+        finally:
+            if autosave_task is not None:
+                autosave_task.cancel()
+                try:
+                    await autosave_task
+                except asyncio.CancelledError:
+                    pass
+            if probe_save_path is not None:
+                _write_probe(probe_save_path, "probe_saved_at_shutdown")
 
     app = FastAPI(title="tgirl", lifespan=_lifespan)
 
