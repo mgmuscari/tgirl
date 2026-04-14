@@ -592,13 +592,25 @@ def create_app(
     _probe_cache: dict[str, Any] = {"v_probe": None}
 
     def _write_probe(path: str, event: str) -> None:
+        # Atomic write: stream into a sibling .tmp, then os.replace.
+        # Non-atomic writes leave a truncated file at `path` on crash,
+        # and the next --probe-load on the same path raises from
+        # np.load — exactly the recovery path this feature promises.
+        # Using an open file object (not a string path) bypasses
+        # np.save's .npy suffix auto-append so the final file lands
+        # at exactly `path`, keeping --probe-save and --probe-load
+        # symmetric regardless of whether the user included .npy.
+        import os
         import numpy as np
 
         v = _probe_cache.get("v_probe")
         if v is None:
             logger.info(event + "_skipped", reason="cache_empty", path=path)
             return
-        np.save(path, np.array(v))
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as f:
+            np.save(f, np.array(v))
+        os.replace(tmp, path)
         logger.info(event, path=path, shape=list(v.shape))
 
     async def _autosave_loop(path: str, interval_s: float) -> None:
@@ -648,7 +660,19 @@ def create_app(
                 except asyncio.CancelledError:
                     pass
             if probe_save_path is not None:
-                _write_probe(probe_save_path, "probe_saved_at_shutdown")
+                # Swallow failures here for the same reason as the
+                # autosave loop: a best-effort save shouldn't raise
+                # out of the lifespan `finally` and obscure the real
+                # shutdown cause in logs.
+                try:
+                    _write_probe(
+                        probe_save_path, "probe_saved_at_shutdown"
+                    )
+                except Exception:
+                    logger.exception(
+                        "probe_shutdown_save_failed",
+                        path=probe_save_path,
+                    )
 
     app = FastAPI(title="tgirl", lifespan=_lifespan)
 
