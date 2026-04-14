@@ -946,7 +946,52 @@ def create_app(
         # does not override via estradiol_beta / estradiol_skew.
         "beta": None,
         "skew": 1.0,
+        # Steering normalization mode. "absolute" scales v_probe
+        # by α directly (pre-this-feature behavior). "residual_relative"
+        # strips v_probe's magnitude and rescales the correction to
+        # α * |residual_last| per forward pass — α becomes a structural
+        # fraction of the signal power being overwritten. Default is
+        # "absolute" so existing clients see no change.
+        "normalization": "absolute",
     }
+
+    _VALID_NORM_MODES = {"absolute", "residual_relative"}
+
+    def _apply_steering(
+        alpha: float,
+        v_probe_prev: Any,
+        norm_mode: str,
+        correction_norms: list[float] | None = None,
+    ) -> None:
+        """Push the current correction configuration onto the bottleneck
+        hook. Dispatches by normalization mode so the generation loops
+        remain a single call site regardless of which mode is active.
+        """
+        import mlx.core as _mx
+
+        hook_local = ctx.bottleneck_hook
+        if hook_local is None:
+            return
+        if alpha <= 0 or v_probe_prev is None:
+            hook_local.clear_steering()
+            return
+        if norm_mode == "residual_relative":
+            hook_local.set_probe_steering(v_probe_prev, alpha)
+            if correction_norms is not None:
+                # Magnitude is α * |residual_last|, not knowable ahead
+                # of the forward pass; record α * |v_probe| as a proxy
+                # so existing telemetry stays populated without a
+                # double-eval.
+                correction_norms.append(
+                    float(_mx.linalg.norm(v_probe_prev).item()) * alpha
+                )
+        else:
+            correction = alpha * v_probe_prev
+            hook_local.set_raw_correction(correction)
+            if correction_norms is not None:
+                correction_norms.append(
+                    float(_mx.linalg.norm(correction).item())
+                )
     _steering_stats: dict[str, Any] = {
         "requests": 0,
         "last_probe_norm": 0.0,
@@ -1041,14 +1086,12 @@ def create_app(
         generated: list[int] = []
         token_ids = list(prompt_tokens)
 
+        norm_mode = _steering_config["normalization"]
+
         for _ in range(max_tok):
-            # Steer: inject scaled probe from previous token (or previous turn)
-            if hook is not None and alpha > 0 and v_probe_prev is not None:
-                correction = alpha * v_probe_prev
-                hook.set_raw_correction(correction)
-                correction_norms.append(float(mx.linalg.norm(correction).item()))
-            elif hook is not None:
-                hook.clear_steering()
+            # Steer: inject scaled probe from previous token (or previous turn).
+            # Dispatch to absolute vs residual-relative mode.
+            _apply_steering(alpha, v_probe_prev, norm_mode, correction_norms)
 
             logits = ctx.forward_fn(token_ids)
             if hasattr(logits, "logits"):
@@ -1171,6 +1214,29 @@ def create_app(
         logger.info("probe_saved", path=path, norm=norm)
         return {"saved": path, "norm": norm, "shape": list(v.shape)}
 
+    @app.post("/v1/steering/normalization")
+    async def set_normalization(request: _FastAPIRequest) -> Any:
+        from fastapi.responses import JSONResponse
+
+        body: dict[str, Any] = {}
+        if "application/json" in request.headers.get("content-type", ""):
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+        mode = body.get("mode") or request.query_params.get("mode")
+        if mode not in _VALID_NORM_MODES:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"unknown mode: {mode!r}. "
+                    f"Must be one of: {sorted(_VALID_NORM_MODES)}."
+                },
+            )
+        _steering_config["normalization"] = mode
+        logger.info("normalization_updated", mode=mode)
+        return {"mode": mode}
+
     @app.post("/v1/steering/probe/clear")
     async def clear_probe() -> dict[str, Any]:
         """Reset the probe cache to empty. Use between α/β configurations
@@ -1207,6 +1273,7 @@ def create_app(
             "probe_cached": _probe_cache.get("v_probe") is not None,
             "beta": _steering_config["beta"],
             "skew": _steering_config["skew"],
+            "normalization": _steering_config["normalization"],
         }
         # Project cached probe onto behavioral codebook for diagnostics
         v = _probe_cache.get("v_probe")
@@ -1310,12 +1377,11 @@ def create_app(
                 if request.seed is not None:
                     mx.random.seed(request.seed)
 
+                norm_mode = _steering_config["normalization"]
+
                 for _ in range(max_tok):
-                    # Probe feedback steering
-                    if hook is not None and alpha > 0 and v_probe_prev is not None:
-                        hook.set_raw_correction(alpha * v_probe_prev)
-                    elif hook is not None:
-                        hook.clear_steering()
+                    # Probe feedback steering (absolute or residual-relative).
+                    _apply_steering(alpha, v_probe_prev, norm_mode)
 
                     logits = ctx.forward_fn(token_ids)
                     if hasattr(logits, "logits"):
