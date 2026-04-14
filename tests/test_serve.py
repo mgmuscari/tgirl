@@ -212,6 +212,82 @@ class TestLoadInferenceContext:
         # And the result is wired in
         assert ctx.estradiol_file is mock_cal
 
+    def test_mlx_bootstrap_passes_discovered_layer_path_to_calibrate(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """Regression: calibrate's layer_path defaults to 'model.layers'
+        but VL-style MLX models (Qwen3.5-*-MLX-*) wrap layers under
+        'language_model.model.layers'. Bootstrap must discover the
+        actual path on the loaded model and forward it, otherwise
+        calibrate raises AttributeError on the first attribute walk.
+        """
+        from tgirl.serve import load_inference_context
+
+        monkeypatch.chdir(tmp_path)
+
+        # Mock model whose layers ONLY exist under
+        # language_model.model.layers — accessing model.layers raises.
+        mock_model = MagicMock()
+
+        class _RaisingOnModelLayers:
+            """Stand-in for a model lacking the .model.layers attribute
+            chain — accessing 'model' on this object raises, simulating
+            the VL/MLX layout where the only valid path is
+            'language_model.model.layers'.
+            """
+
+            def __getattr__(self, name: str):
+                if name == "model":
+                    raise AttributeError(name)
+                raise AttributeError(name)
+
+        # language_model.model.layers walks a separate chain.
+        mock_model.language_model.model.layers = [MagicMock() for _ in range(28)]
+        mock_model.language_model.model.embed_tokens.weight.astype.return_value = (
+            MagicMock(shape=(100, 1024))
+        )
+        # Pin model.layers access to raise — simulating VL layout
+        type(mock_model).model = property(
+            lambda self: (_ for _ in ()).throw(AttributeError("model"))
+        )
+
+        mock_hf_tokenizer = MagicMock()
+        mock_hf_tokenizer.eos_token_id = 0
+        mock_hf_tokenizer.decode = MagicMock(return_value="")
+        mock_hf_tokenizer.encode = MagicMock(return_value=[])
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_hf_tokenizer
+
+        mock_cal = MagicMock()
+        mock_cal.K = 11
+        mock_cal.bottleneck_layer = 14
+
+        with (
+            patch("tgirl.serve._try_import_mlx", return_value=True),
+            patch(
+                "tgirl.serve._load_mlx_model",
+                return_value=(mock_model, mock_tokenizer),
+            ),
+            patch(
+                "tgirl.serve._make_mlx_forward", return_value=MagicMock()
+            ),
+            patch(
+                "tgirl.serve._make_mlx_grammar_factory",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "tgirl.calibrate.calibrate", return_value=mock_cal
+            ) as mock_calibrate,
+        ):
+            load_inference_context("test/test-model", backend="mlx")
+
+        assert mock_calibrate.called
+        kwargs = mock_calibrate.call_args.kwargs
+        assert kwargs.get("layer_path") == "language_model.model.layers", (
+            f"calibrate must be invoked with the discovered layer_path; "
+            f"got kwargs={kwargs}"
+        )
+
     def test_mlx_bootstrap_skipped_when_file_present(
         self, tmp_path: Any, monkeypatch: Any
     ) -> None:

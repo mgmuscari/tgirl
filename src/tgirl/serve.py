@@ -352,16 +352,47 @@ def _build_mlx_context(
         if cal is None and auto_calibrate:
             import tgirl.calibrate as _cal_mod
 
+            # Discover layer_path BEFORE calibrating: tgirl.calibrate
+            # defaults to "model.layers", but VL-style MLX wrappers
+            # (Qwen3.5-*-MLX-*, etc.) expose layers under
+            # "language_model.model.layers". Mismatched path → calibrate
+            # raises AttributeError walking the model graph. We probe
+            # both candidates against the loaded model and forward the
+            # one that resolves.
+            if layer_path is None:
+                for lp_candidate in [
+                    "language_model.model.layers",
+                    "model.layers",
+                ]:
+                    obj = model
+                    try:
+                        for attr in lp_candidate.split("."):
+                            obj = getattr(obj, attr)
+                        layer_path = lp_candidate
+                        break
+                    except AttributeError:
+                        continue
+            if layer_path is None:
+                msg = (
+                    "Cannot bootstrap estradiol calibration: layers "
+                    "not found at any known path on the loaded model. "
+                    "Pass --no-auto-calibrate to skip, or provide an "
+                    "explicit layer_path."
+                )
+                raise RuntimeError(msg)
+
             bootstrap_path = candidates[1]  # "<basename>.estradiol"
             logger.info(
                 "estradiol_bootstrap_starting",
                 model_id=model_id,
                 output_path=bootstrap_path,
+                layer_path=layer_path,
             )
             cal = _cal_mod.calibrate(
                 model=model,
                 tokenizer=hf_tokenizer,
                 model_id=model_id,
+                layer_path=layer_path,
                 output_path=bootstrap_path,
             )
             logger.info(
@@ -373,28 +404,17 @@ def _build_mlx_context(
             if hook is None and cal.bottleneck_layer is not None:
                 from tgirl.cache import _BottleneckHook
 
-                if layer_path is None:
-                    for lp_candidate in ["language_model.model.layers", "model.layers"]:
-                        obj = model
-                        try:
-                            for attr in lp_candidate.split("."):
-                                obj = getattr(obj, attr)
-                            layer_path = lp_candidate
-                            break
-                        except AttributeError:
-                            continue
-                if layer_path is not None:
-                    layers = model
-                    for attr in layer_path.split("."):
-                        layers = getattr(layers, attr)
-                    hook = _BottleneckHook(
-                        layers, layer_idx=cal.bottleneck_layer
-                    )
-                    hook.install()
-                    logger.info(
-                        "bottleneck_hook_from_bootstrap",
-                        layer=cal.bottleneck_layer,
-                    )
+                layers = model
+                for attr in layer_path.split("."):
+                    layers = getattr(layers, attr)
+                hook = _BottleneckHook(
+                    layers, layer_idx=cal.bottleneck_layer
+                )
+                hook.install()
+                logger.info(
+                    "bottleneck_hook_from_bootstrap",
+                    layer=cal.bottleneck_layer,
+                )
 
     logger.info(
         "mlx_model_loaded",
