@@ -209,7 +209,14 @@ def _render_ascii_table(rows: list[dict[str, Any]]) -> str:
     lines.append(
         "───────────────┼─────────────────────────┼───────────────┼───────┼────────"
     )
-    for (alpha, beta, skew), group in sorted(by_key.items()):
+    # Sort key: None (∞ sharpness, i.e. single-layer) sorts first so the
+    # β=∞ baseline row lands at the top of each α block.
+    def _sort_key(item: tuple) -> tuple:
+        (alpha, beta, skew), _ = item
+        beta_s = -float("inf") if beta is None else beta
+        return (alpha, beta_s, skew)
+
+    for (alpha, beta, skew), group in sorted(by_key.items(), key=_sort_key):
         h = _mean([r["token_entropy"] for r in group])
         nov = _mean([r["bigram_novelty"] for r in group])
         rep = _mean([r["repeat_rate"] for r in group])
