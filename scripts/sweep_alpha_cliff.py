@@ -280,6 +280,17 @@ def main() -> int:
         default=None,
         help="Prefix for CSV + ascii summary (default: in tempdir).",
     )
+    parser.add_argument(
+        "--normalization",
+        choices=["absolute", "residual_relative"],
+        default="absolute",
+        help=(
+            "Steering normalization mode. 'absolute' scales the correction "
+            "by |v_probe| (pre-this-feature behavior). 'residual_relative' "
+            "scales by |residual_last| so α becomes a structural fraction "
+            "of the signal power being overwritten."
+        ),
+    )
     parser.add_argument("--keep-workdir", action="store_true")
     ns = parser.parse_args()
 
@@ -304,6 +315,16 @@ def main() -> int:
     failure: Exception | None = None
     try:
         server.wait_ready(f"{base_url}/health")
+
+        # Set steering normalization mode once before the sweep begins.
+        # This is a server-wide config, not a per-request override.
+        _http_post(
+            f"{base_url}/v1/steering/normalization",
+            {"mode": ns.normalization},
+        )
+        print(
+            f"steering normalization: {ns.normalization}", file=sys.stderr
+        )
 
         for alpha in alpha_list:
             # Reset probe cache so each α starts from the same state.
