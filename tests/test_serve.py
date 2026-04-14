@@ -1681,6 +1681,34 @@ class TestBandSteering:
         assert isinstance(weights_arg, dict)
         assert sum(weights_arg.values()) == pytest.approx(1.0, abs=1e-6)
 
+    def test_probe_clear_endpoint_resets_cache(self, tmp_path: Any) -> None:
+        """POST /v1/steering/probe/clear zeros the cache, so sweeps
+        can reset between configurations without restarting the server.
+        """
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        # Prime the cache via --probe-load at startup.
+        probe_path = tmp_path / "probe.npy"
+        np.save(probe_path, np.arange(8, dtype=np.float32))
+        ctx = _make_mock_ctx()
+        app = create_app(ctx, probe_load_path=str(probe_path))
+
+        with TestClient(app) as client:
+            # Sanity: loaded probe shows cached.
+            assert client.get("/v1/steering/status").json()["probe_cached"]
+            # Clear.
+            resp = client.post("/v1/steering/probe/clear")
+            assert resp.status_code == 200
+            assert resp.json()["cleared"] is True
+            # Post-clear: cache empty.
+            assert (
+                client.get("/v1/steering/status").json()["probe_cached"]
+                is False
+            )
+
     def test_request_without_beta_resets_band_to_none(self) -> None:
         """A request with no β override (and no server default) resets
         the hook to single-layer — prevents stale band config from a

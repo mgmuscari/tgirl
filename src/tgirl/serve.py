@@ -1171,6 +1171,15 @@ def create_app(
         logger.info("probe_saved", path=path, norm=norm)
         return {"saved": path, "norm": norm, "shape": list(v.shape)}
 
+    @app.post("/v1/steering/probe/clear")
+    async def clear_probe() -> dict[str, Any]:
+        """Reset the probe cache to empty. Use between α/β configurations
+        in a parameter sweep so accumulated probe state from one step
+        doesn't bleed into the next."""
+        _probe_cache["v_probe"] = None
+        logger.info("probe_cleared")
+        return {"cleared": True}
+
     @app.post("/v1/steering/probe/load")
     async def load_probe(path: str = "session_probe.npy") -> dict[str, Any]:
         """Load a probe vector from disk into the cache."""
