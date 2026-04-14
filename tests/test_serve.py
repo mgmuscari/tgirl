@@ -1118,6 +1118,45 @@ class TestProbePersistence:
         with pytest.raises(ValueError, match="probe_save_path"):
             create_app(ctx, probe_autosave_interval_s=0.1)
 
+    @pytest.mark.parametrize("bad_interval", [0, 0.0, -1.0, -0.001])
+    def test_create_app_rejects_non_positive_autosave_interval(
+        self, tmp_path: Any, bad_interval: float
+    ) -> None:
+        """Non-positive intervals turn the autosave loop into a tight
+        write storm via asyncio.sleep(<=0). Reject at config time."""
+        from tgirl.serve import create_app
+
+        ctx = _make_mock_ctx()
+        with pytest.raises(ValueError, match="must be positive"):
+            create_app(
+                ctx,
+                probe_save_path=str(tmp_path / "out.npy"),
+                probe_autosave_interval_s=bad_interval,
+            )
+
+    @pytest.mark.parametrize("bad_interval", ["0", "0.0", "-1", "-0.5"])
+    def test_cli_rejects_non_positive_autosave_interval(
+        self, tmp_path: Any, bad_interval: str
+    ) -> None:
+        """CLI surfaces non-positive autosave intervals as UsageError
+        before any model load work happens."""
+        from click.testing import CliRunner
+
+        from tgirl.cli import serve
+
+        runner = CliRunner()
+        result = runner.invoke(
+            serve,
+            [
+                "--model", "test-model",
+                "--tools", "dummy",
+                "--probe-save-on-shutdown", str(tmp_path / "out.npy"),
+                "--probe-autosave-interval", bad_interval,
+            ],
+        )
+        assert result.exit_code != 0
+        assert "must be positive" in result.output
+
     def test_cli_forwards_probe_paths_to_create_app(
         self, tmp_path: Any
     ) -> None:
