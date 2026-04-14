@@ -1459,3 +1459,103 @@ class TestProbePersistence:
         assert len(call_log) >= 2, (
             f"expected autosave retries + shutdown save; got {call_log}"
         )
+
+
+class TestCoherenceTelemetry:
+    """Coherence signals surface on /v1/steering/status after each turn."""
+
+    def _make_deterministic_app(self, tokens_to_emit: list[int]) -> Any:
+        """Build an app whose fake_forward emits `tokens_to_emit` in order,
+        then EOS. Lets tests drive specific coherence profiles.
+        """
+        import mlx.core as mx
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import InferenceContext, create_app
+
+        vocab_size = max(tokens_to_emit + [1]) + 10
+        call_count = [0]
+
+        def fake_forward(token_ids: list[int]) -> Any:
+            idx = call_count[0]
+            call_count[0] += 1
+            logits = mx.zeros((vocab_size,))
+            if idx < len(tokens_to_emit):
+                logits = logits.at[tokens_to_emit[idx]].add(mx.array(100.0))
+            else:
+                logits = logits.at[0].add(mx.array(100.0))  # EOS
+            return logits
+
+        ctx = InferenceContext(
+            registry=MagicMock(),
+            forward_fn=fake_forward,
+            tokenizer_decode=lambda ids: "",
+            tokenizer_encode=lambda s: [1, 2, 3],
+            embeddings=MagicMock(),
+            grammar_guide_factory=lambda s: None,
+            mlx_grammar_guide_factory=None,
+            formatter=MagicMock(),
+            backend="mlx",
+            model_id="test-model",
+            stop_token_ids=[0],
+        )
+        return TestClient(create_app(ctx))
+
+    def test_status_exposes_last_coherence_after_completion(self) -> None:
+        """After a non-streaming completion, /v1/steering/status carries
+        the coherence signature of the turn just finished.
+        """
+        # All-same stream: maximally incoherent — repeat_rate=1.0,
+        # bigram_novelty=1/2. Drives a signal the status endpoint can echo.
+        client = self._make_deterministic_app([42, 42, 42])
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 10,
+            },
+        )
+        assert resp.status_code == 200
+
+        status = client.get("/v1/steering/status").json()
+        assert "last_coherence" in status, (
+            f"expected last_coherence on /v1/steering/status, got keys: "
+            f"{sorted(status.keys())}"
+        )
+        c = status["last_coherence"]
+        assert c["n_tokens"] == 3
+        assert c["repeat_rate"] == 1.0
+        assert c["bigram_novelty"] == pytest.approx(1 / 2)
+
+    def test_status_coherence_tracks_diverse_generation(self) -> None:
+        """A diverse token stream lands as high novelty, zero repeats."""
+        client = self._make_deterministic_app([10, 20, 30, 40])
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 10,
+            },
+        )
+        assert resp.status_code == 200
+
+        c = client.get("/v1/steering/status").json()["last_coherence"]
+        assert c["n_tokens"] == 4
+        assert c["repeat_rate"] == 0.0
+        assert c["bigram_novelty"] == 1.0
+
+    def test_status_has_no_coherence_before_first_turn(self) -> None:
+        """Before any generation, there is nothing to report. The field
+        should be absent (or explicitly None) — never a stale value from
+        a prior server process.
+        """
+        client = self._make_deterministic_app([1, 2, 3])
+
+        status = client.get("/v1/steering/status").json()
+        # Allowed: key absent, OR key present with value None.
+        val = status.get("last_coherence")
+        assert val is None
