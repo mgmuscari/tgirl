@@ -1179,6 +1179,88 @@ class TestProbePersistence:
         assert result.exit_code == 0
         assert "--probe-autosave-interval" in result.output
 
+    def test_write_is_atomic_destination_not_corrupted_on_rename_failure(
+        self, tmp_path: Any
+    ) -> None:
+        """A crash/failure between write and rename must leave the
+        destination path either untouched (previous good contents)
+        or absent — never a partially-written corrupt file."""
+        import time
+
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        # Pre-seed the destination with a known-good file so we can
+        # prove failed writes leave it untouched, not corrupted.
+        save_path = tmp_path / "out.npy"
+        good = np.arange(4, dtype=np.float32)
+        np.save(save_path, good)
+
+        # Load a different vector so the cache has fresh content
+        # that would be written on shutdown (and autosave ticks).
+        load_path = tmp_path / "in.npy"
+        np.save(load_path, np.arange(8, dtype=np.float32))
+
+        ctx = _make_mock_ctx()
+        app = create_app(
+            ctx,
+            probe_load_path=str(load_path),
+            probe_save_path=str(save_path),
+            probe_autosave_interval_s=0.03,
+        )
+
+        # Force every rename to fail. This simulates a crash after
+        # the tmp file is written but before the atomic rename lands.
+        with patch("os.replace", side_effect=OSError("simulated crash")):
+            with TestClient(app):
+                time.sleep(0.15)  # let at least one autosave tick run
+
+        # Destination must still hold the original good contents —
+        # no partial bytes from the failed writes leaked through.
+        reloaded = np.load(save_path)
+        assert np.allclose(reloaded, good), (
+            "rename failure corrupted the destination file"
+        )
+
+    def test_shutdown_save_roundtrips_without_npy_suffix(
+        self, tmp_path: Any
+    ) -> None:
+        """User-supplied path is used verbatim for the save; np.save's
+        suffix auto-append must not land the file at path+.npy."""
+        import os
+
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        load_path = tmp_path / "in.npy"
+        expected = np.arange(8, dtype=np.float32)
+        np.save(load_path, expected)
+
+        # Explicitly no .npy suffix.
+        save_path = str(tmp_path / "probe")
+
+        ctx = _make_mock_ctx()
+        app = create_app(
+            ctx,
+            probe_load_path=str(load_path),
+            probe_save_path=save_path,
+        )
+
+        with TestClient(app):
+            pass
+
+        assert os.path.exists(save_path), (
+            "file should land at user-supplied path, not path+.npy"
+        )
+        assert not os.path.exists(save_path + ".npy"), (
+            "np.save suffix auto-append leaked through"
+        )
+        assert np.allclose(np.load(save_path), expected)
+
     def test_autosave_write_failure_does_not_block_shutdown_save(
         self, tmp_path: Any
     ) -> None:
