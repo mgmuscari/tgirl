@@ -1178,3 +1178,56 @@ class TestProbePersistence:
         result = runner.invoke(serve, ["--help"])
         assert result.exit_code == 0
         assert "--probe-autosave-interval" in result.output
+
+    def test_autosave_write_failure_does_not_block_shutdown_save(
+        self, tmp_path: Any
+    ) -> None:
+        """Autosave I/O failures must not kill the task or skip the
+        final shutdown save — that path is exactly why persistence
+        exists."""
+        import time
+
+        import numpy as np
+        from fastapi.testclient import TestClient
+
+        from tgirl.serve import create_app
+
+        load_path = tmp_path / "in.npy"
+        save_path = tmp_path / "out.npy"
+        np.save(load_path, np.arange(8, dtype=np.float32))
+
+        original_save = np.save
+        call_log: list[str] = []
+
+        def flaky_save(p: Any, arr: Any) -> None:
+            call_log.append(str(p))
+            # Fail every autosave (interval tick), but allow the
+            # final shutdown save (identified by call count — after
+            # we've seen at least one failure, subsequent ones still
+            # fail to prove the task survives, then shutdown passes).
+            if len(call_log) < 3:
+                raise OSError("simulated disk full")
+            original_save(p, arr)
+
+        ctx = _make_mock_ctx()
+        app = create_app(
+            ctx,
+            probe_load_path=str(load_path),
+            probe_save_path=str(save_path),
+            probe_autosave_interval_s=0.03,
+        )
+
+        with patch("numpy.save", side_effect=flaky_save):
+            # Must not raise on exit despite repeated autosave failures.
+            with TestClient(app):
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and len(call_log) < 3:
+                    time.sleep(0.02)
+
+        # At least one autosave attempt + the shutdown save attempt
+        # should have been logged. The shutdown save is the critical
+        # assertion — without the fix, the dead-task exception would
+        # propagate out of the finally block and skip it entirely.
+        assert len(call_log) >= 2, (
+            f"expected autosave retries + shutdown save; got {call_log}"
+        )
