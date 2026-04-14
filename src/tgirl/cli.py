@@ -122,12 +122,33 @@ def _load_single_module(file_path: str, registry: ToolRegistry) -> None:
     multiple=True,
     help="Python module(s) or directory containing tool definitions.",
 )
+@click.option(
+    "--probe-load",
+    "probe_load",
+    default=None,
+    help=(
+        "Path to a .npy probe vector to load at startup. Populates the "
+        "self-steering cache so the first generated token inherits the "
+        "behavioral state from a previous session."
+    ),
+)
+@click.option(
+    "--probe-save-on-shutdown",
+    "probe_save_on_shutdown",
+    default=None,
+    help=(
+        "Path to write the current probe vector to on server shutdown. "
+        "Pair with --probe-load on the next start to continue the session."
+    ),
+)
 def serve(
     model: str,
     port: int,
     host: str,
     backend: str,
     tools: tuple[str, ...],
+    probe_load: str | None,
+    probe_save_on_shutdown: str | None,
 ) -> None:
     """Start the tgirl local inference server."""
     import uvicorn
@@ -147,7 +168,11 @@ def serve(
         f"Tools: {len(ctx.registry)}"
     )
 
-    app = create_app(ctx)
+    app = create_app(
+        ctx,
+        probe_load_path=probe_load,
+        probe_save_path=probe_save_on_shutdown,
+    )
     click.echo(f"Starting server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)
 

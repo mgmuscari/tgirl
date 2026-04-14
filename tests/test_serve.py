@@ -1059,3 +1059,63 @@ class TestProbePersistence:
         assert not save_path.exists(), (
             "shutdown should not write when cache is empty"
         )
+
+    def test_cli_exposes_probe_flags(self) -> None:
+        """CLI serve --help lists --probe-load and --probe-save-on-shutdown."""
+        from click.testing import CliRunner
+
+        from tgirl.cli import serve
+
+        runner = CliRunner()
+        result = runner.invoke(serve, ["--help"])
+        assert result.exit_code == 0
+        assert "--probe-load" in result.output
+        assert "--probe-save-on-shutdown" in result.output
+
+    def test_cli_forwards_probe_paths_to_create_app(
+        self, tmp_path: Any
+    ) -> None:
+        """CLI --probe-load / --probe-save-on-shutdown reach create_app."""
+        from click.testing import CliRunner
+
+        from tgirl.cli import serve
+
+        tool_file = tmp_path / "t.py"
+        tool_file.write_text(
+            "def register(registry):\n"
+            "    @registry.tool()\n"
+            "    def noop() -> int:\n"
+            "        return 0\n"
+        )
+
+        load_p = str(tmp_path / "in.npy")
+        save_p = str(tmp_path / "out.npy")
+
+        captured: dict[str, Any] = {}
+
+        def fake_create_app(ctx: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return MagicMock()
+
+        runner = CliRunner()
+        with (
+            patch(
+                "tgirl.serve.load_inference_context",
+                return_value=_make_mock_ctx(),
+            ),
+            patch("tgirl.serve.create_app", side_effect=fake_create_app),
+            patch("uvicorn.run"),
+        ):
+            result = runner.invoke(
+                serve,
+                [
+                    "--model", "test-model",
+                    "--tools", str(tool_file),
+                    "--probe-load", load_p,
+                    "--probe-save-on-shutdown", save_p,
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured.get("probe_load_path") == load_p
+        assert captured.get("probe_save_path") == save_p
