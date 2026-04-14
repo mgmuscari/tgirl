@@ -998,6 +998,9 @@ def create_app(
         "last_correction_norm": 0.0,
         "last_alpha": 0.0,
         "last_coherence": None,
+        # Mean per-token logit-distribution signals from the most recent
+        # turn — feeds the autotuner alongside last_coherence.
+        "last_certainty": None,
     }
 
     def _apply_band_to_hook(
@@ -1087,6 +1090,11 @@ def create_app(
         token_ids = list(prompt_tokens)
 
         norm_mode = _steering_config["normalization"]
+        # Per-token logit-distribution signals; surfaced as last_certainty
+        # alongside last_coherence at turn end so the autotuner can read
+        # both the model's pre-sampling confidence and its post-generation
+        # output structure.
+        certainty_steps: list[dict[str, float]] = []
 
         for _ in range(max_tok):
             # Steer: inject scaled probe from previous token (or previous turn).
@@ -1106,6 +1114,11 @@ def create_app(
                         mx.linalg.norm(v_probe_prev).item()
                     )
 
+            # Record certainty BEFORE temperature scaling — raw distribution.
+            from tgirl.certainty import step_certainty as _step_cert
+
+            certainty_steps.append(_step_cert(logits))
+
             if temp > 0:
                 logits = logits / temp
                 next_token = int(mx.random.categorical(logits).item())
@@ -1119,9 +1132,11 @@ def create_app(
                     _steering_stats["mean_correction_norm"] = (
                         sum(correction_norms) / len(correction_norms)
                     )
+                from tgirl.certainty import mean_certainty as _mean_cert
                 from tgirl.coherence import compute_coherence
 
                 _steering_stats["last_coherence"] = compute_coherence(generated)
+                _steering_stats["last_certainty"] = _mean_cert(certainty_steps)
                 return generated, "stop"
 
             generated.append(next_token)
@@ -1133,9 +1148,11 @@ def create_app(
             _steering_stats["mean_correction_norm"] = (
                 sum(correction_norms) / len(correction_norms)
             )
+        from tgirl.certainty import mean_certainty as _mean_cert
         from tgirl.coherence import compute_coherence
 
         _steering_stats["last_coherence"] = compute_coherence(generated)
+        _steering_stats["last_certainty"] = _mean_cert(certainty_steps)
         return generated, "length"
 
     @app.get("/v1/models")
@@ -1378,6 +1395,7 @@ def create_app(
                     mx.random.seed(request.seed)
 
                 norm_mode = _steering_config["normalization"]
+                certainty_steps_s: list[dict[str, float]] = []
 
                 for _ in range(max_tok):
                     # Probe feedback steering (absolute or residual-relative).
@@ -1394,6 +1412,10 @@ def create_app(
                             _steering_stats["last_probe_norm"] = float(
                                 mx.linalg.norm(v_probe_prev).item()
                             )
+
+                    from tgirl.certainty import step_certainty as _step_cert_s
+
+                    certainty_steps_s.append(_step_cert_s(logits))
 
                     if temp > 0:
                         logits = logits / temp
@@ -1414,10 +1436,14 @@ def create_app(
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
                         _probe_cache["v_probe"] = v_probe_prev
+                        from tgirl.certainty import mean_certainty as _mean_cert_s
                         from tgirl.coherence import compute_coherence
 
                         _steering_stats["last_coherence"] = compute_coherence(
                             generated_tokens
+                        )
+                        _steering_stats["last_certainty"] = _mean_cert_s(
+                            certainty_steps_s
                         )
                         response_text = ctx.tokenizer_decode(generated_tokens)
                         logger.info(
@@ -1472,10 +1498,14 @@ def create_app(
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     _probe_cache["v_probe"] = v_probe_prev
+                    from tgirl.certainty import mean_certainty as _mean_cert_s
                     from tgirl.coherence import compute_coherence
 
                     _steering_stats["last_coherence"] = compute_coherence(
                         generated_tokens
+                    )
+                    _steering_stats["last_certainty"] = _mean_cert_s(
+                        certainty_steps_s
                     )
                     response_text = ctx.tokenizer_decode(generated_tokens)
                     logger.info(
