@@ -322,7 +322,8 @@ def _build_mlx_context(
                     from tgirl.cache import _BottleneckHook
 
                     if layer_path is None:
-                        for lp_candidate in ["language_model.model.layers", "model.layers"]:
+                        _candidates = ["language_model.model.layers", "model.layers"]
+                        for lp_candidate in _candidates:
                             obj = model
                             try:
                                 for attr in lp_candidate.split("."):
@@ -540,9 +541,12 @@ try:
         logit_bias: dict[str, float] | None = None
         user: str | None = None
         # tgirl extensions
-        estradiol_alpha: float | None = None  # per-request override; uses server default
-        estradiol_beta: float | None = None  # band sharpness (inverse σ, layers⁻¹). None = single-layer.
-        estradiol_skew: float | None = None  # band σ_up/σ_down ratio. None = server default (1.0).
+        # per-request override; uses server default if None
+        estradiol_alpha: float | None = None
+        # band sharpness (inverse σ, layers⁻¹). None = single-layer.
+        estradiol_beta: float | None = None
+        # band σ_up/σ_down ratio. None = server default (1.0).
+        estradiol_skew: float | None = None
         enable_thinking: bool = False  # set True for reasoning mode
 
     class ChatCompletionChoice(_PydanticBase):

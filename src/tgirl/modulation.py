@@ -215,7 +215,7 @@ DEFAULT_CONDITIONERS: tuple[SourceConditionerConfig, ...] = (
     SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 3: overlap
     SourceConditionerConfig(range_min=0.0, range_max=10.0),  # 4: depth
     SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 5: position
-    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 6: envelope (continuous 0-1)
+    SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 6: envelope
     SourceConditionerConfig(),  # 7: cycle_detected
     SourceConditionerConfig(range_min=0.0, range_max=1.0),   # 8: linguistic_coherence
 )
@@ -301,7 +301,11 @@ class EnvelopeConfig:
                 SourceConditionerConfig(range_min=0.0, range_max=1.0)
             )  # envelope
             new.append(old[10] if len(old) > 10 else SourceConditionerConfig())  # cycle
-            new.append(old[11] if len(old) > 11 else SourceConditionerConfig(range_min=0.0, range_max=1.0))  # coherence
+            new.append(
+                old[11]
+                if len(old) > 11
+                else SourceConditionerConfig(range_min=0.0, range_max=1.0)
+            )  # coherence
             object.__setattr__(self, "conditioners", tuple(new))
         elif len(self.conditioners) != rows:
             raise ValueError(
