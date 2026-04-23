@@ -16,7 +16,7 @@ from typing import Any
 import mlx.core as mx
 import structlog
 
-from tgirl.cache import _BottleneckHook
+from tgirl.format import TokenizerProto
 
 logger = structlog.get_logger()
 
@@ -237,7 +237,9 @@ class _GenerationHook:
 # ---------------------------------------------------------------------------
 
 
-def _fmt_prompt_system(tok: Any, system_msg: str, user_msg: str) -> str:
+def _fmt_prompt_system(
+    tok: TokenizerProto, system_msg: str, user_msg: str
+) -> str:
     """Format a prompt with system + user roles.
 
     Falls back to embedding system msg in user prompt if the tokenizer's
@@ -281,7 +283,7 @@ def _fmt_prompt_system(tok: Any, system_msg: str, user_msg: str) -> str:
             msgs, tokenize=False, add_generation_prompt=True)
 
 
-def _fmt_prompt(tok: Any, text: str) -> str:
+def _fmt_prompt(tok: TokenizerProto, text: str) -> str:
     """Format a user prompt."""
     return _fmt_prompt_system(tok, "", text)
 
@@ -300,7 +302,6 @@ def _capture_gen(
     temp: float = 0.7,
 ) -> tuple[str, mx.array]:
     """Generate text and capture mean bottleneck activation."""
-    from mlx_lm.utils import generate_step
 
     formatted = _fmt_prompt(tok, prompt_text)
     prompt_tokens = mx.array(tok.encode(formatted))

@@ -575,7 +575,7 @@ class TestExposeMcp:
 
         # Mock session with run_chat that returns a result
         mock_result = MagicMock()
-        mock_result.text = "Pipeline result: 42"
+        mock_result.output_text = "Pipeline result: 42"
         mock_session = MagicMock()
         mock_session.run_chat.return_value = mock_result
 
@@ -620,6 +620,65 @@ class TestExposeMcp:
             item.text for item in content_list if hasattr(item, "text")
         ]
         assert any("Pipeline result: 42" in t for t in texts)
+
+    def test_expose_as_mcp_uses_output_text_field_on_real_sampling_result(
+        self,
+    ) -> None:
+        """Regression: bridge handler must read SamplingResult.output_text,
+        not the older `.text` attribute that only existed in MagicMock
+        auto-attribute synthesis. Constructs a real SamplingResult to
+        prove no AttributeError on its actual field surface."""
+        import asyncio
+
+        from mcp.server import FastMCP
+
+        from tgirl.bridge import expose_as_mcp
+        from tgirl.sample import SamplingResult
+
+        registry = ToolRegistry()
+
+        real_result = SamplingResult(
+            output_text="real output",
+            tool_calls=[],
+            telemetry=[],
+            total_tokens=0,
+            total_cycles=0,
+            wall_time_ms=0.0,
+            quotas_consumed={},
+        )
+        mock_session = MagicMock()
+        mock_session.run_chat.return_value = real_result
+        session_factory = MagicMock(return_value=mock_session)
+
+        server = FastMCP("test_real")
+        expose_as_mcp(
+            registry=registry,
+            pipeline_name="real_pipe",
+            description="real",
+            input_schema={
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            },
+            mcp_server=server,
+            session_factory=session_factory,
+        )
+
+        async def _call() -> Any:
+            return await server.call_tool("real_pipe", {"q": "hi"})
+
+        result = asyncio.run(_call())
+        if isinstance(result, tuple):
+            content_list = result[0]
+        else:
+            content_list = result
+        texts = [
+            item.text for item in content_list if hasattr(item, "text")
+        ]
+        assert any("real output" in t for t in texts), (
+            f"Expected handler to read .output_text from SamplingResult; "
+            f"got {texts}"
+        )
 
     def test_expose_as_mcp_without_session_factory_returns_stub(self) -> None:
         """expose_as_mcp without session_factory returns stub message."""

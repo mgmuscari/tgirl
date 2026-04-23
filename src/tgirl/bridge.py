@@ -62,7 +62,8 @@ def _extract_call_result_text(result: Any) -> str | None:
 
     for item in result.content:
         if hasattr(item, "text"):
-            return item.text
+            text: str = item.text
+            return text
     return None
 
 
@@ -535,7 +536,12 @@ def expose_as_mcp(
         )
         messages = [{"role": "user", "content": user_content}]
         result = session.run_chat(messages)
-        return result.text
+        # SamplingResult.output_text is the canonical field; the prior
+        # `.text` lookup only happened to work in tests via MagicMock
+        # auto-attribute synthesis. Real SamplingResult instances would
+        # AttributeError at runtime — latent bug fixed here.
+        output: str = result.output_text
+        return output
 
     pipeline_handler.__signature__ = sig  # type: ignore[attr-defined]
     pipeline_handler.__annotations__ = annotations
