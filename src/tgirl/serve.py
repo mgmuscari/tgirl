@@ -709,6 +709,7 @@ def create_app(
         # at exactly `path`, keeping --probe-save and --probe-load
         # symmetric regardless of whether the user included .npy.
         import os
+
         import numpy as np
 
         v = _probe_cache.get("v_probe")
@@ -1047,7 +1048,7 @@ def create_app(
         "normalization": "absolute",
     }
 
-    _VALID_NORM_MODES = {"absolute", "residual_relative"}
+    _valid_norm_modes = {"absolute", "residual_relative"}
 
     def _apply_steering(
         alpha: float,
@@ -1495,12 +1496,12 @@ def create_app(
             except Exception:
                 body = {}
         mode = body.get("mode") or request.query_params.get("mode")
-        if mode not in _VALID_NORM_MODES:
+        if mode not in _valid_norm_modes:
             return JSONResponse(
                 status_code=400,
                 content={
                     "error": f"unknown mode: {mode!r}. "
-                    f"Must be one of: {sorted(_VALID_NORM_MODES)}."
+                    f"Must be one of: {sorted(_valid_norm_modes)}."
                 },
             )
         _steering_config["normalization"] = mode
