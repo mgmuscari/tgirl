@@ -143,9 +143,11 @@ def load_estradiol(path: Any) -> CalibrationResult:
 
     tensors = load_file(str(path))
     # safetensors metadata requires re-reading the header
+    from typing import cast
+
     from safetensors import safe_open
 
-    with safe_open(str(path), framework="numpy") as f:
+    with cast(Any, safe_open)(str(path), framework="numpy") as f:
         meta = f.metadata()
 
     V_basis = mx.array(tensors["V_basis"]).astype(mx.float32)
@@ -173,7 +175,7 @@ def load_estradiol(path: Any) -> CalibrationResult:
     )
 
 
-def _mx():
+def _mx() -> Any:
     """Lazy import mlx.core."""
     import mlx.core as mx
 
