@@ -9,11 +9,12 @@ from __future__ import annotations
 import time
 from collections import Counter
 from collections.abc import Callable
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import mlx.core as mx
 import structlog
 
+from tgirl.cache import ForwardResult
 from tgirl.estradiol import EstradiolControllerProto
 from tgirl.sample import (
     ConstrainedGenerationResult,
@@ -23,6 +24,30 @@ from tgirl.state_machine import ConfidenceMonitorProto, TransitionSignal
 from tgirl.transport import TransportConfig
 from tgirl.transport_mlx import redistribute_logits_mlx
 from tgirl.types import ModelIntervention
+
+
+@runtime_checkable
+class SteerableForwardFn(Protocol):
+    """Steerable forward-fn contract used inside the controller branch.
+
+    A function with this signature is produced by
+    ``cache.make_steerable_mlx_forward_fn``. It takes a token list
+    plus an optional ``steering=`` keyword argument, and returns a
+    ``ForwardResult`` (logits + probe reading).
+
+    ``run_constrained_generation_mlx`` accepts a wider
+    ``Callable[[list[int]], Any]`` for ``forward_fn`` because the
+    non-steerable path returns a bare ``mx.array``; the steered path
+    locally narrows to ``SteerableForwardFn`` via ``cast`` before
+    invoking with the ``steering`` kwarg.
+    """
+
+    def __call__(
+        self,
+        token_history: list[int],
+        *,
+        steering: Any | None = None,
+    ) -> ForwardResult: ...
 
 logger = structlog.get_logger()
 
@@ -420,7 +445,7 @@ def apply_shaping_mlx(
 
 def run_constrained_generation_mlx(
     grammar_state: GrammarStateMlx,
-    forward_fn: Callable[[list[int]], mx.array],
+    forward_fn: Callable[[list[int]], Any],
     tokenizer_decode: Callable[[list[int]], str],
     embeddings: mx.array,
     hooks: list[InferenceHookMlx],
@@ -488,11 +513,18 @@ def run_constrained_generation_mlx(
 
         # 1. Forward pass — steerable if controller is active
         if controller is not None and _steering is not None:
-            _fwd_result = forward_fn(token_history, steering=_steering)
+            # Steered path: forward_fn is a SteerableForwardFn that
+            # accepts steering= and returns ForwardResult. Narrow via
+            # cast so the optional kwarg + .logits/.probe_alpha access
+            # type-check.
+            steerable_fn = cast(SteerableForwardFn, forward_fn)
+            _fwd_result = steerable_fn(token_history, steering=_steering)
             raw_logits = _fwd_result.logits
             if _fwd_result.probe_alpha is not None:
                 _delta = controller.step(_fwd_result.probe_alpha)
                 _steering = controller.make_steering_state(_delta)
+                assert estradiol_alphas is not None  # guarded above
+                assert estradiol_deltas is not None
                 estradiol_alphas.append(controller.alpha_current.tolist())
                 estradiol_deltas.append(_delta.tolist())
         else:

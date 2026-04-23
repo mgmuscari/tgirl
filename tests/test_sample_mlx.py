@@ -385,6 +385,33 @@ class TestRunConstrainedGenerationMlx:
         assert len(result.tokens) == 2
 
 
+class TestSteerableForwardFnProtocol:
+    """SteerableForwardFn protocol documents the steered forward-fn shape."""
+
+    def test_steerable_forward_fn_accepts_steering_kwarg(self) -> None:
+        """A function accepting (token_history, *, steering=None) -> ForwardResult
+        is structurally a SteerableForwardFn."""
+        import mlx.core as mx
+
+        from tgirl.cache import ForwardResult
+        from tgirl.sample_mlx import SteerableForwardFn
+
+        def steerable(
+            token_history: list[int], *, steering: object | None = None
+        ) -> ForwardResult:
+            return ForwardResult(
+                logits=mx.zeros((4,)),
+                probe_alpha=None if steering is None else mx.zeros((2,)),
+            )
+
+        # Runtime structural check via @runtime_checkable
+        assert isinstance(steerable, SteerableForwardFn)
+        # Functional check
+        result = steerable([1, 2, 3], steering=object())
+        assert isinstance(result, ForwardResult)
+        assert result.probe_alpha is not None
+
+
 class TestZeroTorchInSampleMlx:
     """sample_mlx.py must not import torch at module level."""
 
