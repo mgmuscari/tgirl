@@ -10,6 +10,7 @@ Optional dependency: requires ``fastapi`` and either ``mlx-lm`` or
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -324,7 +325,8 @@ def _build_mlx_context(
                     from tgirl.cache import _BottleneckHook
 
                     if layer_path is None:
-                        for lp_candidate in ["language_model.model.layers", "model.layers"]:
+                        _candidates = ["language_model.model.layers", "model.layers"]
+                        for lp_candidate in _candidates:
                             obj = model
                             try:
                                 for attr in lp_candidate.split("."):
@@ -542,9 +544,12 @@ try:
         logit_bias: dict[str, float] | None = None
         user: str | None = None
         # tgirl extensions
-        estradiol_alpha: float | None = None  # per-request override; uses server default
-        estradiol_beta: float | None = None  # band sharpness (inverse σ, layers⁻¹). None = single-layer.
-        estradiol_skew: float | None = None  # band σ_up/σ_down ratio. None = server default (1.0).
+        # per-request override; uses server default if None
+        estradiol_alpha: float | None = None
+        # band sharpness (inverse σ, layers⁻¹). None = single-layer.
+        estradiol_beta: float | None = None
+        # band σ_up/σ_down ratio. None = server default (1.0).
+        estradiol_skew: float | None = None
         enable_thinking: bool = False  # set True for reasoning mode
 
     class ChatCompletionChoice(_PydanticBase):
@@ -712,6 +717,7 @@ def create_app(
         # at exactly `path`, keeping --probe-save and --probe-load
         # symmetric regardless of whether the user included .npy.
         import os
+
         import numpy as np
 
         v = _probe_cache.get("v_probe")
@@ -805,10 +811,8 @@ def create_app(
         finally:
             if autosave_task is not None:
                 autosave_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await autosave_task
-                except asyncio.CancelledError:
-                    pass
             if probe_save_path is not None:
                 # Swallow failures here for the same reason as the
                 # autosave loop: a best-effort save shouldn't raise
@@ -1050,7 +1054,7 @@ def create_app(
         "normalization": "absolute",
     }
 
-    _VALID_NORM_MODES = {"absolute", "residual_relative"}
+    _valid_norm_modes = {"absolute", "residual_relative"}
 
     def _apply_steering(
         alpha: float,
@@ -1498,12 +1502,12 @@ def create_app(
             except Exception:
                 body = {}
         mode = body.get("mode") or request.query_params.get("mode")
-        if mode not in _VALID_NORM_MODES:
+        if mode not in _valid_norm_modes:
             return JSONResponse(
                 status_code=400,
                 content={
                     "error": f"unknown mode: {mode!r}. "
-                    f"Must be one of: {sorted(_VALID_NORM_MODES)}."
+                    f"Must be one of: {sorted(_valid_norm_modes)}."
                 },
             )
         _steering_config["normalization"] = mode

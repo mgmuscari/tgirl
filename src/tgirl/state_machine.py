@@ -249,13 +249,13 @@ def compute_transition_signal(
     log_probs = log_fn(probs)
 
     # grammar_mask_overlap: probability mass on grammar-valid tokens
-    weighted = [p * m for p, m in zip(probs, grammar_valid_mask)]
+    weighted = [p * m for p, m in zip(probs, grammar_valid_mask, strict=True)]
     grammar_mask_overlap = float(sum_fn(weighted))
 
     # token_entropy: -sum(p * log(p))
     p_log_p = [
         p * lp if lp != float("-inf") else 0.0
-        for p, lp in zip(probs, log_probs)
+        for p, lp in zip(probs, log_probs, strict=True)
     ]
     token_entropy = -float(sum_fn(p_log_p))
 

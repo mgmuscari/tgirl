@@ -1,5 +1,5 @@
 #!/bin/bash
-# Push Hands commit-msg hook: Enforce Conventional Commits
+# Dialectic commit-msg hook: Enforce Conventional Commits
 # https://www.conventionalcommits.org/
 
 FIRST_LINE=$(head -1 "$1")

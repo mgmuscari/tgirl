@@ -30,10 +30,29 @@ if [ "$CURRENT_BRANCH" != "$BRANCH_NAME" ]; then
     git checkout "$BRANCH_NAME"
 fi
 
-# Read tier metadata
-TIER=$(cat .push-hands-tier 2>/dev/null || echo "standard")
+# Pre-merge: verify the feature branch HEAD has .dialectic-tier.
+# Without this check, a missing tier file is masked by a silent fallback to
+# "standard", so the user thinks they're closing tier X but the script
+# proceeds as standard. Hard error, with a recovery path.
+if ! git show "$BRANCH_NAME:.dialectic-tier" >/dev/null 2>&1; then
+    echo "ERROR: .dialectic-tier is missing from $BRANCH_NAME HEAD." >&2
+    echo "       Tier metadata is required to determine artifact expectations." >&2
+    echo "       Recovery: either" >&2
+    echo "         (a) git checkout $BRANCH_NAME && echo standard > .dialectic-tier && \\" >&2
+    echo "             git add .dialectic-tier && git commit -m 'chore: restore tier metadata'" >&2
+    echo "         (b) re-create the branch via ./scripts/new-feature.sh" >&2
+    exit 1
+fi
+
+# Read tier metadata. The pre-merge check guarantees the file exists in
+# BRANCH_NAME's HEAD. If the working tree is out of sync (e.g. script was
+# invoked from main without a prior checkout), restore from that HEAD.
+if [ ! -f .dialectic-tier ]; then
+    git show "$BRANCH_NAME:.dialectic-tier" > .dialectic-tier
+fi
+TIER=$(cat .dialectic-tier)
 case "$TIER" in
-    light|standard|full) ;;
+    light|iterative|standard|full) ;;
     *) TIER="standard" ;;
 esac
 
@@ -101,9 +120,26 @@ echo "Merging ${BRANCH_NAME} to main..."
 git checkout main
 git merge --squash "$BRANCH_NAME"
 
-# Remove tier metadata from the squash staging area so it never reaches main
-git rm -f --cached .push-hands-tier 2>/dev/null || true
-rm -f .push-hands-tier
+# Remove tier metadata from the squash staging area so it never reaches main.
+# The squash merge pulls .dialectic-tier into the index; unstage + delete it
+# explicitly and verify absence. Loud error if it survives.
+if git diff --cached --name-only | grep -q '^\.dialectic-tier$'; then
+    git restore --staged .dialectic-tier
+    rm -f .dialectic-tier
+    echo "Removed .dialectic-tier from squash staging area."
+fi
+
+# Defense in depth: verify the file is absent from the index after unstage.
+if git diff --cached --name-only | grep -q '^\.dialectic-tier$'; then
+    echo "ERROR: .dialectic-tier is still in the index after cleanup." >&2
+    echo "       Manual intervention required before the squash commit." >&2
+    exit 1
+fi
+
+# Also verify no .dialectic-tier in the working tree.
+if [ -f .dialectic-tier ]; then
+    rm -f .dialectic-tier
+fi
 
 # Determine commit type from branch convention (default: feat)
 COMMIT_TYPE="feat"
@@ -113,11 +149,12 @@ if [ -n "$REPLY" ]; then
     COMMIT_TYPE="$REPLY"
 fi
 
-# Tier-appropriate commit message
-if [ "$TIER" = "light" ]; then
+# Tier-appropriate commit message. Light and iterative tiers produce no
+# PRD/PRP, so their commit messages don't reference those artifact paths.
+if [ "$TIER" = "light" ] || [ "$TIER" = "iterative" ]; then
     git commit -m "${COMMIT_TYPE}: ${FEATURE_NAME}
 
-Squash merge of ${BRANCH_NAME} (light tier)."
+Squash merge of ${BRANCH_NAME} (${TIER} tier)."
 else
     git commit -m "${COMMIT_TYPE}: ${FEATURE_NAME}
 

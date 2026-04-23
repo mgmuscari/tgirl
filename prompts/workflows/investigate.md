@@ -6,7 +6,7 @@ A workflow for iterative, empirically-driven debugging and optimization. The dev
 
 ## Tier
 
-Iterative. Sets `.push-hands-tier` to `iterative` if not already set.
+Iterative. Sets `.dialectic-tier` to `iterative` if not already set.
 
 ## Prerequisites
 
@@ -61,4 +61,3 @@ When the investigation loop is complete:
 - Profile before optimizing — measure, don't guess
 - Atomic commits — each fix is one commit
 - Document findings — capture lessons for future sessions
-- All tensor/matrix math uses accelerated libraries only

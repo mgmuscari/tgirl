@@ -162,8 +162,9 @@ class LLGuidanceGrammarStateMlx:
         if mask.ndim > 1:
             mask = mask.reshape(-1)
         if tokenizer_vocab_size > self._llg_vocab_size:
+            pad_size = tokenizer_vocab_size - self._llg_vocab_size
             mask = mx.concatenate(
-                [mask, mx.zeros(tokenizer_vocab_size - self._llg_vocab_size, dtype=mx.bool_)]
+                [mask, mx.zeros(pad_size, dtype=mx.bool_)]
             )
         elif tokenizer_vocab_size < self._llg_vocab_size:
             mask = mask[:tokenizer_vocab_size]

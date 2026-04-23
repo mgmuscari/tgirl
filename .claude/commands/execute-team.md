@@ -33,17 +33,8 @@ Description: You are the Code Review Partner. Read the PRP at `{path}` to unders
 Spawn both teammates using the Agent tool with `run_in_background: true` and `model: "opus"`:
 
 - `name: "proposer"`, `subagent_type: "proposer"`, `team_name: "execute-{slug}"`, `model: "opus"`
-  Prompt: _(inline stance — required because .claude/agents/*.md definitions don't load for team members, see Claude Code bug #24316)_
 
-  "You are the **Proposer** — thorough, systematic, completion-oriented. You have full tool access (Read, Write, Edit, Bash, Grep, Glob).
-
-  **Your constraints:**
-  - Read CLAUDE.md before writing any code — follow all project conventions
-  - Reference existing code patterns when implementing
-  - Log uncertainty — what you guessed, what needs human review
-  - Run validation gates after each task (lint, type check, tests)
-
-  **TDD is mandatory.** For each PRP task, follow this loop:
+  Prompt: "**TDD is mandatory.** For each PRP task, follow this loop:
   1. RED: Write test(s) that specify expected behavior. Run the test command — verify tests FAIL. If tests pass before implementation, they are too weak — rewrite them.
   2. GREEN: Implement minimum code to make tests pass. Run the test command — verify tests PASS. If tests still fail, fix implementation (never weaken tests). Never mock to make tests pass.
   3. REFACTOR: Clean up if needed (tests must still pass).
@@ -52,17 +43,8 @@ Spawn both teammates using the Agent tool with `run_in_background: true` and `mo
   **Your task:** Implement the PRP at {path}. Read the PRP, plan review (if exists at docs/reviews/plans/{slug}-review.md), and CLAUDE.md. For each PRP task: follow the TDD loop above, then send the commit SHA (from `git rev-parse HEAD`) and a summary to 'code-reviewer' via SendMessage, and WAIT for their response before starting the next task. If they flag a Blocking issue, fix it first. Timeout: if no response within 2 minutes, message the team lead and proceed. Send final summary to team lead when done — include for each task: commit SHA, what was implemented, reviewer findings, resolutions, and skipped reviews."
 
 - `name: "code-reviewer"`, `subagent_type: "code-reviewer"`, `team_name: "execute-{slug}"`, `model: "opus"`
-  Prompt: _(inline stance — required because .claude/agents/*.md definitions don't load for team members, see Claude Code bug #24316)_
 
-  "You are the **Code Review Partner** — detail-oriented, convention-aware, quality-sensing. You review code — you do NOT rewrite it. You CANNOT and MUST NOT modify files. You have no Write or Edit tools. Your tools are: Read, Grep, Glob, Bash.
-
-  **Your constraints:**
-  - Review diffs only — identify where balance breaks, do not fix it yourself
-  - Compare implementation against the PRP specification task by task
-  - Use `git show {sha}` and `git diff {sha}~1..{sha}` — NEVER HEAD-relative commands
-  - Categorize findings: Blocking (must fix), Significant, Minor, Nit
-
-  **Your task:** Review implementation of the PRP at {path}. Read the PRP and CLAUDE.md for context. Wait for commit SHAs from 'proposer' via messages. For each SHA: review the commit, check for spec mismatch, security vulnerabilities, performance issues, test quality, convention violations. Send findings to 'proposer'. ALWAYS respond even for clean commits — the proposer is waiting. Send final summary to team lead when done — include for each commit: SHA, PRP task number, findings, resolution, and verdict."
+  Prompt: "**Your task:** Review implementation of the PRP at {path}. Read the PRP and CLAUDE.md for context. Wait for commit SHAs from 'proposer' via messages. For each SHA: review the commit using `git show {sha}` and `git diff {sha}~1..{sha}` (NEVER HEAD-relative commands). Check for spec mismatch, security vulnerabilities, performance issues, test quality, convention violations. Categorize findings: Blocking (must fix), Significant, Minor, Nit. Send findings to 'proposer'. ALWAYS respond even for clean commits — the proposer is waiting. Send final summary to team lead when done — include for each commit: SHA, PRP task number, findings, resolution, and verdict."
 
 ### 5. Assign tasks
 
@@ -89,9 +71,9 @@ After both teammates are spawned:
 You are the **tech lead**, not a passive observer. You have full architectural context, the PRP, the plan review, and CLAUDE.md. Participate:
 
 - **Validate review findings** — When the code-reviewer flags an issue, assess whether it's blocking, significant, or noise. Message the proposer with your assessment if the reviewer's severity seems wrong.
-- **Intervene on workarounds** — If the proposer stubs something out, defers a decision, or implements a workaround instead of the real fix, call it out. Per CLAUDE.md: no "fix later" shims, no cross-framework conversions, no Python-fu on tensor data.
-- **Unblock the team** — If the proposer hits a technical obstacle (e.g., a hook not firing, a type error, a missing API), investigate it yourself and provide the answer rather than letting them spin.
-- **Verify quality** — Spot-check commits. Read diffs for critical tasks. Don't rubber-stamp.
+- **Intervene on workarounds** — If the proposer stubs something out, defers a decision, or implements a workaround instead of the real fix, call it out. No "fix later" shims land silently.
+- **Unblock the team** — If the proposer hits a technical obstacle (hook not firing, type error, missing API, ambiguous spec), investigate yourself and provide the answer rather than letting them spin.
+- **Verify quality** — Spot-check commits. Read diffs for critical tasks. Don't rubber-stamp summaries.
 - **Enforce TDD** — If a commit has implementation without tests, or tests that don't fail before implementation, flag it.
 
 Track:
@@ -141,7 +123,7 @@ Update the PRD status to IMPLEMENTED.
 
 ### 9. Commit review artifact
 
-Message: `docs: push hands code review for {slug} (team mode)`
+Message: `docs: dialectic code review for {slug} (team mode)`
 
 ### 10. Shutdown and cleanup
 

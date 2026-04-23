@@ -36,14 +36,12 @@ This skill sets the working mode to **iterative tier** — direct implementation
 - **Profile before optimizing** — use telemetry and measurement, not intuition
 - **Atomic commits** — each fix is one commit (test + implementation)
 - **Document findings** — update CLAUDE.md Known Gotchas if the issue could recur
-- **All tensor/matrix math** must use accelerated libraries (MLX or PyTorch), never Python list comprehensions on tensor data
-- **Never convert between linalg libraries** unless there is absolutely no alternative — exhaust the library's own API first
 
 ## Tier
 
-If `.push-hands-tier` is not already set, set it to `iterative`:
+If `.dialectic-tier` is not already set, set it to `iterative`:
 ```bash
-echo "iterative" > .push-hands-tier
+echo "iterative" > .dialectic-tier
 ```
 
 This enables direct implementation without team mode, while preserving TDD requirements and code review before PR.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Push Hands pre-commit hook: Lint + type check (fast gate)
+# Dialectic pre-commit hook: Lint + type check (fast gate)
 #
 # Replace these commands with your stack's equivalents:
 #   Python: ruff check src/ --fix && mypy src/ --ignore-missing-imports

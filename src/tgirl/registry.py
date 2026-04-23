@@ -296,7 +296,7 @@ class ToolRegistry:
         # Collect type grammars referenced by included tools
         referenced_tags = set()
         for td in tools:
-            for param_name, tag in td.param_tags:
+            for _param_name, tag in td.param_tags:
                 referenced_tags.add(tag)
 
         type_grammars = tuple(
