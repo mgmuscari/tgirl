@@ -11,6 +11,7 @@ Optional dependency: requires ``outlines``, ``llguidance``, and
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import structlog
@@ -103,7 +104,7 @@ class LLGuidanceGrammarState:
 
 
 def make_outlines_grammar_factory(
-    tokenizer: object,
+    tokenizer: Any,
 ) -> Callable[[str], GrammarState]:
     """Create a grammar factory that produces GrammarState from Lark EBNF.
 
@@ -139,11 +140,13 @@ class LLGuidanceGrammarStateMlx:
     def __init__(self, matcher: LLMatcher, llg_vocab_size: int) -> None:
         self._matcher = matcher
         self._llg_vocab_size = llg_vocab_size
-        self._bitmask = llg_mlx.allocate_token_bitmask(1, llg_vocab_size)
+        # llguidance.mlx ships without an explicit __all__/exports
+        # for these helpers — stub gap, not a real attribute miss.
+        self._bitmask = llg_mlx.allocate_token_bitmask(1, llg_vocab_size)  # type: ignore[attr-defined]
 
     def apply_mask_to_logits(self, logits: mx.array) -> mx.array:
         """Apply grammar mask directly to mx.array logits. Zero torch."""
-        llg_mlx.fill_next_token_bitmask(self._matcher, self._bitmask, 0)
+        llg_mlx.fill_next_token_bitmask(self._matcher, self._bitmask, 0)  # type: ignore[attr-defined]
         result = llg_mlx.apply_token_bitmask(logits, self._bitmask[0])
         # Preserve input shape — apply_token_bitmask may add batch dim
         if result.ndim > logits.ndim:
@@ -179,7 +182,7 @@ class LLGuidanceGrammarStateMlx:
 
 
 def make_outlines_grammar_factory_mlx(
-    tokenizer: object,
+    tokenizer: Any,
 ) -> Callable[[str], LLGuidanceGrammarStateMlx]:
     """Create a grammar factory that produces MLX-native GrammarState.
 

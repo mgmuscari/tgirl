@@ -6,6 +6,28 @@ message lists into model-consumable prompt strings.
 
 from __future__ import annotations
 
+from typing import Any, Protocol, runtime_checkable
+
+
+@runtime_checkable
+class TokenizerProto(Protocol):
+    """Minimum tokenizer surface required by ChatTemplateFormatter.
+
+    Documents the duck-typed contract on HuggingFace tokenizers used
+    by ``ChatTemplateFormatter``. The real ``transformers.PreTrainedTokenizer``
+    structurally satisfies this Protocol.
+    """
+
+    def apply_chat_template(
+        self,
+        conversation: list[dict[str, str]],
+        /,
+        *,
+        tokenize: bool = ...,
+        add_generation_prompt: bool = ...,
+        **kwargs: Any,
+    ) -> str: ...
+
 
 class PlainFormatter:
     """Simple concatenation formatter for base models and testing.
@@ -25,7 +47,7 @@ class PlainFormatter:
 class ChatTemplateFormatter:
     """Wraps a HuggingFace tokenizer's apply_chat_template method."""
 
-    def __init__(self, tokenizer: object) -> None:
+    def __init__(self, tokenizer: TokenizerProto) -> None:
         self._tokenizer = tokenizer
 
     def format_messages(
