@@ -35,7 +35,12 @@ class PlainFormatter:
     Joins messages as "role: content" lines separated by newlines.
     """
 
-    def format_messages(self, messages: list[dict[str, str]]) -> str:
+    def format_messages(
+        self, messages: list[dict[str, str]], **kwargs: object
+    ) -> str:
+        # Extra kwargs accepted for protocol compatibility; ignored by
+        # PlainFormatter which has no chat template.
+        del kwargs
         if not messages:
             return ""
         parts = []
@@ -53,7 +58,6 @@ class ChatTemplateFormatter:
     def format_messages(
         self,
         messages: list[dict[str, str]],
-        add_generation_prompt: bool = True,
         **kwargs: object,
     ) -> str:
         """Format messages using the tokenizer's chat template.
@@ -62,6 +66,7 @@ class ChatTemplateFormatter:
         through to apply_chat_template. Unsupported kwargs are silently
         dropped to maintain compatibility across model families.
         """
+        add_generation_prompt = bool(kwargs.pop("add_generation_prompt", True))
         try:
             return self._tokenizer.apply_chat_template(
                 messages,

@@ -458,7 +458,8 @@ class _Parser:
                 self._advance()
                 # If :status, next token is the status value
                 if keyword == "status":
-                    if self._peek() and self._peek().kind == "ident":
+                    peeked = self._peek()
+                    if peeked is not None and peeked.kind == "ident":
                         status = self._advance().value
                 continue
             self._advance()

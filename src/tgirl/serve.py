@@ -10,7 +10,7 @@ Optional dependency: requires ``fastapi`` and either ``mlx-lm`` or
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -85,7 +85,10 @@ def _load_mlx_model(model_id: str) -> tuple[Any, Any]:
     """Load model and tokenizer via mlx-lm."""
     import mlx_lm
 
-    model, tokenizer = mlx_lm.load(model_id)
+    # mlx_lm stub gap: at runtime mlx_lm.load returns (model, tokenizer);
+    # the stubs declare a 3-tuple. Real shape verified against mlx-lm
+    # >= 0.31.
+    model, tokenizer = mlx_lm.load(model_id)  # type: ignore[misc]
     return model, tokenizer
 
 
@@ -736,7 +739,7 @@ def create_app(
                 logger.exception("probe_autosave_failed", path=path)
 
     @asynccontextmanager
-    async def _lifespan(_app: Any):
+    async def _lifespan(_app: Any) -> AsyncIterator[None]:
         if probe_load_path is not None:
             import mlx.core as _mx
             import numpy as np
@@ -1616,7 +1619,7 @@ def create_app(
         if request.stream:
             from fastapi.responses import StreamingResponse
 
-            async def stream_gen():
+            async def stream_gen() -> AsyncIterator[str]:
                 # First chunk: role
                 chunk = ChatCompletionChunk(
                     id=completion_id,

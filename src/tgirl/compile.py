@@ -436,7 +436,7 @@ def _analyze_hy_ast(
     return None
 
 
-class _TgirlNodeTransformer(RestrictingNodeTransformer):
+class _TgirlNodeTransformer(RestrictingNodeTransformer):  # type: ignore[misc]  # RestrictedPython has no stubs — base class is Any
     """Subclass of RestrictingNodeTransformer for tgirl.
 
     Overrides:

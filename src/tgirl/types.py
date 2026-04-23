@@ -327,9 +327,18 @@ class SessionConfig(BaseModel):
 
 @runtime_checkable
 class PromptFormatter(Protocol):
-    """Protocol for formatting chat messages into model input strings."""
+    """Protocol for formatting chat messages into model input strings.
 
-    def format_messages(self, messages: list[dict[str, str]]) -> str: ...
+    Concrete implementations may accept extra keyword arguments
+    (e.g. ``add_generation_prompt`` or ``enable_thinking`` for
+    Qwen3.5) and silently drop those they do not support.
+    """
+
+    def format_messages(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: object,
+    ) -> str: ...
 
 
 # Rebuild forward refs for recursive types

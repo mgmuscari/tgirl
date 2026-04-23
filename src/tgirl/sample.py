@@ -140,7 +140,7 @@ class InferenceHook(Protocol):
 
 def merge_interventions(interventions: list[ModelIntervention]) -> ModelIntervention:
     """Merge multiple hook interventions. Last non-None value wins per field."""
-    merged: dict[str, object] = {}
+    merged: dict[str, Any] = {}
     for intervention in interventions:
         for field_name in ModelIntervention.model_fields:
             val = getattr(intervention, field_name)
@@ -819,7 +819,9 @@ class SamplingSession:
         # Lazy-converted on first MLX use
         self._mlx_hooks: list[InferenceHookMlx] | None = None
         # Map session backend to router backend ("auto" -> "torch" default)
-        _router_backend = "mlx" if backend == "mlx" else "torch"
+        _router_backend: Literal["torch", "mlx"] = (
+            "mlx" if backend == "mlx" else "torch"
+        )
         self._router = (
             ToolRouter(
                 grammar_guide_factory=grammar_guide_factory,
@@ -910,9 +912,12 @@ class SamplingSession:
         if hasattr(self._transition_policy, "reset"):
             self._transition_policy.reset()
 
-        # Signal computation — initialized lazily after backend detection
+        # Signal computation — initialized lazily after backend detection.
+        # _empty_mask holds either a torch.Tensor or an mx.array depending
+        # on the backend selected at runtime (set inside the if-block on
+        # first forward), so the static type is widened to Any | None.
         _compute_signal: Callable[..., TransitionSignal] | None = None
-        _empty_mask: torch.Tensor | None = None
+        _empty_mask: Any | None = None
         _signal_vocab_sz: int = 0
 
         for _ in range(self._config.max_tool_cycles + 1):
@@ -992,9 +997,12 @@ class SamplingSession:
                     )
                     probs = torch.softmax(logits, dim=-1)
                     probs = torch.clamp(probs, min=0.0)
-                    prob_sum = probs.sum()
-                    if prob_sum > 0:
-                        probs = probs / prob_sum
+                    # Use a distinct name so mypy doesn't widen prob_sum
+                    # against the MLX branch's `float` reassignment
+                    # earlier in the same scope.
+                    prob_sum_t = probs.sum()
+                    if prob_sum_t > 0:
+                        probs = probs / prob_sum_t
                     token_id = int(
                         torch.multinomial(probs, 1).item()
                     )
@@ -1003,7 +1011,11 @@ class SamplingSession:
                 token_history.append(token_id)
                 total_tokens += 1
 
-                # Compute transition signal from raw logits (native framework ops)
+                # Compute transition signal from raw logits (native framework ops).
+                # _empty_mask was set in the lazy-init block above on first
+                # forward — it cannot be None here.
+                assert _empty_mask is not None
+                assert _compute_signal is not None
                 signal = _compute_signal(
                     token_position=freeform_pos,
                     logits=raw_logits,
