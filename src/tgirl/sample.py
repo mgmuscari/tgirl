@@ -823,6 +823,7 @@ class SamplingSession:
         self._router = (
             ToolRouter(
                 grammar_guide_factory=grammar_guide_factory,
+                mlx_grammar_guide_factory=mlx_grammar_guide_factory,
                 forward_fn=forward_fn,
                 tokenizer_decode=tokenizer_decode,
                 embeddings=embeddings,
@@ -1094,6 +1095,10 @@ class SamplingSession:
                 else:
                     routing_context = token_history
 
+                # rerank_active above asserted self._router is not None,
+                # but mypy can't narrow across the multi-condition truthy
+                # check — re-assert here for the dispatch.
+                assert self._router is not None
                 rerank_result = self._router.route(
                     snapshot=snapshot,
                     context_tokens=routing_context,

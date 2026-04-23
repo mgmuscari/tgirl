@@ -32,8 +32,15 @@ class ToolRouter:
         embeddings: torch.Tensor | Any,
         config: RerankConfig | None = None,
         backend: Literal["torch", "mlx"] = "torch",
+        mlx_grammar_guide_factory: Callable[[str], Any] | None = None,
     ) -> None:
         self._grammar_guide_factory = grammar_guide_factory
+        # When backend == "mlx", routing uses the MLX-native grammar
+        # factory so the grammar_state has get_valid_mask_mx and the
+        # cross-framework conversion fallback in
+        # run_constrained_generation_mlx is unnecessary. Falls back to
+        # the torch factory only if no MLX factory is configured.
+        self._mlx_grammar_guide_factory = mlx_grammar_guide_factory
         self._forward_fn = forward_fn
         self._tokenizer_decode = tokenizer_decode
         self._embeddings = embeddings
@@ -122,7 +129,13 @@ class ToolRouter:
 
         # Step 5: Compile grammar into fresh GrammarState
         # (GrammarState is mutated by advance(), so we need a fresh one each call)
-        grammar_state = self._grammar_guide_factory(routing_grammar_text)
+        if (
+            self._backend == "mlx"
+            and self._mlx_grammar_guide_factory is not None
+        ):
+            grammar_state = self._mlx_grammar_guide_factory(routing_grammar_text)
+        else:
+            grammar_state = self._grammar_guide_factory(routing_grammar_text)
 
         # Step 6: Run constrained generation with empty hooks
         tc = transport_config or TransportConfig()

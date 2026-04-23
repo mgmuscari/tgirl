@@ -505,8 +505,21 @@ def run_constrained_generation_mlx(
         if hasattr(hook, "reset"):
             hook.reset()
 
-    # Detect grammar state type once
-    has_mlx_mask = hasattr(grammar_state, "get_valid_mask_mx")
+    # All grammar states feeding this function MUST expose
+    # get_valid_mask_mx — the MLX-native mask path. When used via
+    # ToolRouter, the MLX-aware factory dispatch ensures this. The
+    # previous cross-framework fallback (mx.array(torch_mask.numpy()))
+    # was deleted to comply with CLAUDE.md "no cross-framework
+    # conversions" (2026-03-14 gotcha).
+    if not hasattr(grammar_state, "get_valid_mask_mx"):
+        msg = (
+            "run_constrained_generation_mlx requires a grammar_state "
+            "with get_valid_mask_mx (MLX-native). Got "
+            f"{type(grammar_state).__name__}. Wire the MLX grammar "
+            "factory through SamplingSession.mlx_grammar_guide_factory "
+            "or call run_constrained_generation (torch) instead."
+        )
+        raise TypeError(msg)
 
     for position in range(max_tokens):
         _t0 = time.monotonic()
@@ -531,13 +544,8 @@ def run_constrained_generation_mlx(
             raw_logits = forward_fn(token_history)
         _t1 = time.monotonic()
 
-        # 2. Grammar mask — pure MLX via llguidance.mlx (or fallback)
-        if has_mlx_mask:
-            valid_mask = grammar_state.get_valid_mask_mx(vocab_size)
-        else:
-            # Fallback for torch-based grammar states
-            valid_mask_torch = grammar_state.get_valid_mask(vocab_size)
-            valid_mask = mx.array(valid_mask_torch.numpy())
+        # 2. Grammar mask — pure MLX via llguidance.mlx
+        valid_mask = grammar_state.get_valid_mask_mx(vocab_size)
 
         # Mask out stop tokens while grammar is not yet accepting —
         # prevents premature EOS. Once the grammar accepts (complete

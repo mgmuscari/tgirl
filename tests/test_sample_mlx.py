@@ -343,8 +343,13 @@ class TestRunConstrainedGenerationMlx:
         # Hook should have set temperatures
         assert all(t >= 0 for t in result.temperatures_applied)
 
-    def test_torch_grammar_fallback(self) -> None:
-        """torch-based grammar state still works via fallback path."""
+    def test_torch_grammar_state_raises_typeerror(self) -> None:
+        """Torch-only grammar states must NOT be silently accepted by the
+        MLX path. The previous cross-framework fallback
+        (mx.array(torch_mask.numpy())) was deleted to comply with
+        CLAUDE.md "no cross-framework conversions" (2026-03-14 gotcha).
+        Callers must wire the MLX-native grammar factory through
+        SamplingSession.mlx_grammar_guide_factory."""
         import torch
 
         from tgirl.sample_mlx import run_constrained_generation_mlx
@@ -355,16 +360,6 @@ class TestRunConstrainedGenerationMlx:
         gs.get_valid_mask = MagicMock(
             return_value=torch.ones(10, dtype=torch.bool)
         )
-        call_count = [0]
-
-        def advance(token_id):
-            call_count[0] += 1
-
-        def is_accepting():
-            return call_count[0] >= 2
-
-        gs.advance.side_effect = advance
-        gs.is_accepting.side_effect = is_accepting
 
         forward = self._make_mock_forward()
         decode = lambda tokens: "test"
@@ -372,17 +367,16 @@ class TestRunConstrainedGenerationMlx:
             np.random.randn(10, 8).astype(np.float32)
         )
 
-        result = run_constrained_generation_mlx(
-            grammar_state=gs,
-            forward_fn=forward,
-            tokenizer_decode=decode,
-            embeddings=embeddings,
-            hooks=[],
-            transport_config=TransportConfig(),
-            max_tokens=10,
-        )
-
-        assert len(result.tokens) == 2
+        with pytest.raises(TypeError, match="get_valid_mask_mx"):
+            run_constrained_generation_mlx(
+                grammar_state=gs,
+                forward_fn=forward,
+                tokenizer_decode=decode,
+                embeddings=embeddings,
+                hooks=[],
+                transport_config=TransportConfig(),
+                max_tokens=10,
+            )
 
 
 class TestSteerableForwardFnProtocol:
