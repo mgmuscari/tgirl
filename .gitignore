@@ -48,5 +48,6 @@ benchmarks/*.log
 # Git worktrees are created outside this directory, but ignore any local artifacts
 *.worktree
 
-# Push Hands tier metadata — feature-branch-local, never tracked
+# Push Hands / Dialectic tier metadata — feature-branch-local, never tracked
 .push-hands-tier
+.dialectic-tier
