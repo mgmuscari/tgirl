@@ -212,9 +212,9 @@ def compute_transition_signal(
     token_position: int,
     logits: Any,
     grammar_valid_mask: Any,
-    softmax_fn: Callable,
-    sum_fn: Callable,
-    log_fn: Callable,
+    softmax_fn: Callable[..., Any],
+    sum_fn: Callable[..., Any],
+    log_fn: Callable[..., Any],
     vocab_size: int,
     sampled_token_id: int | None = None,
 ) -> TransitionSignal:
@@ -603,7 +603,7 @@ class CompositeTransitionPolicy:
 
     def __init__(
         self,
-        policies: list,
+        policies: list[TransitionPolicy],
         mode: str = "or",
     ) -> None:
         self.policies = policies

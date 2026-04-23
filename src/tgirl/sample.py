@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from tgirl.registry import ToolRegistry
+    from tgirl.sample_mlx import InferenceHookMlx
     from tgirl.state_machine import Checkpoint, TransitionPolicy
     from tgirl.types import PromptFormatter
 
@@ -751,7 +752,7 @@ class SamplingSession:
         rerank_config: RerankConfig | None = None,
         formatter: PromptFormatter | None = None,
         backend: Literal["torch", "mlx", "auto"] = "auto",
-        mlx_grammar_guide_factory: Callable | None = None,
+        mlx_grammar_guide_factory: Callable[[str], Any] | None = None,
         transition_policy: TransitionPolicy | None = None,
         stop_token_ids: list[int] | None = None,
         tool_call_primer_tokens: list[int] | None = None,
@@ -810,7 +811,8 @@ class SamplingSession:
             else None
         )
         self._embeddings_mlx: Any = None  # Lazy-converted on first MLX use
-        self._mlx_hooks: list | None = None  # Lazy-converted on first MLX use
+        # Lazy-converted on first MLX use
+        self._mlx_hooks: list[InferenceHookMlx] | None = None
         # Map session backend to router backend ("auto" -> "torch" default)
         _router_backend = "mlx" if backend == "mlx" else "torch"
         self._router = (
@@ -903,7 +905,7 @@ class SamplingSession:
             self._transition_policy.reset()
 
         # Signal computation — initialized lazily after backend detection
-        _compute_signal: Callable | None = None
+        _compute_signal: Callable[..., TransitionSignal] | None = None
         _empty_mask: torch.Tensor | None = None
         _signal_vocab_sz: int = 0
 

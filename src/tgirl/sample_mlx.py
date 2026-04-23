@@ -427,7 +427,7 @@ def run_constrained_generation_mlx(
     max_tokens: int = 512,
     context_tokens: list[int] | None = None,
     confidence_monitor: object | None = None,
-    grammar_guide_factory: Callable | None = None,
+    grammar_guide_factory: Callable[[str], Any] | None = None,
     grammar_text: str | None = None,
     stop_token_ids: list[int] | None = None,
     reachable_tokens: frozenset[int] | None = None,

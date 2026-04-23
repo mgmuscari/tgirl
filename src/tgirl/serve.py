@@ -45,7 +45,7 @@ class InferenceContext:
     tokenizer_encode: Callable[[str], list[int]]
     embeddings: Any
     grammar_guide_factory: Callable[[str], Any]
-    mlx_grammar_guide_factory: Callable | None
+    mlx_grammar_guide_factory: Callable[[str], Any] | None
     formatter: PromptFormatter
     backend: Literal["torch", "mlx"]
     model_id: str
@@ -96,7 +96,7 @@ def _make_mlx_forward(model: Any) -> Callable[[list[int]], Any]:
     return make_mlx_forward_fn(model)
 
 
-def _make_mlx_grammar_factory(tokenizer: Any) -> Callable:
+def _make_mlx_grammar_factory(tokenizer: Any) -> Callable[[str], Any]:
     """Create MLX grammar guide factory."""
     from tgirl.outlines_adapter import make_outlines_grammar_factory_mlx
 
@@ -119,7 +119,7 @@ def _make_torch_forward(model: Any) -> Callable[[list[int]], Any]:
     return make_hf_forward_fn(model)
 
 
-def _make_torch_grammar_factory(tokenizer: Any) -> Callable:
+def _make_torch_grammar_factory(tokenizer: Any) -> Callable[[str], Any]:
     """Create torch grammar guide factory."""
     from tgirl.outlines_adapter import make_outlines_grammar_factory
 
