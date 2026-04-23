@@ -1,5 +1,7 @@
 """tgirl: Transformational Generator for Inference-Restricting Languages."""
 
+import contextlib
+
 from annotated_types import Ge, Gt, Le, Lt, MultipleOf
 
 from tgirl.cache import (
@@ -76,7 +78,7 @@ from tgirl.types import (
     UnionType,
 )
 
-try:
+with contextlib.suppress(ImportError):  # mlx not available
     from tgirl.sample_mlx import (
         GrammarStateMlx,
         GrammarTemperatureHookMlx,
@@ -89,16 +91,12 @@ try:
         TransportResultMlx,
         redistribute_logits_mlx,
     )
-except ImportError:
-    pass  # mlx not available
 
-try:
+with contextlib.suppress(ImportError):  # llguidance/mlx not available
     from tgirl.outlines_adapter import (
         LLGuidanceGrammarStateMlx,
         make_outlines_grammar_factory_mlx,
     )
-except ImportError:
-    pass  # llguidance/mlx not available
 
 __version__ = "0.1.0"
 

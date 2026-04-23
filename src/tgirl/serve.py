@@ -10,6 +10,7 @@ Optional dependency: requires ``fastapi`` and either ``mlx-lm`` or
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -803,10 +804,8 @@ def create_app(
         finally:
             if autosave_task is not None:
                 autosave_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await autosave_task
-                except asyncio.CancelledError:
-                    pass
             if probe_save_path is not None:
                 # Swallow failures here for the same reason as the
                 # autosave loop: a best-effort save shouldn't raise

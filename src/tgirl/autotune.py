@@ -211,10 +211,7 @@ def autotune(obs: Observables) -> Action:
         # Switching from single-layer to β=2.0 is also known to break
         # out (the 2D sweep showed β=2.0 lengthens output at α=0.3,
         # 0.5). If we're not already in the safe band, jump there.
-        if obs.beta is None:
-            next_beta = _BETA_FLOOR
-        else:
-            next_beta = _safe_beta(obs.beta)
+        next_beta = _BETA_FLOOR if obs.beta is None else _safe_beta(obs.beta)
         rationale = (
             f"sycophant trap: n_tok={obs.n_tokens}, H={obs.token_entropy:.2f}; "
             f"α jittered {direction}, β→{next_beta}"

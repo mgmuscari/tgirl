@@ -84,10 +84,7 @@ def generate_tool_doc(tool: ToolDefinition) -> str:
         param_parts.append(_param_label(p.name, p.type_repr, tag))
 
     params_str = " ".join(param_parts)
-    if params_str:
-        signature = f"({tool.name} {params_str})"
-    else:
-        signature = f"({tool.name})"
+    signature = f"({tool.name} {params_str})" if params_str else f"({tool.name})"
 
     ret_label = _type_label(tool.return_type)
 
