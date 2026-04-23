@@ -1186,9 +1186,11 @@ class SamplingSession:
                             )
                         elif _is_mod_matrix_hook(hook):
                             from tgirl.modulation import (
+                                ModMatrixHook,
                                 ModMatrixHookMlx,
                             )
 
+                            assert isinstance(hook, ModMatrixHook)
                             self._mlx_hooks.append(
                                 ModMatrixHookMlx(
                                     config=hook.config,
