@@ -58,6 +58,27 @@ strict = true
 plugins = ["pydantic.mypy"]
 mypy_path = "src"
 
+[[tool.mypy.overrides]]
+module = [
+    "mlx",
+    "mlx.*",
+    "mlx_lm",
+    "mlx_lm.*",
+    "llguidance",
+    "llguidance.*",
+    "transformers",
+    "transformers.*",
+    "outlines",
+    "outlines.*",
+    "mcp",
+    "mcp.*",
+    "hy",
+    "hy.*",
+    "RestrictedPython",
+    "RestrictedPython.*",
+]
+ignore_missing_imports = true
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true
