@@ -87,6 +87,7 @@ for position in range(max_tokens):
 - `HandlerFn` Protocol: `(session, payload) -> InterruptAction`. The `session` arg is supplied by the controller, not the caller of `dispatch_pending` — see binding below.
 - `InterruptController`:
   - **Session-bound at construction.** `__init__(self, session: "SamplingSession")` stores `self._session = session`. Handlers receive this session, so `dispatch_pending()` takes no session argument. This resolves the constrained-gen call-site gap (Y3): the module-level `run_constrained_generation[_mlx]` functions only need to receive the `InterruptController` instance, not the session.
+  - **Lifecycle coupling (explicit):** controller lifetime is exactly session lifetime. `InterruptController.__init__` includes `assert session is not None, "controller is session-bound; weakref is Phase 2 work"`. The resulting strong cycle (session ↔ controller) is handled by Python's cycle collector; no `__del__` is defined on either. **Future cache-fork or multi-session work must revisit this coupling** — if either side grows a finalizer, switch to `weakref.ref(session)` and a defensive `if self._session() is None: return CONTINUE` at dispatch start. AC#12 two-controller isolation is tested via fixture-scoped sessions, not GC semantics, so the strong-ref choice does not weaken the isolation test.
   - **Naming:** the session field is `self._irq`. ESTRADIOL's existing `self._controller` is unchanged. All PRP references to "the controller" mean the IRQ controller unless stated otherwise.
   - `collections.deque` for pending queue; `threading.Lock` (plain, not RLock) guarding `_pending`, `_masked`, `_scheduled_timers`, `_next_timer_fire`, and the Task 10 event buffer.
   - `register(source, handler)` / `unregister(source, handler)` — list per source; registration-order is tiebreak within priority.
@@ -180,38 +181,81 @@ for position in range(max_tokens):
 
 ---
 
-### Task 4a: Route `/v1/chat/completions` (streaming + non-streaming) through `SamplingSession`
+### Task 4a-i: Add plain-freeform streaming API to `SamplingSession`
 
-**Why this exists (Y1 + Y2 root cause):** the current `chat_completions` handler has its own ad-hoc MLX loop at `serve.py:1619–1779` (streaming, `stream_gen`) and `serve.py:1254–1366` (non-streaming, `_generate_tokens`). Neither path instantiates `SamplingSession`. Task 4b's "install CANCEL handler on the session" and Task 7's "TURN_COMPLETE handler at session creation" both have no session to attach to. Rather than decoupling `InterruptController` from `SamplingSession` (which breaks AC#12 isolation), we collapse both ad-hoc loops into the unified sampling engine.
+**Why this exists (Y1 + Y2 root cause, mandatory split per training-partner review):** `SamplingSession` today exposes only `.run(prompt_tokens)` (sample.py:877) and `.run_chat(messages)` (sample.py:829), both returning a buffered `SamplingResult`. **There is no streaming iterator.** Worse, `.run()` orchestrates the full dual-mode machinery (freeform ↔ constrained, tool calling, grammar, transport, rerank, hooks), whereas `serve.py`'s `stream_gen` / `_generate_tokens` run *plain steered freeform* — no tools, no grammar, no transport, no rerank. The semantic gap is bigger than "add an iterator": this task introduces a new operating mode to `SamplingSession`.
 
 **Files:**
-- `src/tgirl/sample.py` (may gain a streaming token-iterator API on `SamplingSession` — see step 1)
-- `src/tgirl/serve.py`
-- `tests/test_serve.py`
-- NEW `tests/regression/fixtures/openai_stream_fixed_seed.json` (golden fixture for bit-parity)
+- `src/tgirl/sample.py`
+- `tests/test_sample.py`
+- NEW `tests/regression/fixtures/plain_freeform_fixed_seed.json` (golden fixture captured from today's `_generate_tokens`)
 
 **Approach:**
-1. **Verify whether `SamplingSession` already exposes a streaming token iterator.** If yes, reuse. If no (likely — `.run()` returns `SamplingResult`), add a minimal `SamplingSession.stream(prompt_tokens) -> Iterator[StreamEvent]` that yields per-token events with (token_id, probe, certainty, correction_norm, finish_reason_or_None). Test-first, behavior-identical to `.run()` for equivalent inputs (the non-streaming path can be rewritten as `list(session.stream(...))` post-refactor; if that rewrite fails parity, the bug is in `stream`).
-2. **Extract `_run_session_chat_stream(ctx, messages, session_config, transport_config, hooks, request_overrides) -> AsyncIterator`** in `serve.py`. Internally: build SamplingSession, resolve per-request overrides (alpha, temp, beta, skew, seed, stop_ids) into config, iterate `session.stream()`, yield serializable per-token events. Extracted for mockability (mirrors existing `_run_session_chat` at L589).
-3. **Refactor `stream_gen` (L1619-1774)** into a thin translator: consume `_run_session_chat_stream`, translate each event into `ChatCompletionChunk`, preserve emit-reasoning-vs-content branching, preserve `<think>` skip logic, preserve `[DONE]` trailer.
-4. **Refactor `_generate_tokens` (L1254-1366)** into a thin wrapper: `async def _generate_tokens(request, prompt_tokens): tokens = []; async for ev in _run_session_chat_stream(...): tokens.append(ev.token_id); ...; return tokens, finish_reason`. Preserve finish_reason semantics, probe_cache writes, steering_stats writes, certainty/correction aggregation.
-5. **Preserve ordering invariants (Y2):**
-   - `_probe_cache["v_probe"]` write happens at turn end, before return (today: L1335/1353 for non-streaming, L1691/1755 for streaming). In the refactor, this write lives in the `finally` of the stream generator OR in a `TURN_COMPLETE` default handler registered on the session in Task 7. Task 4a keeps it inline (near the current call sites) to preserve bit-parity; Task 7 later migrates it into the handler with explicit ordering guarantees.
-   - `_steering_stats["last_*"]` and `_run_autotune_after_turn(...)` calls stay at the same logical moment (turn end) — Task 4a does NOT migrate them yet. Autotuner migration is Task 7.
-6. **Commit-size escape hatch:** if net diff exceeds ~400 LoC, split into 4a-i (SamplingSession streaming API) and 4a-ii (serve.py route through it). Decide at implementation time.
+1. **Capture golden fixture FIRST (before any code change):** run today's `_generate_tokens` with a deterministic prompt, `seed=0`, fixed `alpha`, `temperature`, `beta`, `skew`. Capture full schema per Y1(b):
+   ```json
+   {
+     "prompt": "...",
+     "seed": 0,
+     "alpha": 0.0,
+     "temperature": 0.7,
+     "beta": null,
+     "skew": null,
+     "tokens": [15496, 11, 1917, ...],
+     "finish_reason": "stop",
+     "decoded": "Hello, world..."
+   }
+   ```
+   Commit as `plain_freeform_fixed_seed.json` BEFORE editing `sample.py`.
+2. **Add `SamplingSession.iter_tokens(prompt_tokens, *, enable_tool_calling: bool = True) -> Iterator[TokenDelta]`.** When `enable_tool_calling=False`:
+   - Skip dual-mode / constrained-generation / tool-dispatch / grammar machinery entirely.
+   - Run a pure steered-forward loop equivalent to today's `_generate_tokens`: forward pass → probe capture → certainty step → temperature scale → sample → append.
+   - Yield `TokenDelta(token_id, probe_norm, certainty_step, correction_norm, is_final, finish_reason)` per token.
+   - Holds a reference to `ctx.bottleneck_hook` (via existing session construction path) and calls `hook.get_captured()` at the same relative position `stream_gen` does today. **This is the `SteeringSessionAdapter` concern** — preferred approach is direct hook-ref, fallback is adapter shim if direct coupling proves awkward (see Uncertainty Log).
+   - When `enable_tool_calling=True`, delegates to the existing `.run()` machinery (via internal helper or shim) so tool-calling callers can adopt `iter_tokens` post-launch.
+3. **Thread the IRQ controller (from Task 2):** `iter_tokens` dispatches `self._irq.dispatch_pending()` at the per-token yield point. This is the plumbing that makes Task 4b's CANCEL work on OpenAI endpoints.
 
 **Tests (RED first):**
-- `test_openai_stream_bit_parity` — fixed-seed deterministic prompt, capture full token stream + finish_reason + `_steering_stats` dict pre-refactor (committed as `openai_stream_fixed_seed.json` fixture with token list, reasonings, chunk count, final `_steering_stats` state hash, finish_reason). Post-refactor: identical. Fixture captured BEFORE any code changes — commit it as the first substep of Task 4a.
+- `test_iter_tokens_plain_freeform_bit_parity` — fixed-seed prompt, `enable_tool_calling=False`, assert `[td.token_id for td in session.iter_tokens(...)]` exactly matches `plain_freeform_fixed_seed.json["tokens"]`. Finish_reason matches. Tokenizer-decoded text matches `decoded` field.
+- `test_iter_tokens_emits_probe_and_certainty` — assert `TokenDelta.probe_norm` and `.certainty_step` populated on every token when `ctx.bottleneck_hook` is active.
+- `test_iter_tokens_temperature_scaling_preserved` — set temp=0 (argmax path), temp=0.7 (random.categorical path) — both match today's `_generate_tokens` behavior.
+- `test_iter_tokens_stop_ids_respected` — inject stop-token early, finish_reason="stop".
+- `test_iter_tokens_tool_calling_enabled_matches_run` — `list(session.iter_tokens(..., enable_tool_calling=True))` matches `session.run(...)` token-for-token. Proves the dual-mode shim.
+
+**Validation:** `pytest tests/test_sample.py tests/regression/ -v`
+
+**Commit:** `feat(sample): add iter_tokens streaming API to SamplingSession`
+
+---
+
+### Task 4a-ii: Route `/v1/chat/completions` (streaming + non-streaming) through `iter_tokens`
+
+**Prerequisite:** Task 4a-i landed — `SamplingSession.iter_tokens(enable_tool_calling=False)` exists with bit-parity to `_generate_tokens`.
+
+**Files:**
+- `src/tgirl/serve.py`
+- `tests/test_serve.py`
+- NEW `tests/regression/fixtures/openai_stream_fixed_seed.json` (OpenAI-boundary parity fixture)
+
+**Approach:**
+1. **Capture OpenAI-boundary golden fixture FIRST:** run today's `stream_gen` end-to-end with seed=0, capture full token stream (per Y1(b) schema: `prompt/seed/alpha/temperature/beta/skew/tokens/finish_reason/decoded`), plus per-chunk `ChatCompletionChunk` shapes (role-chunk, content-chunks, reasoning-chunks, `[DONE]` trailer). Commit BEFORE editing `serve.py`.
+2. **Extract `_run_session_chat_stream(ctx, messages, session_config, transport_config, hooks, request_overrides) -> AsyncIterator[TokenDelta]`** in `serve.py` — builds `SamplingSession` with `enable_tool_calling=False` path configured, resolves per-request overrides (alpha, temp, beta, skew, seed, stop_ids), iterates `session.iter_tokens()`, yields. Mirrors `_run_session_chat` (L589) for mockability.
+3. **Refactor `stream_gen` (L1619-1774)** into a thin translator: consume `_run_session_chat_stream`, translate each `TokenDelta` into `ChatCompletionChunk`, preserve emit-reasoning-vs-content branching (`in_thinking` + `think_end_token_id`), preserve `<think>` skip logic, preserve `[DONE]` trailer.
+4. **Refactor `_generate_tokens` (L1254-1366)** into a thin wrapper over the same `iter_tokens` call: collect token ids into a list, capture finish_reason, return. Preserve probe_cache writes, `_steering_stats["last_*"]` writes, `certainty_steps` / `correction_norms` aggregation — these stay inline at turn end (Task 7 migrates them into the TURN_COMPLETE handler later).
+5. **Preserve ordering invariants (Y2):**
+   - `_probe_cache["v_probe"]` write at turn end, before function/generator return. Unchanged relative position.
+   - `_run_autotune_after_turn(...)` call stays inline at the same logical moment. Task 7 migrates it to TURN_COMPLETE.
+6. **Out of scope for Phase 1 (explicit):** Grammar constraints, tool calling, transport (OT), and hooks beyond the bottleneck_hook do NOT activate on this path. If they ever should, it's a separate feature; the 4a-ii refactor does not enable them by default.
+
+**Tests (RED first):**
+- `test_openai_stream_bit_parity` — fixed-seed deterministic prompt, assert the post-refactor token stream matches `openai_stream_fixed_seed.json["tokens"]` byte-for-byte. Chunk shapes match. `[DONE]` trailer present. Reasoning/content split matches.
 - `test_generate_tokens_nonstream_bit_parity` — same prompt, non-streaming path, same token list + finish_reason.
-- `test_per_request_override_alpha_still_applied` — set alpha=0.2 on request, assert steering_stats reflects it.
+- `test_per_request_override_alpha_still_applied` — set alpha=0.2 on request, assert `_steering_stats["last_alpha"]` reflects it.
 - `test_per_request_seed_reproducible` — seed=42 on two sequential requests, identical token streams.
 - Regression: all existing `test_serve.py` tests pass unchanged.
 
-**Uncertainty note:** the OpenAI SSE handler currently does NOT support grammar constraints, tool calling, transport (OT), or hooks — it's a probe-steered raw-sampling path. Routing it through `SamplingSession` *could* silently activate those paths if the session defaults enable them. Mitigation: confirm the shared `InferenceContext` initialized in `create_app` has null defaults for those paths when used for OpenAI endpoints (or: `_run_session_chat_stream` builds a session with explicit grammar/tool disabled). Document in uncertainty log.
-
 **Validation:** `pytest tests/test_serve.py tests/regression/ -v`
 
-**Commit:** `refactor(serve): route /v1/chat/completions through SamplingSession (prep for IRQ)`
+**Commit:** `refactor(serve): route /v1/chat/completions through SamplingSession.iter_tokens`
 
 ---
 
@@ -221,7 +265,7 @@ for position in range(max_tokens):
 - `src/tgirl/serve.py`
 - `tests/test_serve.py`
 
-**Prerequisite:** Task 4a landed — both OpenAI paths now instantiate `SamplingSession`, so `session.irq` exists at the disconnect-watcher boundary.
+**Prerequisite:** Tasks 4a-i and 4a-ii landed — both OpenAI paths now route through `SamplingSession.iter_tokens`, so `session.irq` exists at the disconnect-watcher boundary.
 
 **Approach:**
 - SSE handler (`serve.py:1616–1779`, post-4a):
@@ -295,14 +339,15 @@ for position in range(max_tokens):
 
 ### Task 7: Migrate autotuner → TURN_COMPLETE handler
 
-**Prerequisite:** Task 4a landed — the OpenAI paths now route through `SamplingSession`, so `TURN_COMPLETE` can be raised inside the session loop and all four current call sites disappear.
+**Prerequisite:** Tasks 4a-i + 4a-ii landed — the OpenAI paths now route through `SamplingSession.iter_tokens`, so `TURN_COMPLETE` can be raised inside the session loop and all four current call sites disappear.
 
 **Files:**
 - `src/tgirl/sample.py` (or wherever `SamplingSession.run()` / `SamplingSession.stream()` end-of-turn fires)
 - `src/tgirl/serve.py`
 - `tests/test_serve.py`
 - `tests/test_autotune.py`
-- NEW `tests/regression/fixtures/autotune_3turn_trajectory.jsonl` (pre-refactor trajectory)
+- NEW `tests/regression/autotune_fixtures/multi_turn_seed0.jsonl` (pre-refactor trajectory)
+- NEW `tests/regression/autotune_fixtures/multi_turn_seed0_state_snapshots.json` (per-turn `_autotune_state["next_*"]` snapshots)
 
 **Approach:**
 - **Four current call sites to eliminate** (Y2 — the PRP previously cited only two):
@@ -331,9 +376,12 @@ for position in range(max_tokens):
 - The `_probe_cache["v_probe"]` and `_steering_stats["last_*"]` writes from Task 4a (inline at turn end) may optionally be migrated into the same TURN_COMPLETE handler for consistency, but this is not required — they are single-reader / single-writer under session ownership.
 
 **Tests (RED first):**
-- **Capture golden trajectory FIRST (before any Task 7 edit):** run a scripted 3-turn conversation pre-refactor with `log_path` set, capture the autotune JSONL output + final `_autotune_state` snapshot. Commit as fixture.
+- **Capture golden trajectory FIRST (before any Task 7 edit):** run a **5–10-turn** scripted conversation pre-refactor with `log_path` set. Requirements:
+  - Fixed seed, fixed prompt templates per turn.
+  - Includes **at least one short-stop turn and one length-exhausted turn** — exercises both `_run_autotune_after_turn("stop")` and `("length")` paths.
+  - Capture `multi_turn_seed0.jsonl` (autotune log byte-identical) AND `multi_turn_seed0_state_snapshots.json` (per-turn `_autotune_state["next_*"]` snapshot between turns, proves state carries across the controller boundary).
 - Autotuner regression suite passes unchanged (AC#11).
-- `test_autotune_trajectory_bit_identical_after_refactor` — run the same 3-turn conversation post-refactor; JSONL lines + final `_autotune_state` must match byte-for-byte.
+- `test_autotune_trajectory_bit_identical_after_refactor` — post-refactor: replay same prompts, JSONL output must match fixture byte-for-byte; per-turn state snapshots must match.
 - `test_write_before_next_read_invariant` — two sequential SSE requests with autotune enabled; assert the second request's `_resolve_alpha`/`_resolve_temperature` reads the `next_*` values written by the first request's TURN_COMPLETE dispatch.
 - Integration test: multi-turn request, autotune observables match pre-refactor values for a fixed input.
 
@@ -343,25 +391,34 @@ for position in range(max_tokens):
 
 ---
 
-### Task 8: TOOL_COMPLETE + MODE_SWITCH_REQUEST sources
+### Task 8: TOOL_COMPLETE source (MODE_SWITCH_REQUEST rescoped — see below)
 
 **Files:**
 - `src/tgirl/sample.py`
-- `src/tgirl/serve.py`
 - `tests/test_sample.py`
-- `tests/test_serve.py`
 
 **Approach:**
 - Tool dispatch at `sample.py:1243`: after `run_pipeline(...)`, raise `TOOL_COMPLETE` with `{'result': ..., 'error': ...}`. Default handler performs existing result-token injection (lines 1304–1311) and returns `CONTINUE`.
-- `/generate` per-request overrides at `serve.py:835–897`: before `session.run()`, raise `MODE_SWITCH_REQUEST` with the overrides dict. Default handler applies `restrict_tools`, `scopes`, `ot_epsilon`, `base_temperature`, `max_cost` to session state. Behavior-preserving.
+- Behavior-preserving: the default handler's body is identical to today's inline code path; only the call-site indirection changes.
+
+**MODE_SWITCH_REQUEST scope clarification (Y7 — rescoped):**
+The original PRP also migrated `/generate` per-request overrides at `serve.py:835-897` to `MODE_SWITCH_REQUEST`. **This is incorrect** — those overrides are construction-time, not mid-session:
+- `serve.py:852` builds `req_ctx = replace(ctx, registry=filtered_registry)` (filtered via `_filter_registry` at L847-851 — new `ToolRegistry` instance).
+- `serve.py:859-863` builds `req_transport_config = transport_config.model_copy(update={"epsilon": ...})`.
+- `serve.py:873-878` filters hooks + appends fresh `GrammarTemperatureHook`.
+- `serve.py:883-889` builds `req_session_config = session_config.model_copy(update={"session_cost_budget": ...})`.
+- `serve.py:891-898` calls `_run_session_chat(req_ctx, messages, req_session_config, req_transport_config, req_hooks)` — `SamplingSession` is constructed at `serve.py:599-613` with overrides already baked in.
+
+There is no mid-session mutation. Raising `MODE_SWITCH_REQUEST` "before `session.run()`" would be either (a) a no-op (session already has overrides), or (b) require mutating frozen-ish session state (`self._registry`, `self._transport_config`, `self._hooks`, **plus invalidating `ToolRouter`'s registry-derived cache at sample.py:816-826**). Both are wrong: construction-time overrides are already principled.
+
+**Decision: `MODE_SWITCH_REQUEST` is reserved for genuine mid-session mutation** (future orchestrators — the PRD §2 "external driver / server override" case implying real runtime mode change). `/generate` construction-time overrides stay in `replace(ctx, ...)` / `model_copy(...)` land. **Flagged for PRD revision** (see Uncertainty Log).
 
 **Tests (RED first):**
-- Tool injection bit-parity: fixed-seed tool pipeline produces identical result tokens.
-- Mode-switch parity: existing `/generate` override tests pass unchanged.
+- Tool injection bit-parity: fixed-seed tool pipeline produces identical result tokens pre/post migration.
 
-**Validation:** `pytest tests/test_sample.py tests/test_serve.py -v`
+**Validation:** `pytest tests/test_sample.py -v`
 
-**Commit:** `refactor: migrate tool dispatch and /generate overrides to interrupts`
+**Commit:** `refactor(sample): migrate tool dispatch to TOOL_COMPLETE interrupt`
 
 ---
 
@@ -374,8 +431,10 @@ for position in range(max_tokens):
 **Approach:**
 - Task 1 already wired the fast-path to honor `_next_timer_fire` (Y4). This task populates the scheduling surface.
 - Add `schedule(source, interval_ms, data=None)` to `InterruptController`:
+  - **Cross-thread callable (Y4 clarification, option B).** `schedule()` MAY be called from any thread — sampling thread *or* the FastAPI event-loop thread (e.g., a request handler installing a heartbeat timer on a long-running session). Writes go under `self._lock`. This is `O(N_timers)`, not `O(N_tokens)`, so the extra lock acquire is rare and acceptable.
   - Appends `(source, interval_ms, data, next_fire_monotonic)` to `self._scheduled_timers` under `self._lock`.
   - Recomputes `self._next_timer_fire = min(t.next_fire_monotonic for t in self._scheduled_timers)` under the same lock.
+- **Fast-path read is lockless** — `self._next_timer_fire` is a single `float | None` slot; a stale read causes at most a one-dispatch delay on timer fire (not a correctness violation). GIL-atomic reference read is safe here.
 - In the slow-path of `dispatch_pending`, at the start of the locked section: for each scheduled timer where `now >= t.next_fire_monotonic`, synthesize an `InterruptPayload(source=t.source, data=t.data, timestamp=now)` and append to `_pending`; set `t.next_fire_monotonic = now + t.interval_ms / 1000.0` (re-arm). Recompute `_next_timer_fire` afterwards. Then proceed with drain/fold.
 - Self-contained: no asyncio.Task, no event-loop coupling on sampling thread (PRD OQ#4).
 
@@ -385,6 +444,7 @@ for position in range(max_tokens):
 - `test_timer_reschedules_after_fire` — fire, advance clock, dispatch again → fires again.
 - **`test_timer_fires_on_empty_queue_after_interval` (Y4 critical case):** schedule 10ms, monkeypatch clock forward 15ms, dispatch with empty `_pending` → fires. This is the exact silent-bug case the Y4 revision guards against.
 - `test_multiple_timers_use_earliest_next_fire` — schedule two timers with 5ms and 50ms intervals; `_next_timer_fire` tracks the 5ms one; after 5ms only that timer fires.
+- **`test_schedule_cross_thread_safe` (Y4 option-B invariant):** two threads — one calls `schedule()` repeatedly, the other calls `dispatch_pending()` in a loop. No `RuntimeError`, no lost/duplicated timer registrations, `_next_timer_fire` monotonically correct under contention. Stress-test with 1000 cross-thread `schedule()` calls.
 
 **Validation:** `pytest tests/test_interrupts.py -v`
 
@@ -425,7 +485,10 @@ for position in range(max_tokens):
 **Approach (Y6 — three-variant bench + autotuner probe):**
 - **`bench_empty_no_handlers`** — AC#10 baseline: 10,000 dispatches, no handlers registered. Budget: **50µs/call** (500ms total). Catches regressions in the lockless fast-path.
 - **`bench_empty_with_handlers`** — 10,000 dispatches with a realistic production handler table registered (CANCEL, GRAMMAR_TRIGGER, BUDGET_EXHAUSTED, TOOL_COMPLETE, MODE_SWITCH_REQUEST, TURN_COMPLETE — 6+ handlers, none raised). Budget: **50µs/call**. Guarantees the fast-path ignores handler-table size.
-- **`bench_one_raise_per_100_tokens`** — 10,000 dispatches with 100 synthetic `GRAMMAR_TRIGGER` raises interleaved (≈1 per 100), trivial handler returning `CONTINUE`. Budget: **500µs/call amortized** (absorbs lock acquisition + handler invocation + fold). Catches regressions in slow-path cost.
+- **`bench_one_raise_per_100_tokens`** — 10,000 dispatches with 100 synthetic `GRAMMAR_TRIGGER` raises interleaved (≈1 per 100), trivial handler returning `CONTINUE`. Two separate budget gates (Y6 clarification: mean-over-all is not a useful guard):
+  - **Mean over the 100 loaded dispatches ≤ 500µs** (guards handler invocation + fold cost — the real regression signal).
+  - **p95 over all 10,000 dispatches ≤ 100µs** (catches tail regressions — since 5% of 10,000 is 500 samples, this bucket would absorb the 100 loaded calls *only if* they all landed in the tail, which would itself be a regression signal).
+  - Both numbers committed to the JSON result file for trend tracking. Record per-bucket histograms (min/p50/p95/p99/max for empty bucket and loaded bucket separately) for future analysis.
 - **`bench_turn_complete_handler_per_invocation`** — single-shot cost of the real autotuner `TURN_COMPLETE` handler end-to-end (Observables build + `autotune()` + JSONL append). Observed, NOT budget-gated; emits `warnings.warn` if > 1ms.
 - BFCL bit-parity regression: compare `benchmarks/run_bfcl.py --limit 20 --seed 0` output against golden fixture captured in Task 6 (AC#9).
 - Bench results (all four variants + system metadata — macOS version, chip model, Python version, git sha) committed to `benchmarks/perf/irq_overhead_results.json` as launch evidence and regression floor.
@@ -433,7 +496,7 @@ for position in range(max_tokens):
 **Tests:**
 - `tests/regression/test_irq_overhead.py::test_empty_no_handlers_budget` — asserts < 50µs/call.
 - `tests/regression/test_irq_overhead.py::test_empty_with_handlers_budget` — asserts < 50µs/call.
-- `tests/regression/test_irq_overhead.py::test_one_raise_per_100_tokens_budget` — asserts < 500µs/call amortized.
+- `tests/regression/test_irq_overhead.py::test_one_raise_per_100_tokens_budget` — two assertions: mean over loaded dispatches < 500µs; p95 over all dispatches < 100µs.
 - `tests/regression/test_irq_overhead.py::test_turn_complete_handler_observed` — measures and warns; does not fail.
 - BFCL parity test is a fixture-comparison pytest.
 
@@ -497,19 +560,24 @@ Cancel semantics are correctness-critical, and `sample.py` is on the CLAUDE.md "
 
 ### Uncertainties added during training-partner review (2026-04-22)
 
-- **Task 4a scope creep risk (Y1/Y2).** The OpenAI SSE handler currently does not support grammar constraints, tool calling, transport (OT), or hooks — it's a probe-steered raw-sampling path. Routing it through `SamplingSession` *could* silently activate those paths if session defaults differ. Mitigation in Task 4a: explicitly disable grammar/tool paths when building the session for OpenAI endpoints, and prove equivalence with the bit-parity golden fixture. If 4a's net diff exceeds ~400 LoC, split into 4a-i (add `SamplingSession.stream()` API) + 4a-ii (route serve.py through it).
-- **SamplingSession streaming API existence.** Task 4a assumes `SamplingSession` either has or can gain an `Iterator[StreamEvent]` API compatible with both `.run()` semantics and per-token event emission. If the current architecture can't be extended without cross-layer changes (e.g., constrained loops can't be made generator-friendly), Task 4a expands to add that API behavior-preservingly.
+- **Task 4a-i scope: new operating mode, not just an iterator.** Adding `SamplingSession.iter_tokens(enable_tool_calling=False)` introduces a plain-freeform execution mode that today's `.run()` doesn't support standalone. The `enable_tool_calling=True` branch delegates to existing machinery — verify this shim doesn't drift from `.run()` semantics. Bit-parity test `test_iter_tokens_tool_calling_enabled_matches_run` guards this.
+- **`ctx.bottleneck_hook` / probe_cache coupling in Task 4a-i.** `SamplingSession.iter_tokens` must call `hook.get_captured()` at the same relative position `stream_gen` does today (after forward, before sampling). Preferred approach: session holds a ref to `ctx.bottleneck_hook` directly. If that turns out to require invasive plumbing through existing `run_freeform` / `run_constrained_generation` paths, fall back to a `SteeringSessionAdapter` shim. Flag for Task 4a-i implementer; both options are behavior-preserving if the call points are preserved.
+- **SamplingSession streaming API did NOT exist before this PRP.** Training-partner confirmed via surface audit: only `.run()` (L877) and `.run_chat()` (L829) exist, both buffered. Task 4a-i adds streaming from scratch. This is a non-trivial structural change; split from 4a-ii is MANDATORY (not an escape hatch).
 - **Handler timeout / deadline.** Task 1 does not specify a timeout on handler execution. A pathological handler could block the sampling thread indefinitely. Phase 1 accepts this risk (handlers are internal and audited); Phase 2 or post-merge hardening may add per-source handler deadline with structlog warning. Flagged for /review-code attention.
-- **PRD AC#10 is looser than PRP AC#10.** Y6 revision tightens the PRP to guard three bench variants (empty-no-handlers, empty-with-handlers, loaded-dispatch). PRD currently specifies only the first. Recommended follow-up: update PRD AC#10 to match PRP — OR document in the PRP commit message that PRP intentionally tightens PRD.
-- **AC#1 bound revision (Y5).** The PRD specifies CANCEL latency ≤ 1 forward pass. Under adversarial cross-thread raise/dispatch contention, a late-landing raise can fire on the *next* dispatch (one additional forward pass). PRP revises AC#1 to "≤ 1 forward pass in the common case; ≤ 2 under adversarial contention" and tests assert the ≤ 2 bound. PRD revision recommended to match.
-- **Autotuner closure state migration (Y2).** `_autotune_handler` uses `functools.partial` to capture `_autotune_state` / `_steering_stats` / `_steering_config` / `_probe_cache` dicts by reference. If future work wants to make these per-session (rather than per-app-instance), the handler registration must be updated accordingly. Document for Task 7 reviewer.
-- **`_next_timer_fire` fast-path cost (Y4).** Adding one `time.monotonic()` call per `dispatch_pending` invocation on the hot path. Task 11 bench variant `bench_empty_no_handlers` includes this cost implicitly; `bench_empty_with_handlers` includes it too. If either exceeds 50µs, investigate: consider caching `now` per token inside the sampling loop instead of re-computing per dispatch.
+- **Session-controller strong-ref cycle (Y3 lifecycle clarification).** Chose strong-ref + documented coupling for Phase 1 simplicity. Future cache-fork or multi-session work must revisit: switch to `weakref.ref(session)` with defensive `if self._session() is None: return CONTINUE` in dispatch. Phase 1 AC#12 isolation testable via fixture-scoped sessions; GC semantics not relied on.
+- **PRD AC#10 is looser than PRP AC#10.** Y6 revision tightens the PRP to guard three bench variants. PRD currently specifies only the first. Recommended follow-up: update PRD AC#10 to match PRP.
+- **AC#1 bound revision (Y5).** The PRD specifies CANCEL latency ≤ 1 forward pass. Under adversarial cross-thread raise/dispatch contention, a late-landing raise can fire on the *next* dispatch. PRP revises AC#1 to "≤ 1 forward pass in the common case; ≤ 2 under adversarial contention". PRD revision recommended to match.
+- **Autotuner closure state migration (Y2).** `_autotune_handler` uses `functools.partial` to capture `_autotune_state` / `_steering_stats` / `_steering_config` / `_probe_cache` dicts by reference. If future work makes these per-session (rather than per-app-instance), handler registration must update accordingly.
+- **`_next_timer_fire` fast-path cost (Y4).** One `time.monotonic()` call per `dispatch_pending` on the hot path. Task 11 `bench_empty_no_handlers` and `bench_empty_with_handlers` include this cost. If either exceeds 50µs, consider caching `now` per token in the sampling loop instead of recomputing per dispatch.
+- **Y4 `schedule()` threading model committed (option B).** `schedule()` is cross-thread callable; writes to `_scheduled_timers` / `_next_timer_fire` go under `self._lock`. Fast-path read is lockless (GIL-atomic on the single `float | None` slot; stale reads cause at most one-dispatch delay on fire). Task 9 adds `test_schedule_cross_thread_safe` stress test.
+- **Task 8 MODE_SWITCH_REQUEST rescope (Y7).** `/generate`'s per-request overrides are construction-time, not mid-session. Migrating them to `MODE_SWITCH_REQUEST` was incoherent (no-op or requires frozen-state mutation with ToolRouter cache invalidation). **`MODE_SWITCH_REQUEST` is reserved for future mid-session orchestrators.** PRD §2 currently implies runtime mode change — PRD revision recommended to either (a) clarify "mid-session only" scope, or (b) add a future-mid-session use case that actually exercises the source.
 
 ### Yield points accepted from training-partner review
 
-- **Y1 — SSE bypasses SamplingSession (STRUCTURAL):** Task 4 split into Task 4a (refactor) + Task 4b (cancel-on-disconnect).
-- **Y2 — Autotuner migration lacks session + misses call sites (STRUCTURAL):** Task 7 revised with all four call sites, `functools.partial` closure capture, write-before-return ordering invariant + regression fixture.
-- **Y3 — `controller` param collision (STRUCTURAL):** InterruptController binds session at construction; `HandlerFn` receives session via controller, not via dispatch arg; module-level gen functions take new `irq=` kwarg; `self._irq` naming disambiguates from ESTRADIOL's `self._controller`.
-- **Y4 — Fast-path breaks TIMER (MODERATE):** Fast-path conditioned on `_next_timer_fire`; Task 9 test `test_timer_fires_on_empty_queue_after_interval` added.
+- **Y1 — SSE bypasses SamplingSession (STRUCTURAL):** Task 4 split into Task 4a-i (SamplingSession.iter_tokens plain-freeform API) + Task 4a-ii (route serve.py through it) + Task 4b (cancel-on-disconnect).
+- **Y2 — Autotuner migration lacks session + misses call sites (STRUCTURAL):** Task 7 revised with all four call sites, `functools.partial` closure capture, write-before-return ordering invariant + **5–10-turn** multi-turn fixture covering both stop+length branches.
+- **Y3 — `controller` param collision (STRUCTURAL):** InterruptController binds session at construction; module-level gen functions take new `irq=` kwarg; `self._irq` naming disambiguates from ESTRADIOL's `self._controller`. Lifecycle: strong ref + assertion + documented coupling.
+- **Y4 — Fast-path breaks TIMER (MODERATE):** Fast-path conditioned on `_next_timer_fire`; `schedule()` cross-thread callable with lock-guarded write; `test_timer_fires_on_empty_queue_after_interval` + `test_schedule_cross_thread_safe` added.
 - **Y5 — Drain-side thread safety (MODERATE):** Snapshot-under-lock / invoke-handlers-outside-lock pattern; mask set snapshotted; Task 10 event buffer reads snapshot-copy under lock. AC#1 bound revised to "≤ 2 forward passes under adversarial contention".
-- **Y6 — Perf budget measures the wrong thing (MODERATE):** Task 11 replaced with three-variant bench + autotuner-per-invocation observer.
+- **Y6 — Perf budget measures the wrong thing (MODERATE):** Task 11 replaced with three-variant bench + autotuner-per-invocation observer. Granularity: mean-over-loaded-dispatches ≤ 500µs AND p95-over-all ≤ 100µs (not mean-over-all, which would be trivially satisfied).
+- **Y7 — `/generate` MODE_SWITCH_REQUEST semantic mismatch (STRUCTURAL):** Task 8 rescoped to TOOL_COMPLETE only. `MODE_SWITCH_REQUEST` reserved for mid-session mutation (future work).
