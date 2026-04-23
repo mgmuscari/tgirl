@@ -1,12 +1,12 @@
 #!/bin/bash
-# Sync Push Hands methodology files from this template repo to a downstream project.
+# Sync Dialectic methodology files from this template repo to a downstream project.
 #
 # Usage:
 #   ./scripts/sync-to-project.sh <target-project-dir>
-#   ./scripts/sync-to-project.sh --all <parent-dir>   # sync all Push Hands projects under parent
+#   ./scripts/sync-to-project.sh --all <parent-dir>   # sync all Dialectic projects under parent
 #   ./scripts/sync-to-project.sh --dry-run <target>    # show what would change, don't copy
 #   ./scripts/sync-to-project.sh --with-docs <target>  # also update CLAUDE.md/AGENTS.md via claude
-#   ./scripts/sync-to-project.sh --list <parent-dir>   # list detected Push Hands projects
+#   ./scripts/sync-to-project.sh --list <parent-dir>   # list detected Dialectic projects
 #
 # What syncs (template-owned methodology files):
 #   .claude/commands/*.md        — workflow definitions
@@ -24,7 +24,7 @@
 #
 # What does NOT sync (project-owned):
 #   CLAUDE.md, AGENTS.md         — have project-specific content
-#   push-hands.md                — template's own PRD
+#   dialectic.md                — template's own PRD
 #   src/, tests/, docs/PRDs/*.md (non-template), etc.
 #
 # After syncing, review changes with `git diff` in the target project.
@@ -98,31 +98,31 @@ REVIEW_FILES=(
     "AGENTS.md"
 )
 
-# Detect if a directory is a Push Hands project
-is_push_hands_project() {
+# Detect if a directory is a Dialectic project
+is_dialectic_project() {
     local dir="$1"
     # Must be a git repo
     [ -d "$dir/.git" ] || return 1
     # Must not be the template repo itself
     [ "$(cd "$dir" && pwd)" != "$TEMPLATE_DIR" ] || return 1
-    # Must have at least one Push Hands indicator
-    [ -d "$dir/.claude/commands" ] || [ -d "$dir/prompts/workflows" ] || [ -f "$dir/.claude/hooks/push-hands-guard.sh" ] || return 1
+    # Must have at least one Dialectic indicator
+    [ -d "$dir/.claude/commands" ] || [ -d "$dir/prompts/workflows" ] || [ -f "$dir/.claude/hooks/dialectic-guard.sh" ] || return 1
     return 0
 }
 
-# Find all Push Hands projects under a parent directory
+# Find all Dialectic projects under a parent directory
 find_projects() {
     local parent="$1"
     local found=0
     for dir in "$parent"/*/; do
         [ -d "$dir" ] || continue
-        if is_push_hands_project "$dir"; then
+        if is_dialectic_project "$dir"; then
             echo "$dir"
             found=1
         fi
     done
     if [ "$found" -eq 0 ]; then
-        echo "No Push Hands projects found under $parent" >&2
+        echo "No Dialectic projects found under $parent" >&2
         return 1
     fi
 }
@@ -180,7 +180,7 @@ update_docs() {
     trap "rm -f '$prompt_file'" RETURN
 
     cat > "$prompt_file" <<'HEADER'
-You are updating a downstream project's CLAUDE.md and AGENTS.md to incorporate methodology changes from the Push Hands template.
+You are updating a downstream project's CLAUDE.md and AGENTS.md to incorporate methodology changes from the Dialectic template.
 
 RULES:
 - Update ONLY methodology sections. Preserve ALL project-specific content exactly as-is.
@@ -219,7 +219,7 @@ Methodology sections in CLAUDE.md to update:
 
 Methodology sections in AGENTS.md to update:
 - Cross-Platform Support (intro)
-- Stance definitions (Proposer, Senior Training Partner, Code Review Partner, Security Auditor, Skeptical Client)
+- Stance definitions (Proposer, Interlocutor, Code Review Partner, Security Auditor, Skeptical Client)
 - Platform-Specific Enforcement (including Team Mode subsection with bug notes)
 
 DO NOT touch: Project Overview, Architecture, Tech Stack, Setup (if project-specific commands differ), project-specific Known Gotchas, project-specific Agent Instructions, or any sections not listed above.

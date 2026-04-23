@@ -3,12 +3,15 @@
 #
 # Fires on PreToolUse for Edit and Write tools. Checks if:
 #   1. We're on a feature/* branch
-#   2. .push-hands-tier is "standard" or "full"
+#   2. .dialectic-tier is "standard" or "full"
 #   3. The target file is under src/ or tests/
 #
 # If all conditions are met, exits with code 2 to BLOCK the tool call.
-# Team agents (proposer) are exempt — detected via PUSH_HANDS_TEAM_AGENT=1
-# env var set by scripts/claude-teammate-wrapper.sh.
+# Team agents (proposer) are exempt — detected via DIALECTIC_TEAM_AGENT=1
+# env var set by scripts/claude-teammate-wrapper.sh. When that env var is
+# not inherited (Claude Code bug #32368 can cascade), a fallback consults
+# ~/.claude/teams/<prefix>-<slug>/config.json for a matching cwd across
+# the known team-command prefixes (execute, review, audit, plan-review).
 #
 # Exit codes:
 #   0 = allow (not on feature branch, or light tier, or non-src file)
@@ -41,21 +44,40 @@ case "$BRANCH" in
   *) exit 0 ;;
 esac
 
-# Allow team agents — detected via env var (set by claude-teammate-wrapper.sh)
-# or by checking if an active execute team exists for this branch
-if [ "${PUSH_HANDS_TEAM_AGENT:-}" = "1" ]; then
+# Allow team agents (proposer) — they're spawned via claude-teammate-wrapper.sh
+# which sets this env var to signal they're not the team lead
+if [ "${DIALECTIC_TEAM_AGENT:-}" = "1" ]; then
   exit 0
 fi
 
-# Also allow if an active execute team exists (spawned agents don't get env var)
+# Fallback: for any known dialectic team type, if a team config exists for
+# this branch AND at least one member's cwd matches this repo, exempt the
+# caller. Closes false positive when team agents don't inherit
+# DIALECTIC_TEAM_AGENT. Cross-repo slug collision is blocked by the cwd
+# equality check — ~/.claude/teams/ is user-global.
+#
+# All four team commands must be covered: /execute-team (execute-{slug}),
+# /review-plan-team (plan-review-{slug}), /security-audit-team (audit-{slug}),
+# /review-code-team (review-{slug}). Any new team command must add its prefix
+# here — otherwise its teammates get falsely blocked on src/tests edits.
+DIALECTIC_TEAM_PREFIXES=("execute" "review" "audit" "plan-review")
+
 SLUG="${BRANCH#feature/}"
-TEAM_CONFIG="$HOME/.claude/teams/execute-${SLUG}/config.json"
-if [ -f "$TEAM_CONFIG" ]; then
-  exit 0
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+if [ -n "$REPO_ROOT" ]; then
+  for prefix in "${DIALECTIC_TEAM_PREFIXES[@]}"; do
+    TEAM_CONFIG="$HOME/.claude/teams/${prefix}-${SLUG}/config.json"
+    if [ -f "$TEAM_CONFIG" ] && \
+       jq -e --arg root "$REPO_ROOT" \
+            '.members[] | select(.cwd == $root)' \
+            "$TEAM_CONFIG" >/dev/null 2>&1; then
+      exit 0
+    fi
+  done
 fi
 
 # Check tier
-TIER_FILE="$(git rev-parse --show-toplevel 2>/dev/null)/.push-hands-tier"
+TIER_FILE="$(git rev-parse --show-toplevel 2>/dev/null)/.dialectic-tier"
 if [ ! -f "$TIER_FILE" ]; then
   exit 0
 fi
@@ -73,8 +95,9 @@ BLOCKED: Solo implementation detected on a standard/full tier feature branch.
 You are the TEAM LEAD. You must NOT directly edit src/ or tests/ files.
 
 Options:
-  - Team mode: /execute-team <prp-path> (proposer + code-reviewer team)
-  - Sequential: /execute-prp <prp-path> then /review-code
+  - Team execute:     /execute-team <prp-path>
+  - Team review:      /review-code-team (after implementation commits)
+  - Sequential:       /execute-prp <prp-path> then /review-code
 
 If teammates previously failed:
   - Check claude --version (v2.1.46+ may fix team bugs)

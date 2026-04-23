@@ -1,4 +1,4 @@
-You are orchestrating a **dual-agent Push Hands code review** using agent teams. You are the team lead.
+You are orchestrating a **dual-agent Dialectic code review** using agent teams. You are the team lead.
 
 The Code Reviewer examines the diff against the PRP specification while the Implementation Defender explains decisions and fixes blocking issues. Findings flow via messages as they're discovered — the defender responds to each before the reviewer moves on.
 
@@ -7,11 +7,15 @@ The Code Reviewer examines the diff against the PRP specification while the Impl
 ### 1. Gather context
 
 - Derive the feature slug from the current branch name (strip `feature/` prefix).
-- Run `git diff main...HEAD --stat` to see scope of changes.
-- Run `git log main..HEAD --oneline` to see commit history.
-- Find the PRP at `docs/PRPs/{slug}.md`. Read it.
-- Find the plan review at `docs/reviews/plans/{slug}-review.md` if it exists.
-- Read CLAUDE.md for project conventions.
+- If `docs/PRPs/{slug}.md` does not exist, print exactly:
+  "/review-code-team requires a PRP at docs/PRPs/{slug}.md. Use /review-code instead, or run /new-feature first to generate a PRP."
+  and exit without creating a team, spawning agents, or writing any artifact. Do NOT call `TeamCreate`.
+- Otherwise proceed:
+  - Run `git diff main...HEAD --stat` to see scope of changes.
+  - Run `git log main..HEAD --oneline` to see commit history.
+  - Read the PRP at `docs/PRPs/{slug}.md`.
+  - Read the plan review at `docs/reviews/plans/{slug}-review.md` if it exists.
+  - Read CLAUDE.md for project conventions.
 
 ### 2. Create the team
 
@@ -22,7 +26,7 @@ The Code Reviewer examines the diff against the PRP specification while the Impl
 Create two tasks via `TaskCreate`:
 
 **Task A: "Review implementation against PRP specification"**
-Description: You are the Code Reviewer. Read the PRP at `docs/PRPs/{slug}.md`, the plan review at `docs/reviews/plans/{slug}-review.md` (if exists), and CLAUDE.md. Run `git diff main...HEAD` to see all changes. For each PRP task: compare the implementation against the specification. Then do a full-diff sweep for: spec mismatches, security vulnerabilities, performance issues (especially per-token hot paths and tensor operations), test quality (meaningful assertions, edge cases, not testing implementation details), convention violations (per CLAUDE.md), dead code, and error handling gaps. Send each finding as a structured message to "defender" with category, severity, location, details, and suggestion. Severity levels: Blocking (must fix before merge), Significant (should fix), Minor (nice to fix), Nit (style only). **WAIT for defender's response before sending the next finding** — the exchange on each finding must close before moving on. After all findings and responses are complete, send a final summary to the team lead. **Final summary must be self-contained:** for each finding list category, severity (initial and final after defender response), location, details, defender's response, and whether the issue was resolved/acknowledged/disputed.
+Description: You are the Code Reviewer. Read the PRP at `docs/PRPs/{slug}.md`, the plan review at `docs/reviews/plans/{slug}-review.md` (if exists), and CLAUDE.md. Run `git diff main...HEAD` to see all changes. For each PRP task: compare the implementation against the specification. Then do a full-diff sweep for: spec mismatches, security vulnerabilities, performance issues, test quality (meaningful assertions, edge cases, not testing implementation details), convention violations (per CLAUDE.md), dead code, and error handling gaps. Send each finding as a structured message to "defender" with category, severity, location, details, and suggestion. Severity levels: Blocking (must fix before merge), Significant (should fix), Minor (nice to fix), Nit (style only). **WAIT for defender's response before sending the next finding** — the exchange on each finding must close before moving on. After all findings and responses are complete, send a final summary to the team lead. **Final summary must be self-contained:** for each finding list category, severity (initial and final after defender response), location, details, defender's response, and whether the issue was resolved/acknowledged/disputed.
 
 **Task B: "Defend implementation decisions and fix blocking issues"**
 Description: You are the Implementation Defender. Read the PRP at `docs/PRPs/{slug}.md`, the plan review at `docs/reviews/plans/{slug}-review.md` (if exists), and CLAUDE.md. Run `git diff main...HEAD` to understand all changes. Wait for findings from "code-reviewer". For each finding: if the implementation decision was intentional, explain why with evidence (cite PRP task, plan review yield point, or CLAUDE.md convention). If the finding is valid and Blocking, fix the code and run tests, then report what you changed. If valid and non-Blocking, acknowledge it. Send your response to "code-reviewer" — they are waiting. After all findings are resolved, send a final summary to the team lead. **Final summary must be self-contained:** for each finding list your response (defended/acknowledged/fixed), what was changed if anything, and the commit SHA if a fix was made.
@@ -36,31 +40,14 @@ Description: You are the Implementation Defender. Read the PRP at `docs/PRPs/{sl
 Spawn both teammates using the Agent tool with `run_in_background: true` and `model: "opus"`:
 
 - `name: "code-reviewer"`, `subagent_type: "code-reviewer"`, `team_name: "review-{slug}"`, `model: "opus"`
-  Prompt: _(inline stance — required because .claude/agents/*.md definitions don't load for team members, see Claude Code bug #24316)_
 
-  "You are the **Code Review Partner** — detail-oriented, convention-aware, quality-sensing. You review code — you do NOT rewrite it. You CANNOT and MUST NOT modify files. You have no Write or Edit tools. Your tools are: Read, Grep, Glob, Bash.
+  Prompt: "**Your task:** Review the implementation on this branch against the PRP at docs/PRPs/{slug}.md. Read the PRP, plan review (if exists), and CLAUDE.md. Run `git diff main...HEAD` for the full diff and use `git show {sha}` for individual commits. Review all changes. For each finding: Category, Severity (Blocking | Significant | Minor | Nit), Location (file:line), Details, Suggestion. For convention findings, cite the specific CLAUDE.md rule. Send each finding as a structured message to 'defender'. WAIT for defender's response before moving to the next finding. Send final summary to team lead when done."
 
-  **Your constraints:**
-  - Review diffs only — identify where balance breaks, do not fix it yourself
-  - Compare implementation against the PRP specification task by task
-  - Use `git diff main...HEAD` for full diff, `git show {sha}` for individual commits
-  - Categorize findings: Blocking (must fix), Significant, Minor, Nit
-  - For performance findings: cite the specific hot path or tensor operation
-  - For convention findings: cite the specific CLAUDE.md rule
+- `name: "defender"`, `subagent_type: "defender"`, `team_name: "review-{slug}"`, `model: "opus"`
 
-  **Your task:** Review the implementation on this branch against the PRP at docs/PRPs/{slug}.md. Read the PRP, plan review (if exists), and CLAUDE.md. Run `git diff main...HEAD` and review all changes. Send each finding as a structured message to 'defender' with: Category, Severity, Location (file:line), Details, Suggestion. WAIT for defender's response before moving to the next finding. Send final summary to team lead when done."
+  Prompt: "**Edit scope (sharply bounded).** Allowed: files named in an active Blocking finding's `Location: file:line`, and test files at paths corresponding to those files. Forbidden: the PRP at `docs/PRPs/{slug}.md` (it is the contract being compared against), `CLAUDE.md` (convention changes go through `/update-claude-md`), methodology files under `prompts/`, `.claude/commands/`, `.claude/hooks/`, `.claude/agents/`, and files outside the PR diff scope (not modified between `main` and `HEAD`). Every defender commit must touch only allowed-scope files — a post-commit checker (`scripts/check-defender-scope.sh`) enforces this before the review artifact is written.
 
-- `name: "defender"`, `subagent_type: "proposer"`, `team_name: "review-{slug}"`, `model: "opus"`
-  Prompt: _(inline stance — required because .claude/agents/*.md definitions don't load for team members, see Claude Code bug #24316)_
-
-  "You are the **Implementation Defender** — thorough, evidence-based, willing to acknowledge valid criticism. You have full tool access (Read, Write, Edit, Bash, Grep, Glob).
-
-  **Your constraints:**
-  - Read CLAUDE.md before responding — know the project conventions
-  - Defend decisions with evidence: cite PRP tasks, plan review yield points, design docs
-  - If a Blocking finding is valid, fix it immediately: edit the code, run tests, commit with conventional format
-  - If a non-Blocking finding is valid, acknowledge it — don't defend for the sake of defending
-  - Never weaken tests to resolve a finding
+  **Response protocol:** defend decisions with evidence (cite PRP tasks, plan review yield points, design docs). If a Blocking finding is valid, fix it immediately: edit the code, run tests, commit with conventional format (`fix(defender): <short description>`, ≤72 chars first line). If a non-Blocking finding is valid, acknowledge it — don't defend for the sake of defending. Never weaken tests to resolve a finding.
 
   **Your task:** Defend the implementation on this branch. Read the PRP at docs/PRPs/{slug}.md, plan review, and CLAUDE.md for context. Run `git diff main...HEAD` to understand all changes. Wait for findings from 'code-reviewer'. For each: defend with evidence, acknowledge, or fix (if Blocking). Send your response to 'code-reviewer' — they are waiting. Send final summary to team lead when done."
 
@@ -104,7 +91,16 @@ Track:
 
 ### 7. Synthesize code review artifact
 
-After both teammates complete (check `TaskList`), write `docs/reviews/code/{slug}-review.md`:
+After both teammates complete (check `TaskList`), prepare the artifact content but do NOT write it to disk yet.
+
+### 8. Verify defender scope, then write and commit the artifact
+
+Before writing the review artifact to `docs/reviews/code/{slug}-review.md`:
+
+- Run `bash scripts/check-defender-scope.sh {slug}`.
+- If it exits non-zero, ABORT: print the script's output, do NOT write the artifact, do NOT commit. Report the violation to the user and stop.
+
+If the check passes, write the artifact:
 
 ```markdown
 # Code Review: {slug}
@@ -136,9 +132,7 @@ After both teammates complete (check `TaskList`), write `docs/reviews/code/{slug
 [Overall assessment. Finding counts by severity. Whether all Blocking issues resolved.]
 ```
 
-### 8. Commit review artifact
-
-Message: `docs: push hands code review for {slug} (team mode)`
+Commit message: `docs: dialectic code review for {slug} (team mode)`
 
 ### 9. Shutdown and cleanup
 
@@ -151,3 +145,17 @@ Send `shutdown_request` to both teammates. Wait for responses. Then call `TeamDe
 - Key findings and how they were resolved
 - If APPROVED: recommend `/security-audit-team` for full tier, otherwise create PR
 - If REQUESTS CHANGES: list specific changes needed before re-review
+
+## Validation
+
+```bash
+# Review artifact was written at the expected path
+test -f "docs/reviews/code/{slug}-review.md"
+
+# Required sections present
+grep -qE "^## Verdict:" "docs/reviews/code/{slug}-review.md"
+grep -qE "Defender Response" "docs/reviews/code/{slug}-review.md"
+
+# Defender-scope enforcement succeeded
+bash scripts/check-defender-scope.sh {slug}
+```

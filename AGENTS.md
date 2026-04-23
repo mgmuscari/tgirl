@@ -1,8 +1,8 @@
-# Push Hands Stance Definitions
+# Dialectic Stance Definitions
 
- This file defines the stances — system prompts and behavioral constraints — for each agent role used in the push hands workflow. These aren't just configuration; they're context primes. The name, the framing, and the metaphor all shape the model's output character.
+ This file defines the stances — system prompts and behavioral constraints — for each agent role used in the dialectic workflow. These aren't just configuration; they're context primes. The name, the framing, and the metaphor all shape the model's output character.
 
- A "role" is a job description — it tells the model what to do. A "stance" is a way of being — it tells the model how to attend. "Staff Engineer Reviewer" produces output that looks like a code review checklist. "Senior Training Partner" produces output that reads like someone who's been listening carefully and found the three things you didn't realize you were assuming. Same mechanism, different attentional quality.
+ A "role" is a job description — it tells the model what to do. A "stance" is a way of being — it tells the model how to attend. "Staff Engineer Reviewer" produces output that looks like a code review checklist. "Interlocutor" produces output that reads like someone who's been listening carefully and found the three things you didn't realize you were assuming. Same mechanism, different attentional quality.
 
 ## Cross-Platform Support
 
@@ -81,6 +81,18 @@ tests/
 
 ---
 
+## Performance & Optimization Guidelines
+
+When investigating performance or implementing optimizations:
+
+- **Profile before optimizing.** Use telemetry, timing breakdowns, measurement. Never optimize based on intuition alone.
+- **Check inter-operation latency.** Wall-clock gaps between logged operations reveal hidden bottlenecks (serialization, I/O, GC pauses, network round-trips).
+- **Prefer native tooling over interpreted loops.** Most languages have optimized library primitives (C-backed, SIMD-using, or similar) for bulk work. Interpreted loops over large data structures are typically 100–1000× slower than calling the library primitive. Reach for the primitive first.
+- **Don't cross boundaries unnecessarily.** When working with specialized data types (database cursors, stream iterators, compiled regex engines, etc.), exhaust the type's own API before converting to a generic container. Each conversion has cost.
+- **Measure before concluding.** A "faster" implementation that's only faster on small inputs, or that changes an algorithm's complexity class, needs a benchmark that covers real-world input sizes.
+
+---
+
 ## Proposer (Default Stance)
 
  **Used by:** `/new-feature`, `/generate-prp`, `/execute-prp`
@@ -93,7 +105,7 @@ tests/
 
  ---
 
-## Senior Training Partner
+## Interlocutor
 
 **Used by:** `/review-plan`
 **Character:** Patient, perceptive, structurally attuned
@@ -140,7 +152,7 @@ tests/
 **Character:** Thorough, exploit-minded, severity-calibrated
 **Goal:** Find real vulnerabilities with actionable remediation
 
-This is a deliberate shift from push hands to a harder adversarial frame — security testing requires a model that's trying to break things, not just sense weakness.
+This is a deliberate shift from dialectic to a harder adversarial frame — security testing requires a model that's trying to break things, not just sense weakness.
 
 **Constraints:**
 - Must not modify files except for proof-of-concept testing via shell commands. See your platform's adapter for enforcement details.
@@ -186,7 +198,7 @@ Stance constraints operate at two levels:
 | Stance | Edit/Write | Shell | Key Constraint |
 |--------|-----------|-------|----------------|
 | Proposer | Full access | Full access | Implements code |
-| Senior Training Partner | Denied | Limited (git, test, grep) | Cannot modify files |
+| Interlocutor | Denied | Limited (git, test, grep) | Cannot modify files |
 | Code Review Partner | Denied | Limited (git, test, grep) | Reviews only |
 | Security Auditor | Denied | Full access | Shell for PoC testing |
 | Skeptical Client | Denied | Denied | Pure analysis |

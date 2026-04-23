@@ -1,6 +1,6 @@
-You are orchestrating a **concurrent Push Hands plan review** using agent teams. You are the team lead.
+You are orchestrating a **concurrent Dialectic plan review** using agent teams. You are the team lead.
 
-This command requires an existing PRP — generation still happens via `/generate-prp`. This command enhances the review phase: a Training Partner critiques the PRP while a Proposer defends and revises it in real time.
+This command requires an existing PRP — generation still happens via `/generate-prp`. This command enhances the review phase: an Interlocutor critiques the PRP while a Proposer defends and revises it in real time.
 
 ## Instructions
 
@@ -22,12 +22,12 @@ Review the PRP at: $ARGUMENTS
 Create two tasks via `TaskCreate`:
 
 **Task A: "Analyze PRP for structural weaknesses"**
-Description: You are the Senior Training Partner. Read the PRP at `{path}` and the source PRD. Verify every file path and symbol reference against the actual codebase. Identify at least 3 yield points — missing edge cases, incorrect assumptions, underspecified tasks, security implications, performance concerns, unnecessary complexity, hidden coupling, test gaps. Send each yield point as a separate message to the "proposer" teammate with severity and evidence as you discover them. After all yield points are sent, send a summary to the team lead. **Final summary to team lead must be self-contained for artifact synthesis:** list every yield point with severity, evidence, the proposer's response, whether it was accepted/rejected, and any strengths identified. The team lead will use this summary directly — do not assume the lead has tracked individual messages.
+Description: You are the Interlocutor. Read the PRP at `{path}` and the source PRD. Verify every file path and symbol reference against the actual codebase. Identify at least 3 yield points — missing edge cases, incorrect assumptions, underspecified tasks, security implications, performance concerns, unnecessary complexity, hidden coupling, test gaps. Send each yield point as a separate message to the "proposer" teammate with severity and evidence as you discover them. After all yield points are sent, send a summary to the team lead. **Final summary to team lead must be self-contained for artifact synthesis:** list every yield point with severity, evidence, the proposer's response, whether it was accepted/rejected, and any strengths identified. The team lead will use this summary directly — do not assume the lead has tracked individual messages.
 
-**Task B: "Defend and revise PRP based on training partner feedback"**
-Description: You are the Proposer. Read the PRP at `{path}` for context. Then wait for messages from "training-partner". As each concern arrives: evaluate it honestly, revise the PRP where the concern is valid (use Edit tool), respond to "training-partner" explaining what you changed and why. Reject invalid concerns with justification. **Final summary to team lead must be self-contained for artifact synthesis:** list every yield point received, your response (accepted/rejected with rationale), what was changed in the PRP and where, and any unresolved concerns. The team lead will use this summary directly.
+**Task B: "Defend and revise PRP based on interlocutor feedback"**
+Description: You are the Proposer. Read the PRP at `{path}` for context. Then wait for messages from "interlocutor". As each concern arrives: evaluate it honestly, revise the PRP where the concern is valid (use Edit tool), respond to "interlocutor" explaining what you changed and why. Reject invalid concerns with justification. **Final summary to team lead must be self-contained for artifact synthesis:** list every yield point received, your response (accepted/rejected with rationale), what was changed in the PRP and where, and any unresolved concerns. The team lead will use this summary directly.
 
-**Convergence rule:** The exchange is complete when: (a) the training partner has sent all yield points AND a summary message to the team lead, AND (b) the proposer has responded to every yield point and sent a summary of revisions to the team lead. If a revision introduces a new issue that the training partner catches, the training partner may raise additional yield points, but the exchange MUST terminate after a maximum of 2 revision rounds (initial findings + one round of follow-up on revisions). After the second round, remaining concerns are documented in the review artifact as "open items for human review."
+**Convergence rule:** The exchange is complete when: (a) the interlocutor has sent all yield points AND a summary message to the team lead, AND (b) the proposer has responded to every yield point and sent a summary of revisions to the team lead. If a revision introduces a new issue that the interlocutor catches, the interlocutor may raise additional yield points, but the exchange MUST terminate after a maximum of 2 revision rounds (initial findings + one round of follow-up on revisions). After the second round, remaining concerns are documented in the review artifact as "open items for human review."
 
 **Do NOT use `addBlockedBy`.** Both tasks start simultaneously. The Proposer reads the PRP then waits for incoming messages — this creates genuine concurrent exchange.
 
@@ -35,36 +35,17 @@ Description: You are the Proposer. Read the PRP at `{path}` for context. Then wa
 
 Spawn both teammates using the Agent tool with `run_in_background: true` and `model: "opus"`:
 
-- `name: "training-partner"`, `subagent_type: "training-partner"`, `team_name: "plan-review-{slug}"`, `model: "opus"`
-  Prompt: _(inline stance — required because .claude/agents/*.md definitions don't load for team members, see Claude Code bug #24316)_
+- `name: "interlocutor"`, `subagent_type: "interlocutor"`, `team_name: "plan-review-{slug}"`, `model: "opus"`
 
-  "You are the **Senior Training Partner** — patient, perceptive, structurally attuned. You sense where plans yield under pressure — before implementation exposes it. You CANNOT write code or modify files — you have no Write or Edit tools. Your tools are: Read, Grep, Glob, Bash.
-
-  **Your constraints:**
-  - You can only test the plan's balance through calibrated pressure
-  - You must cite specific yield points with evidence (file paths, line numbers)
-  - You must check every file path and symbol reference against the actual codebase
-  - Assume the plan has at least 3 structural weaknesses
-
-  **What you look for:** Missing edge cases, incorrect assumptions about existing code, underspecified tasks, security implications, performance concerns, unnecessary complexity, hidden coupling, test gaps.
-
-  **Your task:** Review the PRP at {path}. The source PRD is at {prd_path}. Read CLAUDE.md for project conventions. Find at least 3 structural weaknesses. Send each yield point as a separate message to 'proposer' with severity and evidence. After all yield points, send a summary to the team lead."
+  Prompt: "**Your task:** Review the PRP at {path}. The source PRD is at {prd_path}. Read CLAUDE.md for project conventions. Find at least 3 structural weaknesses. Send each yield point as a separate message to 'proposer' with severity and evidence. After all yield points, send a summary to the team lead."
 
 - `name: "proposer"`, `subagent_type: "proposer"`, `team_name: "plan-review-{slug}"`, `model: "opus"`
-  Prompt: _(inline stance — required because .claude/agents/*.md definitions don't load for team members, see Claude Code bug #24316)_
 
-  "You are the **Proposer** — thorough, systematic, completion-oriented. You have full tool access (Read, Write, Edit, Bash, Grep, Glob).
-
-  **Your constraints:**
-  - Read CLAUDE.md before any work — follow all project conventions
-  - Evaluate feedback honestly — accept valid concerns, push back on invalid ones with justification
-  - When revising the PRP, use the Edit tool to make specific changes
-
-  **Your task:** Defend and revise the PRP at {path}. Read the PRP for context. Then wait for messages from 'training-partner'. For each concern: if valid, edit the PRP and tell training-partner what you changed; if invalid, explain why. When done, send a summary of all revisions to the team lead."
+  Prompt: "**Your task:** Defend and revise the PRP at {path}. Read the PRP for context. Then wait for messages from 'interlocutor'. For each concern: if valid, use the Edit tool to revise the PRP and tell interlocutor what you changed; if invalid, explain why with justification. When done, send a summary of all revisions to the team lead."
 
 ### 5. Assign tasks
 
-Use `TaskUpdate` to assign Task A to "training-partner" and Task B to "proposer".
+Use `TaskUpdate` to assign Task A to "interlocutor" and Task B to "proposer".
 
 ### 5.5. Health check (after spawning)
 
@@ -84,16 +65,16 @@ After both teammates are spawned:
 
 ### 6. Actively manage the exchange
 
-You are the **tech lead**, not a passive observer. You have full architectural context that the teammates lack. Participate:
+You are the **tech lead**, not a passive observer. You have full architectural context the teammates lack. Participate:
 
-- **Validate yield points** — When the training partner raises a concern, assess whether it's real. If it's noise, message the proposer to deprioritize it. If it's critical, message the proposer to take it seriously.
-- **Intervene on drift** — If the proposer defers a decision ("out of scope", "follow-up"), evaluate whether the deferral is appropriate or a shim. Per CLAUDE.md: no "fix later" shims.
+- **Validate yield points** — When the interlocutor raises a concern, assess whether it's real. If it's noise, message the proposer to deprioritize it. If it's critical, message the proposer to take it seriously.
+- **Intervene on drift** — If the proposer defers a decision ("out of scope", "follow-up"), evaluate whether the deferral is appropriate or a shim. No "fix later" shims.
 - **Provide context** — You've read the PRD, PRP, design docs, and CLAUDE.md. If the exchange stalls on a factual question about the codebase or architecture, answer it directly via message to the relevant teammate.
 - **Verify empirically** — If a yield point questions an assumption (e.g., "does this API exist?"), check the codebase yourself and share the finding.
 - **Enforce quality** — If the proposer accepts a yield point but the revision is superficial, push back.
 
 Track:
-- What yield points were found (from training-partner messages)
+- What yield points were found (from interlocutor messages)
 - How the proposer responded (accepted/revised or rejected with justification)
 - Whether the exchange converged (both agents complete their tasks)
 
@@ -105,7 +86,7 @@ After both teammates complete (check `TaskList`), write `docs/reviews/plans/{slu
 # Plan Review: {slug}
 
 ## Verdict: APPROVED | REQUESTS CHANGES
-## Reviewer Stance: Team — Senior Training Partner + Proposer
+## Reviewer Stance: Team — Interlocutor + Proposer
 ## Date: {today}
 ## Mode: Agent Team (concurrent review + revision)
 
@@ -113,7 +94,7 @@ After both teammates complete (check `TaskList`), write `docs/reviews/plans/{slu
 
 ### 1. [Description]
 **Severity:** Structural | Moderate | Minor
-**Evidence:** [from training partner's message]
+**Evidence:** [from interlocutor's message]
 **Proposer Response:** [accepted and revised | rejected with justification]
 **PRP Updated:** Yes/No
 
@@ -128,7 +109,7 @@ After both teammates complete (check `TaskList`), write `docs/reviews/plans/{slu
 
 ### 8. Commit
 
-Message: `docs: push hands plan review for {slug} (team mode)`
+Message: `docs: dialectic plan review for {slug} (team mode)`
 
 ### 9. Shutdown and cleanup
 
