@@ -148,9 +148,16 @@ def tokenize_tdl(text: str) -> list[TdlToken]:
             col += 3
             doc_start = i
             while i < len(text):
-                if text[i] == '"' and i + 2 < len(text) and text[i + 1] == '"' and text[i + 2] == '"':
+                if (
+                    text[i] == '"'
+                    and i + 2 < len(text)
+                    and text[i + 1] == '"'
+                    and text[i + 2] == '"'
+                ):
                     doc_text = text[doc_start:i]
-                    tokens.append(TdlToken("docstring", doc_text, start_line, start_col))
+                    tokens.append(
+                        TdlToken("docstring", doc_text, start_line, start_col)
+                    )
                     i += 3
                     col += 3
                     break
@@ -455,7 +462,8 @@ class _Parser:
                 section_parts.append(keyword)
                 self._advance()
                 # If :status, next token is the status value
-                if keyword == "status" and self._peek() and self._peek().kind == "ident":
+                peek = self._peek()
+                if keyword == "status" and peek and peek.kind == "ident":
                     status = self._advance().value
                 continue
             self._advance()
@@ -743,7 +751,9 @@ class _Parser:
             self._advance()
 
 
-def parse_tdl(tokens: list[TdlToken]) -> list[TdlDefinition | TdlInclude | TdlDirective]:
+def parse_tdl(
+    tokens: list[TdlToken],
+) -> list[TdlDefinition | TdlInclude | TdlDirective]:
     """Parse a token stream into TDL AST nodes."""
     parser = _Parser(tokens)
     return parser.parse()
@@ -824,7 +834,9 @@ def _parse_recursive(
 
     # Track section state for include resolution
     current_section = section_context
-    current_is_instance = section_context is not None and section_context.startswith("instance")
+    current_is_instance = (
+        section_context is not None and section_context.startswith("instance")
+    )
 
     for item in items:
         if isinstance(item, TdlDirective):
@@ -843,7 +855,9 @@ def _parse_recursive(
                     current_is_instance = False
             elif item.kind == "end":
                 current_section = section_context  # revert to inherited
-                current_is_instance = section_context is not None and section_context.startswith("instance")
+                current_is_instance = (
+        section_context is not None and section_context.startswith("instance")
+    )
             results.append(item)
         elif isinstance(item, TdlInclude):
             try:
