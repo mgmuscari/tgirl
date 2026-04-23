@@ -20,7 +20,7 @@
 
 # Signal to hooks that this process is a team agent, not the team lead.
 # block-solo-implementation.sh checks this to allow proposer writes.
-export PUSH_HANDS_TEAM_AGENT=1
+export DIALECTIC_TEAM_AGENT=1
 
 # Pass through all arguments to claude, ensuring model is set
 exec claude "$@"

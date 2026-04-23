@@ -7,6 +7,8 @@
 
 Code Review Partner — detail-oriented, convention-aware, quality-sensing. You review the diff — you do not rewrite code. You only identify where balance breaks. You must not modify files.
 
+> **Note:** Defender scope enforcement runs automatically in `/review-code-team`; sequential `/review-code` has no defender, so the `scripts/check-defender-scope.sh` check does not apply here.
+
 ## Input
 
 Review all changes on the current feature branch against `main`. No additional input required.
@@ -42,7 +44,7 @@ Write the review at `docs/reviews/code/<slug>-review.md`.
 
 ### 5. Commit the review
 
-Commit with message: `docs: push hands code review for <slug>`
+Commit with message: `docs: dialectic code review for <slug>`
 
 ### 6. Next steps
 

@@ -1,10 +1,28 @@
 #!/bin/bash
-# Push Hands template setup script
+# Dialectic template setup script
 # Run this after creating a new project from the template or after cloning.
 
 set -e
 
-echo "Setting up Push Hands development environment..."
+# Cwd/toplevel guard. This distribution ships inside a parent template repo
+# at distributions/dialectic/. If you run setup.sh while still inside that
+# parent, `git rev-parse --show-toplevel` resolves to the parent's root and
+# `.git/hooks/` would silently overwrite parent hooks. Copy this directory
+# out to a new location and `git init` there BEFORE running setup.sh.
+if ! command -v git >/dev/null 2>&1 || ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+    echo "ERROR: not inside a git repo. Copy this distribution into a new repo and 'git init' first." >&2
+    exit 2
+fi
+TOPLEVEL="$(git rev-parse --show-toplevel)"
+if [ "$(pwd -P)" != "$TOPLEVEL" ]; then
+    echo "ERROR: refusing to run inside a parent git repo." >&2
+    echo "       Distribution root:     $(pwd -P)" >&2
+    echo "       Active git toplevel:   $TOPLEVEL" >&2
+    echo "       Copy this distribution out and 'git init' in the new location first." >&2
+    exit 2
+fi
+
+echo "Setting up Dialectic development environment..."
 echo ""
 
 # Install git hooks
@@ -45,7 +63,7 @@ echo ""
 echo "Checking key files..."
 MISSING=0
 
-for file in CLAUDE.md AGENTS.md push-hands.md; do
+for file in CLAUDE.md AGENTS.md dialectic.md; do
     if [ -f "$file" ]; then
         echo "  ✓ ${file}"
     else
@@ -72,7 +90,7 @@ fi
 
 # Check methodology enforcement hooks
 echo "Checking methodology enforcement hooks..."
-for hook in push-hands-guard.sh block-solo-implementation.sh enforce-opus-teams.sh; do
+for hook in dialectic-guard.sh block-solo-implementation.sh enforce-opus-teams.sh; do
     if [ -f ".claude/hooks/${hook}" ]; then
         echo "  ✓ .claude/hooks/${hook}"
         if [ ! -x ".claude/hooks/${hook}" ]; then
@@ -94,7 +112,7 @@ echo ""
 # Check agent definitions (optional — needed for team mode)
 echo "Checking agent definitions (for team mode)..."
 AGENTS_MISSING=0
-for agent in proposer training-partner code-reviewer security-auditor skeptical-client; do
+for agent in proposer interlocutor code-reviewer security-auditor skeptical-client; do
     if [ -f ".claude/agents/${agent}.md" ]; then
         echo "  ✓ .claude/agents/${agent}.md"
     else
@@ -112,7 +130,7 @@ echo ""
 # Check portable prompt templates
 echo "Checking portable templates..."
 STANCES_COUNT=0
-for stance in proposer training-partner code-reviewer security-auditor skeptical-client; do
+for stance in proposer interlocutor code-reviewer security-auditor skeptical-client; do
     if [ -f "prompts/stances/${stance}.md" ]; then
         STANCES_COUNT=$((STANCES_COUNT + 1))
     fi

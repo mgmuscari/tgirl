@@ -5,7 +5,7 @@
 
 ## Stance
 
-Senior Training Partner — patient, perceptive, structurally attuned. You sense where the plan yields under pressure — before implementation exposes it. You must not modify files — only analyze and review.
+Interlocutor — patient, perceptive, structurally attuned. You sense where the plan yields under pressure — before implementation exposes it. You must not modify files — only analyze and review.
 
 ## Input
 
@@ -45,7 +45,7 @@ Write the review at `docs/reviews/plans/<slug>-review.md`.
 
 ### 6. Commit the review
 
-Commit with message: `docs: push hands plan review for <slug>`
+Commit with message: `docs: dialectic plan review for <slug>`
 
 ### 7. Next steps
 
@@ -58,7 +58,7 @@ If APPROVED, recommend proceeding to PRP execution.
 # Plan Review: <slug>
 
 ## Verdict: APPROVED | REQUESTS CHANGES
-## Reviewer Stance: Senior Training Partner
+## Reviewer Stance: Interlocutor
 ## Date: YYYY-MM-DD
 
 ## Yield Points Found
@@ -72,7 +72,7 @@ If APPROVED, recommend proceeding to PRP execution.
 ### 2. ...
 
 ## What Holds Well
-[Acknowledge what's solid — push hands is cooperative, not adversarial]
+[Acknowledge what's solid — dialectic is cooperative, not adversarial]
 
 ## Summary
 [Overall assessment and recommended path forward]

@@ -30,14 +30,14 @@ Extract the `--tier <value>` flag from the input if present:
   - If `feature/<slug>` already exists AND you're already on it: continue — no branch switching needed.
   - If `feature/<slug>` already exists but you're on a different branch: switch to it.
   - If `feature/<slug>` does not exist: create it from `main`.
-- **Read existing tier metadata** if present: if `.push-hands-tier` exists on the branch, use its value (it takes precedence over any `--tier` flag).
-- If no `.push-hands-tier` exists, write the parsed tier value to `.push-hands-tier`.
+- **Read existing tier metadata** if present: if `.dialectic-tier` exists on the branch, use its value (it takes precedence over any `--tier` flag).
+- If no `.dialectic-tier` exists, write the parsed tier value to `.dialectic-tier`.
 
 ### 2. Light tier path
 
 If the tier is `light`:
 - **Skip PRD generation entirely.** No codebase research, no PRD template, no document artifact.
-- Commit `.push-hands-tier` if not already committed: message `chore: create feature branch for <slug> (light tier)`
+- Commit `.dialectic-tier` if not already committed: message `chore: create feature branch for <slug> (light tier)`
 - **Report:**
   - "Light tier — implement your change directly."
   - "Run a code review when done (optional), then create a PR."
@@ -64,7 +64,7 @@ Read the PRD template at `docs/PRDs/TEMPLATE.md` and fill in every section:
 
 ### 5. Commit to the feature branch
 
-- Stage both `.push-hands-tier` and the PRD (if `.push-hands-tier` is not already committed)
+- Stage both `.dialectic-tier` and the PRD (if `.dialectic-tier` is not already committed)
 - Message: `docs: scaffold PRD for <slug>`
 
 ### 6. Auto-generate the PRP (standard and full tiers)
@@ -96,5 +96,5 @@ git branch --list "feature/*" | grep -q "<slug>"
 test -f "docs/PRDs/<slug>.md"
 
 # Tier file exists
-test -f ".push-hands-tier"
+test -f ".dialectic-tier"
 ```

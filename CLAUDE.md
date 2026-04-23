@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Operating Principles
 
-**Default stance: Team Lead.** When receiving user instructions or feedback, orchestrate dialectical teams — do not solo-implement. Use `/new-feature` to initiate work. Use team commands (`/review-plan-team`, `/execute-team`) for standard/full tier. The proposer implements; the training partner tests balance; the team lead orchestrates.
+**Default stance: Team Lead.** When receiving user instructions or feedback, orchestrate dialectical teams — do not solo-implement. Use `/new-feature` to initiate work. Use team commands (`/review-plan-team`, `/execute-team`) for standard/full tier. The proposer implements; the interlocutor tests balance; the team lead orchestrates.
 
 **Pressure demands the *right* structure.** Scope pressure → tighten methodology (more review, more planning). Performance/bug pressure → tighten feedback loops (faster iteration, empirical validation). Never abandon structure — match it to the problem type.
 
-**The dialectic is the product.** The structured tension between proposer and training partner is not overhead — it is the mechanism that produces quality. Bypassing it is like skipping the partner and practicing alone.
+**The dialectic is the product.** The structured tension between proposer and interlocutor is not overhead — it is the mechanism that produces quality. Bypassing it is like skipping the partner and practicing alone.
 
 **TDD is mandatory.** All implementation follows RED → GREEN → REFACTOR. Tests are written before implementation code. Never mock to make tests pass — fix the real issue. Never weaken tests to get green.
 
@@ -107,7 +107,7 @@ All modules use `structlog` for structured logging. `transport`/`transport_mlx` 
 
 ## Development Lifecycle Pipeline
 
-Four workflow tiers (light/iterative/standard/full) match process weight to change size. Default is standard. Tier metadata is stored in `.push-hands-tier` on feature branches — this file must never reach `main`.
+Four workflow tiers (light/iterative/standard/full) match process weight to change size. Default is standard. Tier metadata is stored in `.dialectic-tier` on feature branches — this file must never reach `main`.
 
 ```
 Light:     Feature Branch → Implement (TDD) → /review-code (optional) → PR → Merge
@@ -118,7 +118,7 @@ Full:      Standard pipeline + /security-audit (expected) → PR → Merge
 
 Each arrow is a gate. Work does not proceed until the gate passes.
 
-**Iterative tier** — For benchmark-driven optimization, performance investigation, and bug hunt loops. Direct implementation allowed, TDD mandatory, code review before PR. The developer is the training partner in real-time. Use `/investigate` to enter this workflow.
+**Iterative tier** — For benchmark-driven optimization, performance investigation, and bug hunt loops. Direct implementation allowed, TDD mandatory, code review before PR. The developer is the interlocutor in real-time. Use `/investigate` to enter this workflow.
 
 **Security audits are strongly recommended** for work touching `compile.py` (sandbox), `transport.py` (numerical correctness), and `sample.py` (sampling loop integrity).
 
@@ -143,7 +143,7 @@ Requires: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in Claude Code settings.
 Five defined stances with distinct optimization targets:
 
 - **Proposer** — Completion-oriented, used for `/new-feature`, `/generate-prp`, `/execute-prp`
-- **Senior Training Partner** — Senses structural weakness in plans, used for `/review-plan`. Cannot write code.
+- **Interlocutor** — Senses structural weakness in plans, used for `/review-plan`. Cannot write code.
 - **Code Review Partner** — Reviews diff against PRP spec, used for `/review-code`
 - **Security Auditor** (hard stance) — Exploit-minded, requires PoC for HIGH+ findings
 - **Skeptical Client** (hard stance) — Challenges severity inflation, demands proof
@@ -156,7 +156,7 @@ Five defined stances with distinct optimization targets:
 - PRPs: `docs/PRPs/<feature-slug>.md` (matches PRD slug)
 - Reviews: `docs/reviews/{plans,code}/<feature-slug>-review.md`
 - Audits: `docs/audits/<feature-slug>-audit.md`
-- Tier metadata: `.push-hands-tier` (feature branches only, never on `main`)
+- Tier metadata: `.dialectic-tier` (feature branches only, never on `main`)
 - Slugs: lowercase, hyphen-separated, alphanumeric only (`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 ## Execution Rules
@@ -178,7 +178,7 @@ Five defined stances with distinct optimization targets:
 
 Three hooks in `.claude/hooks/` enforce the methodology:
 
-1. **`push-hands-guard.sh`** — Fires on `UserPromptSubmit`. Detects implementation-intent keywords and injects methodology reminders.
+1. **`dialectic-guard.sh`** — Fires on `UserPromptSubmit`. Detects implementation-intent keywords and injects methodology reminders.
 2. **`block-solo-implementation.sh`** — Fires on `PreToolUse` for Edit/Write. Blocks direct edits to `src/` and `tests/` on standard/full tier feature branches.
 3. **`enforce-opus-teams.sh`** — Fires on `PreToolUse` for Agent. Denies team agent spawns without `model: "opus"`.
 
@@ -188,7 +188,7 @@ Three hooks in `.claude/hooks/` enforce the methodology:
 
 2026-02-10: `grep -qE "$PATTERN" "$FILE"` checks ALL lines, not just the first → Use `head -1 "$FILE" | grep -qE "$PATTERN"` when validating only the first line (e.g., commit message hooks)
 
-2026-03-01: Claude Code's built-in TaskCreate system reminders can override CLAUDE.md operating principles → The `push-hands-guard.sh` hook counteracts this by injecting methodology reminders on UserPromptSubmit before system nudges take effect
+2026-03-01: Claude Code's built-in TaskCreate system reminders can override CLAUDE.md operating principles → The `dialectic-guard.sh` hook counteracts this by injecting methodology reminders on UserPromptSubmit before system nudges take effect
 
 2026-03-09: Claude Code agent definitions (`.claude/agents/*.md`) don't load for team members — `subagent_type` is ignored when `team_name` is set (bug #24316, OPEN) → Team commands inline stance definitions in spawn prompts as a workaround
 
@@ -196,6 +196,6 @@ Three hooks in `.claude/hooks/` enforce the methodology:
 
 2026-03-09: `~/.claude/teams/` directory detection is unreliable for checking active teams → `block-solo-implementation.sh` uses tier + branch + file path checks instead
 
-2026-03-14: Spawned team agents don't get `PUSH_HANDS_TEAM_AGENT=1` env var (they're not launched through `claude-teammate-wrapper.sh`) → `block-solo-implementation.sh` now also checks for `~/.claude/teams/execute-{slug}/config.json` to detect active execute teams
+2026-03-14: Spawned team agents don't get `DIALECTIC_TEAM_AGENT=1` env var (they're not launched through `claude-teammate-wrapper.sh`) → `block-solo-implementation.sh` now also checks for `~/.claude/teams/execute-{slug}/config.json` to detect active execute teams
 
 2026-03-14: **All tensor/matrix math must use the accelerated library for the context (MLX or PyTorch). Never use Python list comprehensions on tensor data.** `[float(v) for v in mx_array]` on 248k elements takes 8.3 seconds; `mx_array.tolist()` takes 6ms — a 1,400x difference. Conversion between linalg libraries (e.g., mx→torch, torch→numpy) must be avoided unless there is absolutely no alternative; exhaust the library's own API and documentation before resorting to cross-library conversion.

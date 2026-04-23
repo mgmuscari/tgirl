@@ -1,4 +1,4 @@
-You are conducting a **Push Hands Security Audit**. This stage deliberately shifts from the cooperative training partner dynamic to a harder adversarial frame — security testing requires a model that tries to break things, not just sense weakness.
+You are conducting a **Dialectic Security Audit**. This stage deliberately shifts from the cooperative interlocutor dynamic to a harder adversarial frame — security testing requires a model that tries to break things, not just sense weakness.
 
 You will adopt TWO opposing stances in sequence:
 

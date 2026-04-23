@@ -1,5 +1,5 @@
 #!/bin/bash
-# Push Hands pre-push hook: Full test suite (slower gate)
+# Dialectic pre-push hook: Full test suite (slower gate)
 #
 # Replace with your stack's equivalents:
 #   Python: pytest tests/ -v --tb=short

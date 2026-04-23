@@ -39,17 +39,18 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$FEATURE_NAME" ]; then
-    echo "Usage: ./scripts/new-feature.sh <feature-name> [--tier light|standard|full]"
+    echo "Usage: ./scripts/new-feature.sh <feature-name> [--tier light|iterative|standard|full]"
     echo "Example: ./scripts/new-feature.sh user-authentication"
     echo "Example: ./scripts/new-feature.sh fix-typo --tier light"
+    echo "Example: ./scripts/new-feature.sh perf-bottleneck --tier iterative"
     exit 1
 fi
 
 # Validate tier value
 case "$TIER" in
-    light|standard|full) ;;
+    light|iterative|standard|full) ;;
     *)
-        echo "Error: invalid tier '${TIER}' — must be light, standard, or full"
+        echo "Error: invalid tier '${TIER}' — must be light, iterative, standard, or full"
         exit 1
         ;;
 esac
@@ -72,27 +73,35 @@ git pull --ff-only 2>/dev/null || true
 git checkout -b "$BRANCH_NAME"
 
 # Write tier metadata
-echo "$TIER" > .push-hands-tier
+echo "$TIER" > .dialectic-tier
 
-if [ "$TIER" = "light" ]; then
-    # Light tier: no PRD scaffold, just tier file
-    git add .push-hands-tier
-    git commit -m "chore: create feature branch for ${FEATURE_NAME} (light tier)"
+if [ "$TIER" = "light" ] || [ "$TIER" = "iterative" ]; then
+    # Light/iterative tier: no PRD scaffold, just tier file
+    git add .dialectic-tier
+    git commit -m "chore: create feature branch for ${FEATURE_NAME} (${TIER} tier)"
 
     echo ""
     echo "Feature branch created: ${BRANCH_NAME}"
-    echo "Tier: light"
+    echo "Tier: ${TIER}"
     echo ""
-    echo "Next steps:"
-    echo "  1. Implement your change directly"
-    echo "  2. Run /review-code (optional)"
-    echo "  3. Close with ./scripts/close-feature.sh ${FEATURE_NAME}"
+    if [ "$TIER" = "iterative" ]; then
+        echo "Next steps:"
+        echo "  1. Implement with TDD (mandatory)"
+        echo "  2. Benchmark/test → fix → re-benchmark (iterate)"
+        echo "  3. Run /review-code before PR"
+        echo "  4. Close with ./scripts/close-feature.sh ${FEATURE_NAME}"
+    else
+        echo "Next steps:"
+        echo "  1. Implement your change directly"
+        echo "  2. Run /review-code (optional)"
+        echo "  3. Close with ./scripts/close-feature.sh ${FEATURE_NAME}"
+    fi
 else
     # Standard/Full tier: scaffold PRD
     cp docs/PRDs/TEMPLATE.md "$PRD_PATH"
     mkdir -p docs/PRPs
 
-    git add .push-hands-tier "$PRD_PATH"
+    git add .dialectic-tier "$PRD_PATH"
     git commit -m "docs: scaffold PRD for ${FEATURE_NAME}"
 
     echo ""

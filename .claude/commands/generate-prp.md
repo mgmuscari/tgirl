@@ -30,4 +30,4 @@ Generate a PRP from the PRD at: $ARGUMENTS
 4. **Commit** to the feature branch:
    - Message: `docs: generate PRP for <slug>`
 
-5. **Recommend next step:** `/review-plan docs/PRPs/<slug>.md` to have the Senior Training Partner review the plan before execution.
+5. **Recommend next step:** `/review-plan docs/PRPs/<slug>.md` to have the Interlocutor review the plan before execution.
