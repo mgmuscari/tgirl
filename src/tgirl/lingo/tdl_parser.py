@@ -388,9 +388,7 @@ class _Parser:
             return False
         if tok.kind != kind:
             return False
-        if value is not None and tok.value != value:
-            return False
-        return True
+        return not (value is not None and tok.value != value)
 
     def parse(self) -> list[TdlDefinition | TdlInclude | TdlDirective]:
         results: list[TdlDefinition | TdlInclude | TdlDirective] = []
@@ -457,9 +455,8 @@ class _Parser:
                 section_parts.append(keyword)
                 self._advance()
                 # If :status, next token is the status value
-                if keyword == "status":
-                    if self._peek() and self._peek().kind == "ident":
-                        status = self._advance().value
+                if keyword == "status" and self._peek() and self._peek().kind == "ident":
+                    status = self._advance().value
                 continue
             self._advance()
         # Consume .
