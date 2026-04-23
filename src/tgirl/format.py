@@ -41,7 +41,7 @@ class ChatTemplateFormatter:
         dropped to maintain compatibility across model families.
         """
         try:
-            return self._tokenizer.apply_chat_template(  # type: ignore[union-attr]
+            return self._tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
@@ -49,7 +49,7 @@ class ChatTemplateFormatter:
             )
         except TypeError:
             # Model template doesn't support these kwargs — retry without
-            return self._tokenizer.apply_chat_template(  # type: ignore[union-attr]
+            return self._tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
