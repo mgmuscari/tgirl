@@ -5,7 +5,7 @@
 
 ## 1. Context Summary
 
-Drive `mypy src/ --ignore-missing-imports` to a clean run under the existing `strict = true` config. Baseline is 100 errors across 17 `src/tgirl/*` files. No runtime behavior changes; protocols added are internal documentation of already-existing duck-typed contracts. Latent bugs surfaced in stage 4 (below) must ship with failing-then-passing regression tests.
+Drive `mypy src/ --ignore-missing-imports` to a clean run under the existing `strict = true` config. Baseline is **100 errors across 18 `src/tgirl/*` files** (verified 2026-04-23 via `mypy src/ --ignore-missing-imports 2>&1 | grep "error:" | sed 's/:[0-9]*:.*//' | sort | uniq -c`; note the `grep "error:"` filter — a naive `grep "^src/"` inflates counts by including mypy `note:` lines). No runtime behavior changes; protocols added are internal documentation of already-existing duck-typed contracts. Latent bugs surfaced in stage 4 (below) must ship with failing-then-passing regression tests.
 
 ## 2. Codebase Analysis
 
@@ -23,8 +23,8 @@ Captured via `mypy src/ --ignore-missing-imports` on the branch base. Distributi
 - 5 `unused-ignore` — stale `# type: ignore` comments
 - 4 `no-untyped-def` — functions without annotations
 - 3 `index` — tuple-as-dict-key narrowing in `rerank.py`
-- 3 `assignment` / 2 `comparison-overlap` — `lingo/types.py` set/str confusion (latent bug cluster)
-- 2 `misc` — `serve.py:89` tuple unpack mismatch (latent bug), dynamic base class in `compile.py:438`
+- 3 `assignment` / 2 `comparison-overlap` — `lingo/types.py` scope-shadowing cluster (NOT a bug — see Task 10 for rename fix; originally misdiagnosed as set/str confusion in earlier drafts)
+- 2 `misc` — `serve.py:88` unpack mismatch (mlx_lm stub gap — see Task 13), dynamic base class in `compile.py:438`
 - 2 `call-overload` — `kwargs.get("token_id")` narrowing in `state_machine.py`
 - 2 `call-arg` — `steering=` kwarg on `forward_fn`; `enable_thinking=` on `PromptFormatter`
 - 1 `operator` — `>` on `list[list_or_scalar]` in `calibrate.py:39`
@@ -70,7 +70,19 @@ Captured via `mypy src/ --ignore-missing-imports` on the branch base. Distributi
 
 **Test Command:** `pytest tests/` and `mypy src/ --ignore-missing-imports`
 
-Each task below is scoped to a single logical commit. Tasks are ordered by risk (low to high) and dependency; later tasks may build on protocols introduced earlier.
+Each task below is scoped to a single logical commit. Tasks are ordered by risk (low to high) and dependency; later tasks build on protocols introduced earlier.
+
+### Task dependency DAG (must-precede relations)
+
+Most tasks are independent. The non-trivial dependencies are:
+
+- **Task 6 must precede Task 13's `sample_mlx.py:490`** (`steering=` kwarg). Task 13 fixes the `Unexpected keyword argument "steering"` call-arg error, but the fix is valid only after Task 6 has widened the `forward_fn` parameter to the `SteerableForwardFn` protocol with the `steering=` kwarg.
+- **Task 5 must precede Task 12a** (`estradiol_alphas` append narrowing, sample_mlx.py:495). Note: the narrowing fix itself (`assert estradiol_alphas is not None`) is independent of the controller Protocol, but having `controller: EstradiolControllerProto | None` makes the surrounding code easier to read and removes adjacent `hasattr` guards. This is a *preferred* ordering, not a hard dependency.
+- **Task 7 (TokenizerProto) must precede Task 9's `format.py:44, 52`** no-any-return fixes. Once `apply_chat_template` has a concrete `-> str` return type via the Protocol, the `no-any-return` errors vanish naturally. Doing Task 9 first would mean writing `cast(str, ...)` only to delete it in Task 7.
+- **Task 12c (rerank cross-framework investigation)** subsumes what was originally scattered: `rerank.py:143` arg-type and `sample_mlx.py:506` attr-defined. Both must be fixed together because the fix is a single architectural decision (backend-aware factory), not two independent narrowings.
+- **Tasks 1–4** have no inter-dependencies and can be done in any order.
+
+Recommended execution order: 1 → 2 → 3 → 4 → **5 → 6 → 7 → 8** (Protocol cluster) → **9 → 10 → 11** (narrowing cluster) → **12** (latent bugs) → **13** (scatter-gather) → **14** (cleanup).
 
 ---
 
@@ -167,11 +179,12 @@ Each task below is scoped to a single logical commit. Tasks are ordered by risk 
 
 ---
 
-### Task 5: EstradiolControllerProto + apply to sample_mlx.py
+### Task 5: EstradiolControllerProto + ConfidenceMonitorProto + apply to sample_mlx.py
 
 **Files:**
-- `src/tgirl/estradiol.py` (add Protocol near the top of the file, after imports; reference the concrete class below)
-- `src/tgirl/sample_mlx.py` (change `controller: object | None = None` → `controller: EstradiolControllerProto | None = None`, import the protocol)
+- `src/tgirl/estradiol.py` (add `EstradiolControllerProto` near the top of the file, after imports; reference the concrete class below)
+- `src/tgirl/state_machine.py` (add `ConfidenceMonitorProto` co-located with its concrete consumer — the `should_checkpoint`/`record_log_prob`/`should_backtrack`/`record_backtrack`/`backtracks_remaining` methods are defined at lines 367–388 in state_machine.py, so the Protocol lives there)
+- `src/tgirl/sample_mlx.py` (change `controller: object | None = None` at line 434 → `controller: EstradiolControllerProto | None = None`, and `confidence_monitor: object | None = None` at line 429 → `confidence_monitor: ConfidenceMonitorProto | None = None`; import both protocols)
 - `src/tgirl/sample.py` (if the torch counterpart has the same pattern — check; else skip)
 - `tests/test_sample_mlx.py` (verify the MLX constrained-gen test still accepts the concrete `EstradiolController` via the Protocol)
 
@@ -182,44 +195,61 @@ Each task below is scoped to a single logical commit. Tasks are ordered by risk 
   - `def step(self, probe_alpha: Any) -> Any: ...`
   - `def make_steering_state(self, delta_alpha: Any) -> Any: ...`
   - `def reset(self) -> None: ...`
-- Verify the concrete `EstradiolController` class implicitly satisfies this by running `isinstance(controller, EstradiolControllerProto)` in a one-off test before removing it.
-- In `sample_mlx.py`: import the Protocol, change the parameter annotation at line 434 from `object | None` to `EstradiolControllerProto | None`. Remove the `hasattr(controller, "reset")` guard at line 470 (the Protocol now guarantees it) IF the existing runtime behavior doesn't depend on it; keep the `hasattr` if other callers pass controllers without `.reset()`.
+- In `state_machine.py`, add a `@runtime_checkable` `ConfidenceMonitorProto(Protocol)` matching the methods accessed in sample_mlx.py at lines 535, 640, 642, 643, 676:
+  - `def should_checkpoint(self, grammar_valid_count: int) -> bool: ...`
+  - `def record_log_prob(self, log_prob: float) -> None: ...`
+  - `def should_backtrack(self) -> bool: ...`
+  - `def record_backtrack(self) -> None: ...`
+  - `backtracks_remaining: int  # property or attribute`
+  Find the concrete monitor class via `grep -rn "def should_checkpoint" src/` before finalizing the Protocol surface — the five methods above are the *known* uses, but the concrete class may expose additional state that future call sites will want.
+- Verify the concrete classes implicitly satisfy both Protocols by running `isinstance(controller, EstradiolControllerProto)` and `isinstance(monitor, ConfidenceMonitorProto)` in one-off tests.
+- In `sample_mlx.py`: import both Protocols, change the parameter annotations at lines 429 and 434 as described above. Remove the `hasattr(controller, "reset")` guard at line 470 (the Protocol now guarantees it) IF the existing runtime behavior doesn't depend on it; keep the `hasattr` if other callers pass controllers without `.reset()`.
 
 **Tests (RED first):**
-- RED: `mypy src/tgirl/sample_mlx.py 2>&1 | grep -cE "controller.*object|V_basis|make_steering_state|alpha_current|step.*attr-defined"` → ≥8 (the ESTRADIOL-on-`object` cluster)
-- Add `tests/test_estradiol.py::test_controller_satisfies_proto` — `isinstance(EstradiolController(...), EstradiolControllerProto)` is True. This is the RED → GREEN check for the Protocol surface.
-- GREEN: the 8 attr-defined errors in `sample_mlx.py:472-495` resolve; `test_controller_satisfies_proto` passes.
-- Full suite: `tests/test_sample_mlx.py`, `tests/test_estradiol.py`, `tests/test_estradiol_integration.py` all still pass.
+- RED: `mypy src/tgirl/sample_mlx.py 2>&1 | grep -cE "object.*has no attribute"` → 13 (8 for controller/V_basis/etc. on lines 472–495, 5 for confidence_monitor on lines 535/640/642/643/676)
+- Add `tests/test_estradiol.py::test_controller_satisfies_proto` — `isinstance(EstradiolController(...), EstradiolControllerProto)` is True.
+- Add `tests/test_state_machine.py::test_monitor_satisfies_proto` — `isinstance(ConfidenceMonitor(...), ConfidenceMonitorProto)` is True (or whatever the concrete class is named — find via grep).
+- GREEN: all 13 attr-defined errors resolve; both proto tests pass.
+- Full suite: `tests/test_sample_mlx.py`, `tests/test_estradiol.py`, `tests/test_estradiol_integration.py`, `tests/test_state_machine.py` all still pass.
 
-**Validation:** `pytest tests/test_sample_mlx.py tests/test_estradiol.py tests/test_estradiol_integration.py -v`; `mypy src/tgirl/sample_mlx.py` error count drops by ≥8.
+**Validation:** `pytest tests/test_sample_mlx.py tests/test_estradiol.py tests/test_estradiol_integration.py tests/test_state_machine.py -v`; `mypy src/tgirl/sample_mlx.py` error count drops by ≥13.
 
-**Commit:** `feat(types): define EstradiolControllerProto and type sample_mlx controller parameter`
+**Commit:** `feat(types): define Estradiol+ConfidenceMonitor protos and type sample_mlx params`
 
 ---
 
-### Task 6: Type the steered forward-fn return (`ForwardFnResult`)
+### Task 6: Type the steered forward-fn via existing `ForwardResult` + `SteerableForwardFn` protocol
 
 **Files:**
-- `src/tgirl/cache.py` or `src/tgirl/sample_mlx.py` (add a `ForwardFnResult` dataclass / Protocol with `.logits` and `.probe_alpha`)
-- `src/tgirl/sample_mlx.py` (update the `forward_fn` call site's expected return type at lines 490–496)
+- `src/tgirl/cache.py` (the `ForwardResult` NamedTuple already exists at `cache.py:21` with `logits: Any, probe_alpha: Any | None = None` — NO NEW TYPE NEEDED. `make_steerable_mlx_forward_fn` (lines 309–408) already returns `ForwardResult`. The non-steerable `make_mlx_forward_fn` still returns raw `mx.array` — this task unifies them.)
+- `src/tgirl/sample_mlx.py` (update `forward_fn` parameter type at line 422 from `Callable[[list[int]], mx.array]` to a Protocol that models the optional `steering=` kwarg and returns `ForwardResult`; update callers at lines 490 and 498)
+- `src/tgirl/cache.py` (update `make_mlx_forward_fn` — the non-steerable factory — to also return `ForwardResult(logits, probe_alpha=None)` for a unified return type)
+- Callers of the non-steerable factory (grep for `make_mlx_forward_fn` and any torch equivalent) — may need one-line `.logits` accessor updates.
 
 **Approach:**
-- The current flow: `forward_fn(token_history, steering=_steering)` returns an object with `.logits` and `.probe_alpha` when steering is active, but returns a raw `mx.array` when steering is inactive. This polymorphism is the root of 3 `attr-defined` errors on `_fwd_result.logits` / `.probe_alpha`.
-- Two options:
-  - (a) Define `ForwardFnResult` dataclass `(logits: mx.array, probe_alpha: mx.array | None)` and have the cache's forward factory ALWAYS return this shape (even in non-steered path where `probe_alpha=None`). Update callers. This is cleaner.
-  - (b) Make the steered return a Union type: `mx.array | SteeredForwardResult`, and narrow at the call site.
-- Recommend (a). Ripple: `cache.py` forward factories need updating; other callers (sample.py torch path, tests) may need adjustment.
-- If (a) proves too invasive, fall back to (b) with `assert isinstance(_fwd_result, SteeredForwardResult)` right after the steered call, which narrows the type for mypy.
+- DO NOT define `ForwardFnResult`; the existing `cache.ForwardResult` NamedTuple is the canonical type. Training-partner reviewer flagged the original plan was duplicating an existing symbol.
+- Define a new `SteerableForwardFn(Protocol)` inside `sample_mlx.py` (co-located with `run_constrained_generation_mlx`):
+  ```python
+  class SteerableForwardFn(Protocol):
+      def __call__(
+          self, token_history: list[int], *, steering: Any | None = None,
+      ) -> ForwardResult: ...
+  ```
+  Import `ForwardResult` from `tgirl.cache`.
+- Unify the two mlx forward factories in `cache.py` so both return `ForwardResult`. The non-steerable path builds `ForwardResult(logits, probe_alpha=None)`. This removes the return-type polymorphism that blocks mypy narrowing.
+- At `sample_mlx.py:498` (the non-steered call), simply read `.logits` off the ForwardResult instead of the raw array. This is the rippled caller change.
+- Resolves three errors directly (attr-defined at 491, 492, 493) AND the call-arg error at 490 (`Unexpected keyword argument "steering"`) — four errors total, not three as originally stated.
 
 **Tests (RED first):**
-- RED: `mypy src/tgirl/sample_mlx.py 2>&1 | grep -cE '"array" has no attribute.*(logits|probe_alpha)'` → 3
-- Add `tests/test_sample_mlx.py::test_steered_forward_returns_forwardfnresult` — calls the steered forward function, asserts `hasattr(result, "logits") and hasattr(result, "probe_alpha")`.
-- GREEN: the 3 attr-defined errors resolve.
-- Full suite still 1118 passed.
+- RED: `mypy src/tgirl/sample_mlx.py 2>&1 | grep -cE '"array" has no attribute.*(logits|probe_alpha)|Unexpected keyword argument "steering"'` → 4
+- Add `tests/test_cache.py::test_make_mlx_forward_fn_returns_forwardresult` — asserts the non-steerable factory now returns `ForwardResult` with `probe_alpha=None`.
+- Add `tests/test_sample_mlx.py::test_forward_fn_protocol_accepts_steering_kwarg` — asserts the steerable factory accepts the kwarg and returns a `ForwardResult` typed object.
+- GREEN: 4 errors resolve.
+- Full suite still 1118 passed. `tests/test_cache.py` remains green (non-steerable callers still work because `.logits` attribute exists).
 
 **Validation:** `pytest tests/test_sample_mlx.py tests/test_cache.py -v`.
 
-**Commit:** `feat(cache): define ForwardFnResult for steered forward passes`
+**Commit:** `refactor(cache): unify mlx forward factories to return ForwardResult`
 
 ---
 
@@ -301,27 +331,29 @@ Each task below is scoped to a single logical commit. Tasks are ordered by risk 
 
 ---
 
-### Task 10: Union narrowing (calibrate.py, modulation.py, rerank.py)
+### Task 10: Union narrowing & scope-shadowing cleanup (calibrate.py, modulation.py, rerank.py, lingo/types.py)
 
 **Files:**
 - `src/tgirl/calibrate.py` — lines 36, 39, 467, 562, 575, 628 (union-attr and arg-type from MLX `svd` return narrowing; `stream=` kwarg type)
 - `src/tgirl/modulation.py` — 4 errors around line 298 (conditioner tuple indexing, `SourceConditionerConfig` vs `float`)
-- `src/tgirl/rerank.py` — 3 errors at lines 116, 121, 143 (tuple-as-dict-key narrowing, `GrammarState` vs `GrammarStateMlx`)
+- `src/tgirl/rerank.py` — 2 errors at lines 116, 121 (tuple-as-dict-key narrowing). Line 143 (`GrammarState` vs `GrammarStateMlx`) was originally listed here but moved to Task 12d — see below.
+- `src/tgirl/lingo/types.py` — 4 errors at lines 128–130: these are **variable-shadowing cleanup, not a latent bug**. Line 117 declares `anc = {name}` as `set[str]`; line 128's for-loop `for anc in ancs:` shadows the outer variable, iterating `frozenset[str]` so the loop variable is `str`. mypy carries the outer `set[str]` annotation into the inner scope. Runtime is correct. Reclassified from Task 12 to Task 10 after training-partner review established this is pure shadowing, not a set/str-confusion bug.
 
 **Approach:**
 - `calibrate.py:36, 467, 562, 628`: `stream=mx.cpu` has mypy type `DeviceType` but `svd` expects `Stream | Device | None`. This is an MLX stub gap — the real `mx.cpu` IS a `Device`. Use `cast(Any, mx.cpu)` at call sites, or (preferred) add `# type: ignore[arg-type]  # mlx stub gap: mx.cpu is Device` at each site. Budget: 4.
 - `calibrate.py:39, 575`: `mx.linalg.svd(...)[1]` returns `int | float | list[list_or_scalar]` per mypy — but at runtime it's always `mx.array`. `cast(mx.array, result)` or `assert isinstance(result, mx.array)` narrowing.
 - `modulation.py:298-305`: `list(self.conditioners)` is typed as `list[float]` but the member type is `SourceConditionerConfig`. Likely the caller's expected type is wrong; fix by annotating the `new: list[SourceConditionerConfig]` properly.
 - `rerank.py:116, 121`: `tuple[object, ...]` as dict key — add explicit type annotation on the tuple construction: `key: tuple[str | int, ...] = tuple(...)`.
-- `rerank.py:143`: `GrammarState` is passed to `run_constrained_generation_mlx` which expects `GrammarStateMlx`. This is a real API mismatch — either the function signature accepts a union protocol, or the caller is wrong. Investigate.
+- `lingo/types.py:128`: rename the inner for-loop variable: `for anc in ancs:` → `for ancestor in ancs:` (and update `ancestor != name` and `ancestor in self._descendants` and `self._descendants[ancestor].add(name)`). One-line semantic-preserving rename. No test needed — runtime is already correct.
 
 **Tests (RED first):**
-- RED: `mypy src/ 2>&1 | grep -cE "union-attr|index"` in these files → 9
+- RED: `mypy src/ 2>&1 | grep -cE "union-attr|index|assignment|comparison-overlap"` in these files → 10 (4 calibrate + 4 modulation + 2 rerank.116/121 + 4 lingo/types.128-130; minus rerank.143 which moved to Task 12d; confirm with fresh mypy output)
 - GREEN: resolved.
+- Full suite still 1118 passed. Specifically `tests/test_lingo_types.py` passes unchanged (the shadowing rename is a no-op semantically).
 
-**Validation:** `pytest tests/test_calibrate.py tests/test_modulation.py tests/test_rerank.py -v`.
+**Validation:** `pytest tests/test_calibrate.py tests/test_modulation.py tests/test_rerank.py tests/test_lingo_types.py -v`.
 
-**Commit:** `fix(types): narrow unions in calibrate, modulation, rerank`
+**Commit:** `fix(types): narrow unions and rename shadowed loop variable in lingo/types`
 
 ---
 
@@ -353,36 +385,52 @@ Each task below is scoped to a single logical commit. Tasks are ordered by risk 
 
 ---
 
-### Task 12: Latent bug investigation (lingo/types.py, serve.py:89, sample_mlx.py:495)
+### Task 12: Latent bug investigation (sample_mlx.py:495, sample.py:1090, rerank.py:143 cross-framework)
 
 **Files:**
-- `src/tgirl/lingo/types.py` — lines 128–130 (set/str confusion — assignment/comparison-overlap/index cluster)
-- `src/tgirl/serve.py` — line 89 (`Too many values to unpack (2 expected, 3 provided)`)
 - `src/tgirl/sample_mlx.py` — line 495 (`Item "None" of "list[list[float]] | None" has no attribute "append"`)
 - `src/tgirl/sample.py` — line 1090 (`ToolRouter | None` has no attribute "route") — similar None-dereference
-- Tests: `tests/test_lingo_types.py`, `tests/test_serve.py`, `tests/test_sample_mlx.py`, `tests/test_sample.py`
+- `src/tgirl/rerank.py` — line 143 (`GrammarState` passed where `GrammarStateMlx` expected) paired with `src/tgirl/sample_mlx.py:506-507` fallback (cross-framework conversion)
+- Tests: `tests/test_sample_mlx.py`, `tests/test_sample.py`, `tests/test_rerank.py`, `tests/test_cache.py`
+
+**Reclassifications established during training-partner plan review:**
+- `serve.py:88` (originally 12b) — stub gap, not a bug. Moved to Task 13 as budgeted `# type: ignore[misc]`.
+- `lingo/types.py:128-130` (originally 12a) — variable shadowing, not a set/str bug. Moved to Task 10 as a loop-variable rename.
+- `rerank.py:143 + sample_mlx.py:506-507` (originally scattered across Task 10) — promoted to Task 12d because the runtime fallback performs a cross-framework `torch → numpy → mx` conversion, which violates CLAUDE.md's "No cross-framework conversions" invariant.
 
 **Approach — ONE investigation per bug:**
 
-**12a. `lingo/types.py:128-130`:** Read lines 120-135 in context. The errors are consistent with an assignment where a string is assigned to a `set[str]`-typed variable, then compared/indexed as a set. This is either:
-- Real bug: the variable should be named `values` (set) but got a single `value` assigned. Add test reproducing the broken behavior. Fix by using the correct variable / type.
-- Type annotation wrong: if the runtime actually stores single strings, change the declared type.
+**12a. `sample_mlx.py:495`:** `estradiol_alphas` is typed as `list[list[float]] | None`, initialized to `None` at line 461, re-assigned to `[]` at line 474 inside `if controller is not None`, then `.append()` at line 495 inside the same `if controller is not None and _steering is not None` guard. The guard narrows to `not None` for `_steering` but mypy can't see the same for `estradiol_alphas`. Fix: move `estradiol_alphas` / `estradiol_deltas` initialization outside the conditional (`= None` always), or narrow at the append site with `assert estradiol_alphas is not None`. The latter preserves the current "only allocated when needed" pattern.
 
-Write a test that triggers this code path. If it fails on `main`, this is a real bug — commit test + fix together. If it passes, the code is somehow correct; document why (likely an `Any` bleeding through) and fix annotations.
+**12b. `sample.py:1090`:** `self._tool_router: ToolRouter | None` is accessed as `self._tool_router.route(...)` without narrowing. Either narrow with `assert self._tool_router is not None` at the call site, or hoist the check.
 
-**12b. `serve.py:89`:** `(batch=1, seq_len, d_model) → (seq_len, d_model)` comment hints the unpacking is a 3-tuple reshape. Read lines 82–95. If the code genuinely unpacks 3 into 2, it's a bug. Likely intention: `batch, seq_len, d_model = tensor.shape` (3-unpack into 3 names). Write a test that exercises this path. Fix the unpacking site.
+**12c. `rerank.py:143 + sample_mlx.py:506-507` (cross-framework conversion investigation):** At `rerank.py:125` `self._grammar_guide_factory(routing_grammar_text)` returns a `GrammarState` (torch-protocol); at line 142 it's passed to `run_constrained_generation_mlx(grammar_state=...)` which expects `GrammarStateMlx`. Runtime only "works" because of the fallback at `sample_mlx.py:502-507`:
+```python
+if has_mlx_mask:
+    valid_mask = grammar_state.get_valid_mask_mx(vocab_size)
+else:
+    # Fallback for torch-based grammar states
+    valid_mask_torch = grammar_state.get_valid_mask(vocab_size)
+    valid_mask = mx.array(valid_mask_torch.numpy())  # <-- cross-framework conversion
+```
+This violates CLAUDE.md: "No cross-framework conversions. If a function needs both MLX and torch, implement two variants with matching interfaces."
 
-**12c. `sample_mlx.py:495`:** `estradiol_alphas` is typed as `list[list[float]] | None`, initialized to `None` at line 461, re-assigned to `[]` at line 474 inside `if controller is not None`, then `.append()` at line 495 inside the same `if controller is not None and _steering is not None` guard. The guard narrows to `not None` for `_steering` but mypy can't see the same for `estradiol_alphas`. Fix: move `estradiol_alphas` / `estradiol_deltas` initialization outside the conditional (`= None` always), or narrow at the append site with `assert estradiol_alphas is not None`. The latter preserves the current "only allocated when needed" pattern.
+Two possibilities, one test to disambiguate:
+1. **Factory is backend-aware** — when `_backend == "mlx"`, `_grammar_guide_factory` actually returns a `GrammarStateMlx`; the type is just widened. Fix: type the factory as `Callable[[str], GrammarState | GrammarStateMlx]`, `assert isinstance(grammar_state, GrammarStateMlx)` in the MLX branch of rerank.py. Delete the fallback path in sample_mlx.py:506-507 (no callers hit it). This eliminates the cross-framework conversion.
+2. **Factory always returns torch `GrammarState`** — the MLX path silently pays the torch→numpy→mx cost every call. That's a real performance bug AND a CLAUDE.md violation. Fix: add a backend-aware factory dispatch in rerank (serve.py already provides `mlx_grammar_guide_factory` separately at line 48); rerank should choose the MLX factory when `_backend == "mlx"`. Delete the fallback at sample_mlx.py:506-507.
 
-**12d. `sample.py:1090`:** `self._tool_router: ToolRouter | None` is accessed as `self._tool_router.route(...)` without narrowing. Either narrow with `assert self._tool_router is not None` at the call site, or hoist the check.
+Regression test (RED): `tests/test_rerank.py::test_mlx_backend_uses_mlx_grammar_state` — assert `isinstance(grammar_state, GrammarStateMlx)` inside `run_constrained_generation_mlx` (hook via debug callback) when rerank is configured with `backend="mlx"`. If this test fails on `main`, it's hitting possibility (2) and needs the factory-dispatch fix. If it passes, the type annotations just need tightening (possibility 1).
+
+Either way, the `valid_mask = mx.array(valid_mask_torch.numpy())` fallback at `sample_mlx.py:506-507` is deleted.
 
 **Tests (RED first):**
-- For each latent bug 12a–12d: write a test that demonstrates the issue (even if it's type-only). Failing test → fix → passing test + type resolved.
-- Aggregate: `mypy src/` error count drops by 6–8 for this task.
+- For each latent bug 12a–12c: write a test that demonstrates the issue. Failing test → fix → passing test + type resolved.
+- For 12c: the regression test stays even after the fix, to catch re-introduction of the cross-framework fallback.
+- Aggregate: `mypy src/` error count drops by 4 (12a: 2 union-attr at 495/496; 12b: 1 union-attr at 1090; 12c: 1 arg-type at rerank.py:143 + 1 attr-defined at sample_mlx.py:506 = 2, with possible additional errors if factory typing tightens).
 
-**Validation:** `pytest tests/test_lingo_types.py tests/test_serve.py tests/test_sample_mlx.py tests/test_sample.py -v -k "the new test names"`.
+**Validation:** `pytest tests/test_sample_mlx.py tests/test_sample.py tests/test_rerank.py tests/test_cache.py -v -k "the new test names"`.
 
-**Commit:** `fix(lang, serve, sample): resolve latent None-dereference and unpack bugs found by mypy`
+**Commit:** `fix(rerank, sample): resolve None-dereference and cross-framework conversion bugs`
 
 ---
 
@@ -391,7 +439,7 @@ Write a test that triggers this code path. If it fails on `main`, this is a real
 **Files:**
 - `src/tgirl/sample.py` — lines 143 (`ModelIntervention(**dict)`), 823 (`ToolRouter(backend=str)`), 942, 987, 1002
 - `src/tgirl/sample_mlx.py` — lines 490 (`steering=` kwarg), 506 (`get_valid_mask` vs `get_valid_mask_mx`)
-- `src/tgirl/serve.py` — 1581 (`enable_thinking` kwarg on `PromptFormatter`), 745, 1623 (missing return annotations), 1781 (no-untyped-call on stream_gen)
+- `src/tgirl/serve.py` — 88 (`mlx_lm.load` stub declares 3-tuple but runtime returns 2-tuple — `# type: ignore[misc]  # mlx_lm.load stub gap: runtime returns (model, tokenizer)`; budget: 1), 1577 (`enable_thinking` kwarg on `PromptFormatter`), 739, 1619 (missing return annotations), 1777 (no-untyped-call on stream_gen)
 - `src/tgirl/compile.py` — 438 (`class ... subclass "Any"`) — `RestrictedPython.RestrictingNodeTransformer` has no stubs. `# type: ignore[misc]` with reason.
 - `src/tgirl/lingo/tdl_parser.py` — 461 (None-union-attr; similar to 12c, narrow at use site)
 
@@ -467,6 +515,22 @@ kill $SERVER_PID
 # Expect: coherent poem; steering_status shows alpha=0.5 active.
 ```
 
+### Per-task mypy gate (team-mode)
+
+Because this branch is based on `main` (NOT on `chore/dialectic-framework-sync`), the local pre-commit hook does NOT run mypy. Without an explicit gate, a mid-work regression — e.g. Task 10 introducing a new `arg-type` while resolving union-narrowing — would go unnoticed until the final Task 14 check.
+
+**Mitigation: the training partner enforces a per-commit mypy gate during `/execute-team`.**
+
+Between every proposer commit, the training partner runs:
+```bash
+mypy src/ --ignore-missing-imports 2>&1 | grep -c "error:"
+```
+and compares the count to the baseline (100 at task start, decreasing monotonically per task's "GREEN" target). If the count rises relative to the previous commit, the training partner blocks the next task and messages the proposer to fix the regression before proceeding. This is message-gated, not hook-gated — the gate lives in the team protocol, not the git hook.
+
+Secondary fallback: the proposer appends the pre/post mypy error counts to each commit footer (e.g. `mypy: 100 → 87 (-13)`) so reviewers can audit monotonic decrease without re-running mypy.
+
+This is explicit in the PRP so the team lead can hold the training partner accountable to it.
+
 ## 5. Rollback Plan
 
 Each task is one commit → revert-range granularity is per-task.
@@ -479,11 +543,12 @@ Each task is one commit → revert-range granularity is per-task.
 ## 6. Uncertainty Log
 
 - **MLX stub completeness.** MLX has partial `*.pyi` stubs but `mx.cpu` / `mx.gpu` / `mx.linalg.svd` have known gaps. Task 10 assumes 4 `# type: ignore[arg-type]` for these; if there are more, the budget creeps toward the limit. If we exceed 10 total `# type: ignore` comments, add a `[[tool.mypy.overrides]] module = "tgirl.calibrate"` override in pyproject.toml with `disable_error_code = ["arg-type"]` and document the scope.
-- **`ForwardFnResult` scope of change.** Task 6 may require touching `cache.py` forward-fn factories more broadly than anticipated. If updating the factory signature breaks `sample.py` (torch path) or tests, split Task 6 into 6a (define) + 6b (migrate MLX) + 6c (migrate torch). Add tasks on the fly during execution.
+- **Running `# type: ignore` budget accounting (post-review).** Task 7: 2 (llguidance.mlx re-export). Task 10: 4 (mx stream/svd stubs). Task 13: 1 (serve.py:88 mlx_lm.load stub) + 1 (compile.py:438 RestrictedPython). **Running total: 8 of 10.** Leaves 2 slack for unforeseen stub gaps. Tasks that were originally candidates for ignores and resolved WITHOUT them: Task 5 (ConfidenceMonitor + Estradiol Protocols — 13 errors fixed via Protocol, zero ignores); Task 6 (ForwardResult — unified types, zero ignores); Task 12c (rerank cross-framework — architectural fix, zero ignores). If the count threatens to exceed 10 during execution, escalate to a `[[tool.mypy.overrides]]` block (see MLX bullet above) rather than adding more scattered ignores.
+- **Task 6 scope of change.** Unifying the two MLX forward factories (`make_mlx_forward_fn` + `make_steerable_mlx_forward_fn`) to both return `ForwardResult` may ripple to `sample.py` (torch path) and tests that consume the non-steerable factory. If updating the factory signature breaks more than 3 call sites, split Task 6 into 6a (unify factories) + 6b (migrate torch callers). Add tasks on the fly during execution.
 - **Pydantic strict-init impact.** Task 13's `ModelInterventionDict` TypedDict might require cascade typing changes in callers. If the cascade is big (>2 files), defer and use `cast(dict[str, Any], source)` with a rationale comment.
 - **`compile.py:438` dynamic base.** If the `# type: ignore[misc]` on `class ... RestrictingNodeTransformer` turns out to hide subclass-signature bugs, the right fix is contributing stubs upstream. Not in scope — document the deferral.
-- **`rerank.py:143` GrammarState mismatch.** This may be a real bug (caller passes torch GrammarState to MLX function). Task 10 surfaces it; if it's a bug, escalate to Task 12 (latent-bug treatment with regression test).
+- **Task 12c disambiguation.** rerank.py's `_grammar_guide_factory` may be backend-aware at runtime (possibility 1 in Task 12c) or always-torch with a silent cross-framework conversion fallback (possibility 2). The Task 12c regression test disambiguates them on the first RED run. If it's possibility 2, the fix is larger (wire `mlx_grammar_guide_factory` through rerank); budget up to 30 LoC of rerank.py changes.
 - **`state_machine.py:632, 649` TransitionDecision narrowing.** Unknown what's returning `Any` there without reading. May require a larger Protocol-narrowing refactor. If the fix exceeds 20 LoC, split into a dedicated task.
-- **Branch base.** This PRD is branched from `main`, not from `chore/dialectic-framework-sync`. If the sync branch doesn't merge first, the pre-commit hook here is the old one (not mypy-running), which means local commits won't fail and we won't notice if mypy regresses mid-work. Mitigation: Task 1 commits include a manual `mypy src/` check in the commit message; the interlocutor enforces discipline.
-- **Test coverage for latent bugs.** If `tests/test_calibrate.py` doesn't exist and needs to be created for Task 12, add that as a prerequisite. Scanning `tests/` at PRP-generation time showed no dedicated `test_calibrate.py` — the `test_estradiol.py` tests may exercise calibrate transitively, or a new file is needed. Handle at execution time.
+- **Branch base & mypy gate enforcement.** This branch is based on `main`, not `chore/dialectic-framework-sync`. The local pre-commit hook does NOT run mypy. Mitigation (see §4 "Per-task mypy gate (team-mode)"): the training partner runs `mypy src/ 2>&1 | grep -c "error:"` between every proposer commit and blocks the next task if the count rises. Commit footers also carry `mypy: X → Y` deltas for audit.
+- **ConfidenceMonitor Protocol surface.** Task 5 infers the Protocol from five observed call sites (should_checkpoint, record_log_prob, should_backtrack, record_backtrack, backtracks_remaining). If the concrete monitor class exposes state that future tgirl call sites will want (e.g. `log_prob_history`), the Protocol may need expansion. Start minimal; expand if a future task trips attr-defined on a new method.
 - **Mypy version drift.** CI may run a different mypy version than local. Pinning `mypy==1.x` in `pyproject.toml[project.optional-dependencies.dev]` is out of scope but worth noting if we hit drift.

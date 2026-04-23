@@ -13,7 +13,7 @@ The errors predate this session — they accumulated because the prior pre-commi
 
 - Several fields typed as `object` when the code actually uses them through a well-defined protocol surface (ESTRADIOL controller, inference hooks, tokenizer — in `sample_mlx.py`, `format.py`).
 - Union-type narrowing gaps (`calibrate.py`, `rerank.py`, `modulation.py`) where the code branches on types but mypy can't prove it.
-- A handful of latent bugs where mypy is catching real problems: e.g. `serve.py` has a tuple-unpack mismatch, `lingo/types.py` has a `str`/`set[str]` confusion, `sample_mlx.py:495` dereferences a list that's typed as possibly-None.
+- A handful of latent bugs where mypy is catching real problems: e.g. `sample_mlx.py:495` dereferences a list that's typed as possibly-None, `sample.py:1090` dereferences `ToolRouter | None`, `rerank.py:143` violates CLAUDE.md's "no cross-framework conversions" invariant by passing a torch `GrammarState` into an MLX-only function path. (Note: initial drafting also listed `serve.py:88` tuple unpack and `lingo/types.py` set/str confusion as bugs — plan review identified these as a mlx-lm stub gap and a variable-shadowing rename respectively, not bugs. PRP is the authoritative classification.)
 
 **Why now:** This is the first time mypy is actually enforced on this codebase. Every week that passes accumulates more drift, and the `--no-verify` muscle memory erodes the gate's value. Fixing it once, now, re-establishes mypy as a genuine quality signal.
 
