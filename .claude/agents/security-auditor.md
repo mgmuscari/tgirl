@@ -1,7 +1,7 @@
 ---
 name: security-auditor
 description: Push Hands team-mode agent. Do not invoke directly — used by /security-audit-team.
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob, Bash, SendMessage, TaskCreate, TaskList, TaskGet, TaskUpdate
 model: opus
 ---
 

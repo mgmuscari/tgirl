@@ -1,7 +1,7 @@
 ---
 name: skeptical-client
 description: Push Hands team-mode agent. Do not invoke directly — used by /security-audit-team.
-tools: Read, Grep, Glob
+tools: Read, Grep, Glob, SendMessage, TaskCreate, TaskList, TaskGet, TaskUpdate
 model: opus
 ---
 

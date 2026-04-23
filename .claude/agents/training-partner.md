@@ -1,7 +1,7 @@
 ---
 name: training-partner
 description: Push Hands team-mode agent. Do not invoke directly — used by /review-plan-team.
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob, Bash, SendMessage, TaskCreate, TaskList, TaskGet, TaskUpdate
 model: opus
 ---
 

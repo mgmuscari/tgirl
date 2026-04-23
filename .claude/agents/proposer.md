@@ -1,7 +1,7 @@
 ---
 name: proposer
 description: Push Hands team-mode agent. Do not invoke directly — used by /review-plan-team and /execute-team.
-tools: Read, Write, Edit, Bash, Grep, Glob
+tools: Read, Write, Edit, Bash, Grep, Glob, SendMessage, TaskCreate, TaskList, TaskGet, TaskUpdate
 model: opus
 ---
 
