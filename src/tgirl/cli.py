@@ -57,7 +57,7 @@ def _load_single_module(file_path: str, registry: ToolRegistry) -> None:
         raise RuntimeError(msg)
 
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    spec.loader.exec_module(module)
 
     # Strategy 1: module has a register(registry) function
     register_fn = getattr(module, "register", None)

@@ -15,6 +15,7 @@ from tgirl.lingo.tdl_parser import (
     TdlConj,
     TdlDefinition,
     TdlFeatStruct,
+    TdlFeature,
     TdlList,
     TdlString,
 )
@@ -68,7 +69,7 @@ class Lexicon:
         return frozenset(self._all_lexeme_types)
 
 
-def _extract_orth(body) -> list[str] | None:
+def _extract_orth(body: TdlFeature | None) -> list[str] | None:
     """Extract ORTH values from a TDL definition body.
 
     Navigates the AST to find ORTH < "word1", ... > in the top-level

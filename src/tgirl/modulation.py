@@ -295,18 +295,20 @@ class EnvelopeConfig:
             logger.warning(
                 "EnvelopeConfig: trimming conditioners to 9"
             )
-            old = list(self.conditioners)
-            new = old[:6]  # rows 0-5
-            new.append(
+            old_conds: list[SourceConditionerConfig] = list(self.conditioners)
+            new_conds: list[SourceConditionerConfig] = old_conds[:6]  # rows 0-5
+            new_conds.append(
                 SourceConditionerConfig(range_min=0.0, range_max=1.0)
             )  # envelope
-            new.append(old[10] if len(old) > 10 else SourceConditionerConfig())  # cycle
-            new.append(
-                old[11]
-                if len(old) > 11
+            new_conds.append(
+                old_conds[10] if len(old_conds) > 10 else SourceConditionerConfig()
+            )  # cycle
+            new_conds.append(
+                old_conds[11]
+                if len(old_conds) > 11
                 else SourceConditionerConfig(range_min=0.0, range_max=1.0)
             )  # coherence
-            object.__setattr__(self, "conditioners", tuple(new))
+            object.__setattr__(self, "conditioners", tuple(new_conds))
         elif len(self.conditioners) != rows:
             raise ValueError(
                 f"conditioners has {len(self.conditioners)} entries, "

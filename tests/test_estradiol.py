@@ -108,6 +108,12 @@ class TestEstradiolController:
             ema_beta=0.9,
         )
 
+    def test_controller_satisfies_proto(self, controller) -> None:
+        """EstradiolController is a structural match for EstradiolControllerProto."""
+        from tgirl.estradiol import EstradiolControllerProto
+
+        assert isinstance(controller, EstradiolControllerProto)
+
     def test_step_returns_delta_shape(self, controller) -> None:
         probe = mx.zeros((4,))
         delta = controller.step(probe)

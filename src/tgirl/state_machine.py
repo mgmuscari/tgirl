@@ -105,6 +105,13 @@ class DelimiterTransitionPolicy:
                 reason="no token_id provided",
                 confidence=0.0,
             )
+        if not isinstance(token_id, (int, str)):
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="token_id not coercible to int",
+                confidence=0.0,
+            )
 
         # Feed token to internal delimiter detector
         new_text = self._decode([int(token_id)])
@@ -212,9 +219,9 @@ def compute_transition_signal(
     token_position: int,
     logits: Any,
     grammar_valid_mask: Any,
-    softmax_fn: Callable,
-    sum_fn: Callable,
-    log_fn: Callable,
+    softmax_fn: Callable[..., Any],
+    sum_fn: Callable[..., Any],
+    log_fn: Callable[..., Any],
     vocab_size: int,
     sampled_token_id: int | None = None,
 ) -> TransitionSignal:
@@ -339,6 +346,25 @@ class BacktrackEvent(BaseModel):
     trigger_position: int
     trigger_log_prob: float
     dead_end_tokens_added: frozenset[int]
+
+
+@runtime_checkable
+class ConfidenceMonitorProto(Protocol):
+    """Public surface of a confidence monitor for constrained generation.
+
+    Documents the duck-typed contract that sample_mlx.py relies on.
+    Concrete implementation: ``ConstrainedConfidenceMonitor`` (below).
+    """
+
+    backtracks_remaining: int  # property in concrete impl
+
+    def should_checkpoint(self, grammar_valid_count: int) -> bool: ...
+
+    def record_log_prob(self, log_prob: float) -> None: ...
+
+    def should_backtrack(self) -> bool: ...
+
+    def record_backtrack(self) -> None: ...
 
 
 class ConstrainedConfidenceMonitor:
@@ -542,7 +568,11 @@ class LatchedTransitionPolicy:
         # Decode token text for terminal detection
         token_text = str(kwargs.get("token_text", ""))
         token_id = kwargs.get("token_id")
-        if token_id is not None and self._decode is not None:
+        if (
+            token_id is not None
+            and isinstance(token_id, (int, str))
+            and self._decode is not None
+        ):
             token_text = self._decode([int(token_id)])
 
         # Phase 1: latch on low entropy (high confidence)
@@ -603,7 +633,7 @@ class CompositeTransitionPolicy:
 
     def __init__(
         self,
-        policies: list,
+        policies: list[TransitionPolicy],
         mode: str = "or",
     ) -> None:
         self.policies = policies

@@ -1068,6 +1068,16 @@ class TestBacktrackEvent:
 class TestConstrainedConfidenceMonitor:
     """ConstrainedConfidenceMonitor tracks confidence during constrained gen."""
 
+    def test_monitor_satisfies_proto(self) -> None:
+        """ConstrainedConfidenceMonitor structurally matches ConfidenceMonitorProto."""
+        from tgirl.state_machine import (
+            ConfidenceMonitorProto,
+            ConstrainedConfidenceMonitor,
+        )
+
+        monitor = ConstrainedConfidenceMonitor()
+        assert isinstance(monitor, ConfidenceMonitorProto)
+
     def test_construction_defaults(self) -> None:
         from tgirl.state_machine import ConstrainedConfidenceMonitor
 

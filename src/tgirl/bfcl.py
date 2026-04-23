@@ -25,7 +25,7 @@ def load_test_data(category: str) -> list[dict[str, Any]]:
     """
     data_dir = importlib.resources.files("bfcl_eval") / "data"
     path = data_dir / f"BFCL_v4_{category}.json"
-    text = path.read_text()  # type: ignore[union-attr]
+    text = path.read_text()
     return [json.loads(line) for line in text.strip().split("\n")]
 
 
@@ -40,7 +40,7 @@ def load_ground_truth(category: str) -> list[dict[str, Any]]:
     """
     data_dir = importlib.resources.files("bfcl_eval") / "data"
     path = data_dir / "possible_answer" / f"BFCL_v4_{category}.json"
-    text = path.read_text()  # type: ignore[union-attr]
+    text = path.read_text()
     return [json.loads(line) for line in text.strip().split("\n")]
 
 

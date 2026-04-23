@@ -125,9 +125,9 @@ class TypeHierarchy:
         # Build descendant sets by inverting ancestors
         self._descendants: dict[str, set[str]] = {n: set() for n in all_names}
         for name, ancs in self._ancestors.items():
-            for anc in ancs:
-                if anc != name and anc in self._descendants:
-                    self._descendants[anc].add(name)
+            for ancestor in ancs:
+                if ancestor != name and ancestor in self._descendants:
+                    self._descendants[ancestor].add(name)
 
         # Direct children (for leaf computation)
         self._direct_children: dict[str, set[str]] = {n: set() for n in all_names}

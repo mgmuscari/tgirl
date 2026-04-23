@@ -514,7 +514,7 @@ def compute_reachable_set(
         reachable_chars.update(literal)
 
     # Extract regex terminal patterns and derive their character sets
-    regex_patterns: list[re.Pattern] = []
+    regex_patterns: list[re.Pattern[str]] = []
     for match in re.finditer(
         r'(\w+)\s*:\s*/([^/]+)/', grammar_text
     ):

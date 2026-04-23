@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -46,7 +46,7 @@ class InferenceContext:
     tokenizer_encode: Callable[[str], list[int]]
     embeddings: Any
     grammar_guide_factory: Callable[[str], Any]
-    mlx_grammar_guide_factory: Callable | None
+    mlx_grammar_guide_factory: Callable[[str], Any] | None
     formatter: PromptFormatter
     backend: Literal["torch", "mlx"]
     model_id: str
@@ -86,7 +86,10 @@ def _load_mlx_model(model_id: str) -> tuple[Any, Any]:
     """Load model and tokenizer via mlx-lm."""
     import mlx_lm
 
-    model, tokenizer = mlx_lm.load(model_id)
+    # mlx_lm stub gap: at runtime mlx_lm.load returns (model, tokenizer);
+    # the stubs declare a 3-tuple. Real shape verified against mlx-lm
+    # >= 0.31.
+    model, tokenizer = mlx_lm.load(model_id)  # type: ignore[misc]
     return model, tokenizer
 
 
@@ -97,7 +100,7 @@ def _make_mlx_forward(model: Any) -> Callable[[list[int]], Any]:
     return make_mlx_forward_fn(model)
 
 
-def _make_mlx_grammar_factory(tokenizer: Any) -> Callable:
+def _make_mlx_grammar_factory(tokenizer: Any) -> Callable[[str], Any]:
     """Create MLX grammar guide factory."""
     from tgirl.outlines_adapter import make_outlines_grammar_factory_mlx
 
@@ -120,7 +123,7 @@ def _make_torch_forward(model: Any) -> Callable[[list[int]], Any]:
     return make_hf_forward_fn(model)
 
 
-def _make_torch_grammar_factory(tokenizer: Any) -> Callable:
+def _make_torch_grammar_factory(tokenizer: Any) -> Callable[[str], Any]:
     """Create torch grammar guide factory."""
     from tgirl.outlines_adapter import make_outlines_grammar_factory
 
@@ -742,7 +745,7 @@ def create_app(
                 logger.exception("probe_autosave_failed", path=path)
 
     @asynccontextmanager
-    async def _lifespan(_app: Any):
+    async def _lifespan(_app: Any) -> AsyncIterator[None]:
         if probe_load_path is not None:
             import mlx.core as _mx
             import numpy as np
@@ -1620,7 +1623,7 @@ def create_app(
         if request.stream:
             from fastapi.responses import StreamingResponse
 
-            async def stream_gen():
+            async def stream_gen() -> AsyncIterator[str]:
                 # First chunk: role
                 chunk = ChatCompletionChunk(
                     id=completion_id,

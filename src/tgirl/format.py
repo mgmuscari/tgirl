@@ -6,6 +6,28 @@ message lists into model-consumable prompt strings.
 
 from __future__ import annotations
 
+from typing import Any, Protocol, runtime_checkable
+
+
+@runtime_checkable
+class TokenizerProto(Protocol):
+    """Minimum tokenizer surface required by ChatTemplateFormatter.
+
+    Documents the duck-typed contract on HuggingFace tokenizers used
+    by ``ChatTemplateFormatter``. The real ``transformers.PreTrainedTokenizer``
+    structurally satisfies this Protocol.
+    """
+
+    def apply_chat_template(
+        self,
+        conversation: list[dict[str, str]],
+        /,
+        *,
+        tokenize: bool = ...,
+        add_generation_prompt: bool = ...,
+        **kwargs: Any,
+    ) -> str: ...
+
 
 class PlainFormatter:
     """Simple concatenation formatter for base models and testing.
@@ -13,7 +35,12 @@ class PlainFormatter:
     Joins messages as "role: content" lines separated by newlines.
     """
 
-    def format_messages(self, messages: list[dict[str, str]]) -> str:
+    def format_messages(
+        self, messages: list[dict[str, str]], **kwargs: object
+    ) -> str:
+        # Extra kwargs accepted for protocol compatibility; ignored by
+        # PlainFormatter which has no chat template.
+        del kwargs
         if not messages:
             return ""
         parts = []
@@ -25,13 +52,12 @@ class PlainFormatter:
 class ChatTemplateFormatter:
     """Wraps a HuggingFace tokenizer's apply_chat_template method."""
 
-    def __init__(self, tokenizer: object) -> None:
+    def __init__(self, tokenizer: TokenizerProto) -> None:
         self._tokenizer = tokenizer
 
     def format_messages(
         self,
         messages: list[dict[str, str]],
-        add_generation_prompt: bool = True,
         **kwargs: object,
     ) -> str:
         """Format messages using the tokenizer's chat template.
@@ -40,8 +66,9 @@ class ChatTemplateFormatter:
         through to apply_chat_template. Unsupported kwargs are silently
         dropped to maintain compatibility across model families.
         """
+        add_generation_prompt = bool(kwargs.pop("add_generation_prompt", True))
         try:
-            return self._tokenizer.apply_chat_template(  # type: ignore[union-attr]
+            return self._tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
@@ -49,7 +76,7 @@ class ChatTemplateFormatter:
             )
         except TypeError:
             # Model template doesn't support these kwargs — retry without
-            return self._tokenizer.apply_chat_template(  # type: ignore[union-attr]
+            return self._tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,

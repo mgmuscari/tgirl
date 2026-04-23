@@ -707,6 +707,71 @@ class TestToolRouterMlxPath:
             mock_gen_mlx.assert_called_once()
             assert "alpha" in result.selected_tools
 
+    def test_mlx_backend_uses_mlx_grammar_state(self) -> None:
+        """Regression: when backend='mlx' and an mlx_grammar_guide_factory
+        is configured, ToolRouter must use the MLX factory (returns
+        GrammarStateMlx-compatible) — never the torch factory passed
+        through a cross-framework conversion fallback.
+
+        This locks out the CLAUDE.md violation (2026-03-14 gotcha) where
+        sample_mlx.py used to convert torch valid_mask via
+        mx.array(valid_mask_torch.numpy()) when the grammar state lacked
+        get_valid_mask_mx.
+        """
+        from tgirl.rerank import ToolRouter
+
+        # Torch factory that should NOT be called on the mlx path
+        mock_torch_gs = _make_mock_grammar_state()
+        torch_factory = MagicMock(return_value=mock_torch_gs)
+
+        # MLX factory whose return has the get_valid_mask_mx method
+        mock_mlx_gs = MagicMock()
+        mock_mlx_gs.get_valid_mask_mx = MagicMock()
+        mock_mlx_gs.is_accepting = MagicMock(return_value=True)
+        mock_mlx_gs.advance = MagicMock()
+        mlx_factory = MagicMock(return_value=mock_mlx_gs)
+
+        forward_fn = MagicMock(return_value=torch.randn(100))
+        decode = MagicMock(return_value="alpha")
+        embeddings = torch.randn(100, 32)
+
+        router = ToolRouter(
+            grammar_guide_factory=torch_factory,
+            mlx_grammar_guide_factory=mlx_factory,
+            forward_fn=forward_fn,
+            tokenizer_decode=decode,
+            embeddings=embeddings,
+            backend="mlx",
+        )
+        snap = _make_snapshot(["alpha", "beta"])
+
+        with patch(
+            "tgirl.sample_mlx.run_constrained_generation_mlx"
+        ) as mock_gen_mlx:
+            mock_gen_mlx.return_value = ConstrainedGenerationResult(
+                tokens=[5],
+                hy_source="alpha",
+                grammar_valid_counts=[2],
+                temperatures_applied=[0.3],
+                wasserstein_distances=[0.0],
+                top_p_applied=[-1.0],
+                token_log_probs=[-0.5],
+                ot_computation_total_ms=1.0,
+                ot_bypassed_count=0,
+                ot_bypass_reasons=[None],
+                ot_iterations=[5],
+                grammar_generation_ms=5.0,
+            )
+            router.route(snap, context_tokens=[1, 2])
+
+            # MLX factory used; torch factory not consulted
+            mlx_factory.assert_called_once()
+            torch_factory.assert_not_called()
+            # The grammar_state passed to run_constrained_generation_mlx
+            # is the one from the MLX factory.
+            call_kwargs = mock_gen_mlx.call_args.kwargs
+            assert call_kwargs["grammar_state"] is mock_mlx_gs
+
     def test_router_mlx_embeddings_lazy_conversion(self) -> None:
         """Torch embeddings converted to mx.array on first MLX route."""
         import mlx.core as mx

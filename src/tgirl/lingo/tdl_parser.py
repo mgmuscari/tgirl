@@ -462,8 +462,12 @@ class _Parser:
                 section_parts.append(keyword)
                 self._advance()
                 # If :status, next token is the status value
-                peek = self._peek()
-                if keyword == "status" and peek and peek.kind == "ident":
+                peeked = self._peek()
+                if (
+                    keyword == "status"
+                    and peeked is not None
+                    and peeked.kind == "ident"
+                ):
                     status = self._advance().value
                 continue
             self._advance()

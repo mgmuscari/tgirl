@@ -17,6 +17,7 @@ import concurrent.futures
 import functools
 import re
 import time
+from collections.abc import Callable
 from typing import Any
 
 import hy
@@ -119,7 +120,7 @@ def _parse_hy(source: str) -> list[Object] | PipelineError:
 # --- Composition operator implementations ---
 
 
-def _pmap_impl(fns: list, arg: Any) -> list:
+def _pmap_impl(fns: list[Callable[..., Any]], arg: Any) -> list[Any]:
     """Apply each function in fns to arg, return list of results.
 
     v1.0: sequential execution (fail-fast on first error).
@@ -435,7 +436,7 @@ def _analyze_hy_ast(
     return None
 
 
-class _TgirlNodeTransformer(RestrictingNodeTransformer):
+class _TgirlNodeTransformer(RestrictingNodeTransformer):  # type: ignore[misc]  # RestrictedPython has no stubs — base class is Any
     """Subclass of RestrictingNodeTransformer for tgirl.
 
     Overrides:

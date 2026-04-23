@@ -9,7 +9,7 @@ This module has ZERO coupling to any other tgirl module.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -44,6 +44,24 @@ class CalibrationResult:
     compression_ratio: float
     n_dims: int
     complement_fractions: dict[str, float]  # {name: fraction in complement}
+
+
+@runtime_checkable
+class EstradiolControllerProto(Protocol):
+    """Public surface of an ESTRADIOL controller.
+
+    Documents the duck-typed contract that sample_mlx.py relies on.
+    Concrete implementation: ``EstradiolController`` (below).
+    """
+
+    V_basis: Any  # mx.array (d_model, K)
+    alpha_current: Any  # mx.array (K,)
+
+    def step(self, probe_alpha: Any) -> Any: ...
+
+    def make_steering_state(self, delta_alpha: Any) -> SteeringState: ...
+
+    def reset(self) -> None: ...
 
 
 class EstradiolController:
@@ -143,9 +161,11 @@ def load_estradiol(path: Any) -> CalibrationResult:
 
     tensors = load_file(str(path))
     # safetensors metadata requires re-reading the header
+    from typing import cast
+
     from safetensors import safe_open
 
-    with safe_open(str(path), framework="numpy") as f:
+    with cast(Any, safe_open)(str(path), framework="numpy") as f:
         meta = f.metadata()
 
     V_basis = mx.array(tensors["V_basis"]).astype(mx.float32)
@@ -173,7 +193,7 @@ def load_estradiol(path: Any) -> CalibrationResult:
     )
 
 
-def _mx():
+def _mx() -> Any:
     """Lazy import mlx.core."""
     import mlx.core as mx
 
