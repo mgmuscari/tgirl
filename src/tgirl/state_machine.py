@@ -341,6 +341,25 @@ class BacktrackEvent(BaseModel):
     dead_end_tokens_added: frozenset[int]
 
 
+@runtime_checkable
+class ConfidenceMonitorProto(Protocol):
+    """Public surface of a confidence monitor for constrained generation.
+
+    Documents the duck-typed contract that sample_mlx.py relies on.
+    Concrete implementation: ``ConstrainedConfidenceMonitor`` (below).
+    """
+
+    backtracks_remaining: int  # property in concrete impl
+
+    def should_checkpoint(self, grammar_valid_count: int) -> bool: ...
+
+    def record_log_prob(self, log_prob: float) -> None: ...
+
+    def should_backtrack(self) -> bool: ...
+
+    def record_backtrack(self) -> None: ...
+
+
 class ConstrainedConfidenceMonitor:
     """Monitors confidence during constrained generation.
 

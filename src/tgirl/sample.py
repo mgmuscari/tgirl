@@ -13,9 +13,14 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from tgirl.estradiol import EstradiolControllerProto
     from tgirl.registry import ToolRegistry
     from tgirl.sample_mlx import InferenceHookMlx
-    from tgirl.state_machine import Checkpoint, TransitionPolicy
+    from tgirl.state_machine import (
+        Checkpoint,
+        ConfidenceMonitorProto,
+        TransitionPolicy,
+    )
     from tgirl.types import PromptFormatter
 
 import structlog
@@ -492,12 +497,12 @@ def run_constrained_generation(
     transport_config: TransportConfig,
     max_tokens: int = 512,
     context_tokens: list[int] | None = None,
-    confidence_monitor: Any | None = None,
+    confidence_monitor: ConfidenceMonitorProto | None = None,
     grammar_guide_factory: Callable[[str], GrammarState] | None = None,
     grammar_text: str | None = None,
     stop_token_ids: list[int] | None = None,
     reachable_tokens: frozenset[int] | None = None,
-    controller: object | None = None,
+    controller: EstradiolControllerProto | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
@@ -756,7 +761,7 @@ class SamplingSession:
         transition_policy: TransitionPolicy | None = None,
         stop_token_ids: list[int] | None = None,
         tool_call_primer_tokens: list[int] | None = None,
-        controller: object | None = None,
+        controller: EstradiolControllerProto | None = None,
     ) -> None:
         from tgirl.rerank import ToolRouter
         from tgirl.state_machine import DelimiterTransitionPolicy

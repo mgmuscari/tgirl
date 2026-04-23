@@ -9,16 +9,17 @@ from __future__ import annotations
 import time
 from collections import Counter
 from collections.abc import Callable
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import mlx.core as mx
 import structlog
 
+from tgirl.estradiol import EstradiolControllerProto
 from tgirl.sample import (
     ConstrainedGenerationResult,
     merge_interventions,
 )
-from tgirl.state_machine import TransitionSignal
+from tgirl.state_machine import ConfidenceMonitorProto, TransitionSignal
 from tgirl.transport import TransportConfig
 from tgirl.transport_mlx import redistribute_logits_mlx
 from tgirl.types import ModelIntervention
@@ -426,12 +427,12 @@ def run_constrained_generation_mlx(
     transport_config: TransportConfig,
     max_tokens: int = 512,
     context_tokens: list[int] | None = None,
-    confidence_monitor: object | None = None,
+    confidence_monitor: ConfidenceMonitorProto | None = None,
     grammar_guide_factory: Callable[[str], Any] | None = None,
     grammar_text: str | None = None,
     stop_token_ids: list[int] | None = None,
     reachable_tokens: frozenset[int] | None = None,
-    controller: object | None = None,
+    controller: EstradiolControllerProto | None = None,
 ) -> ConstrainedGenerationResult:
     """Run constrained token generation until grammar accepts or max_tokens.
 
