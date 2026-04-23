@@ -105,6 +105,13 @@ class DelimiterTransitionPolicy:
                 reason="no token_id provided",
                 confidence=0.0,
             )
+        if not isinstance(token_id, (int, str)):
+            return TransitionDecision(
+                should_transition=False,
+                target_state=None,
+                reason="token_id not coercible to int",
+                confidence=0.0,
+            )
 
         # Feed token to internal delimiter detector
         new_text = self._decode([int(token_id)])
@@ -561,7 +568,11 @@ class LatchedTransitionPolicy:
         # Decode token text for terminal detection
         token_text = str(kwargs.get("token_text", ""))
         token_id = kwargs.get("token_id")
-        if token_id is not None and self._decode is not None:
+        if (
+            token_id is not None
+            and isinstance(token_id, (int, str))
+            and self._decode is not None
+        ):
             token_text = self._decode([int(token_id)])
 
         # Phase 1: latch on low entropy (high confidence)
