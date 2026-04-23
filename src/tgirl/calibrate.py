@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 import structlog
@@ -35,10 +35,13 @@ def effective_rank(X: mx.array) -> float:
     Args:
         X: (n_samples, d_features) matrix.
     """
-    _, S, _ = mx.linalg.svd(X, stream=mx.cpu)
+    # mlx stub gap: mx.cpu is a Device at runtime but typed DeviceType.
+    _, S, _ = mx.linalg.svd(X, stream=cast(Any, mx.cpu))
     mx.eval(S)
-    # Filter near-zero singular values
-    s = [float(v) for v in S.tolist() if v > 1e-10]
+    # Filter near-zero singular values. S is 1D so tolist() returns
+    # list[float]; mlx stubs widen it to a recursive union — narrow
+    # via cast.
+    s = [float(v) for v in cast("list[float]", S.tolist()) if v > 1e-10]
     if not s:
         return 0.0
     total = sum(s)
@@ -468,7 +471,8 @@ def build_scaffold(
     M = mx.stack([semantic_vectors[n] for n in names])  # (n_dims, d_model)
     M = M - mx.mean(M, axis=0, keepdims=True)  # center
 
-    U, S, Vt = mx.linalg.svd(M, stream=mx.cpu)
+    # mlx stub gap: mx.cpu is a Device at runtime but typed DeviceType.
+    U, S, Vt = mx.linalg.svd(M, stream=cast(Any, mx.cpu))
     mx.eval(U, S, Vt)
 
     s_vals = S[:min(len(names), Vt.shape[0])]
@@ -563,7 +567,8 @@ def build_codebook(
     M = mx.stack([behavioral_vectors[nm] for nm in names])  # (N, d_model)
     M_centered = M - mx.mean(M, axis=0, keepdims=True)
 
-    U, S, Vt = mx.linalg.svd(M_centered, stream=mx.cpu)
+    # mlx stub gap: mx.cpu is a Device at runtime but typed DeviceType.
+    U, S, Vt = mx.linalg.svd(M_centered, stream=cast(Any, mx.cpu))
     mx.eval(U, S, Vt)
 
     s_vals = S[:min(n, Vt.shape[0])]
@@ -576,7 +581,9 @@ def build_codebook(
     cum_var: list[float] = []
     running = 0.0
     rank_at_threshold = K
-    for i in range(len(s_vals.tolist())):
+    # s_vals is 1D so .shape[0] is the scalar length (avoids the
+    # recursive list_or_scalar union returned by tolist()).
+    for i in range(int(s_vals.shape[0])):
         running += float(s_vals[i].item()) ** 2
         cv = running / (var_total + 1e-30)
         cum_var.append(cv)
@@ -629,7 +636,8 @@ def _random_baseline_eff_rank(n_vecs: int, d_model: int, n_trials: int = 5) -> f
         norms = mx.linalg.norm(R, axis=1, keepdims=True)
         R = R / (norms + 1e-10)
         R = R - mx.mean(R, axis=0, keepdims=True)
-        _, S, _ = mx.linalg.svd(R, stream=mx.cpu)
+        # mlx stub gap: mx.cpu is a Device at runtime but typed DeviceType.
+        _, S, _ = mx.linalg.svd(R, stream=cast(Any, mx.cpu))
         mx.eval(S)
         s_vals = S[:min(n_vecs, d_model)]
         ranks.append(participation_ratio(s_vals))

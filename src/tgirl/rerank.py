@@ -109,9 +109,9 @@ class ToolRouter:
 
         # Step 4: Get routing grammar text (with caching)
         top_k = self._config.top_k
-        cache_key = tuple(sorted(t.name for t in filtered_tools))
+        cache_key: tuple[str, ...] = tuple(sorted(t.name for t in filtered_tools))
         # Include top_k in cache key so different top_k values don't collide
-        grammar_cache_key = (*cache_key, top_k)
+        grammar_cache_key: tuple[str | int, ...] = (*cache_key, top_k)
         if grammar_cache_key in self._routing_grammar_cache:
             routing_grammar_text = self._routing_grammar_cache[grammar_cache_key]
         else:
