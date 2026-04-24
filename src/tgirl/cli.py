@@ -17,6 +17,7 @@ import structlog
 
 from tgirl.plugins import PluginManifest
 from tgirl.plugins.config import load_plugin_config
+from tgirl.plugins.loader import DuplicatePluginNameError
 from tgirl.registry import ToolRegistry
 
 logger = structlog.get_logger()
@@ -94,10 +95,6 @@ def _load_single_module(file_path: str, registry: ToolRegistry) -> None:
         "tools_module_no_tools_found",
         module=file_path,
     )
-
-
-class DuplicatePluginNameError(ValueError):
-    """Raised when the same plugin name appears in both CLI and TOML config."""
 
 
 def _collect_plugin_manifests(

@@ -9,6 +9,8 @@ Task 5 plumbs ``grant: CapabilityGrant`` through:
 
 from __future__ import annotations
 
+import pytest
+
 from tgirl.compile import (
     CompileConfig,
     _analyze_python_ast,
@@ -127,19 +129,18 @@ def test_zero_grant_permits_random_module_import() -> None:
         )
 
 
-def test_explicit_network_grant_rejects_socket_at_task5_level() -> None:
-    """Task 5 has not added NETWORK mapping beyond what ships in Task 4.
+def test_network_grant_passes_ast_but_runtime_rejects_socket_in_sandbox_a() -> None:
+    """With NETWORK granted, the AST gate passes `import socket`, but the
+    Sandbox A execution layer has no ``__import__`` in its 14-entry builtin
+    set — so the actual import statement raises at runtime.
 
-    Task 5 keeps the CAPABILITY_MODULES mapping stable and only wires the
-    grant through. The NETWORK entry exists from Task 4; however, the point
-    of this test is: at Task 5, Sandbox A rejects `import socket` even when
-    NETWORK is declared (the sandbox is STRICT by design — network code has
-    no business running inside Hy-generated LLM bytecode).
-
-    This locks in that Sandbox A's import gate is ABOVE the plugin-loader
-    gate: even NETWORK-granted plugins cannot `import socket` inside Hy
-    bytecode. Hy s-expressions do not need dynamic imports.
+    This documents the Task 5 contract: Sandbox A is STRICT about runtime
+    imports regardless of capability grant. The capability-gated AST pass
+    enables plugin-loader use cases (where the module has access to a richer
+    builtin set); Hy bytecode inside Sandbox A does not.
     """
+    from tgirl.compile import PipelineError
+
     reg = ToolRegistry()
     src = "(do (import socket) 0)"
     result = run_pipeline(
@@ -153,14 +154,12 @@ def test_explicit_network_grant_rejects_socket_at_task5_level() -> None:
             )
         ),
     )
-    # Sandbox A remains strict about non-default-granted modules.
-    # (Task 5 does not unlock network imports in compile.py. That machinery
-    # is only for plugin-loader Sandbox B. Task 6 only extends for default
-    # capabilities and the proxy modules, not for the raw socket.)
-    # Keep this as a regression guard; if Task 6 changes policy, update.
-    from tgirl.compile import PipelineError
-
+    # NOT an ast_analysis-stage rejection — AST pass accepts now that NETWORK
+    # is granted. Failure comes from the sandboxed bytecode execution.
     assert isinstance(result, PipelineError)
+    assert result.stage != "ast_analysis", (
+        f"expected non-AST failure, got stage={result.stage!r}"
+    )
 
 
 def test_analyze_python_ast_permits_time_when_clock_in_grant() -> None:
@@ -172,6 +171,39 @@ def test_analyze_python_ast_permits_time_when_clock_in_grant() -> None:
         tree, tool_names=set(), grant=CapabilityGrant.zero()
     )
     assert err is None, f"expected None, got {err}"
+
+
+_DEFAULTS = {Capability.CLOCK, Capability.RANDOM}
+
+
+@pytest.mark.parametrize(
+    "grant_caps,denied_module",
+    [
+        # Zero grant → socket rejected (NETWORK not granted).
+        (frozenset(_DEFAULTS), "socket"),
+        # Only CLOCK → socket still rejected.
+        (frozenset({Capability.CLOCK}), "socket"),
+        # NETWORK granted → subprocess module still rejected.
+        (frozenset({Capability.NETWORK} | _DEFAULTS), "subprocess"),
+        # SUBPROCESS granted → socket still rejected.
+        (frozenset({Capability.SUBPROCESS} | _DEFAULTS), "socket"),
+    ],
+)
+def test_sandbox_grant_cannot_exceed_declared_capabilities(
+    grant_caps: frozenset[Capability], denied_module: str
+) -> None:
+    """PRP §Task 5 line 364: any module outside the grant's union is rejected."""
+    import ast
+
+    tree = ast.parse(f"import {denied_module}", mode="exec")
+    err = _analyze_python_ast(
+        tree,
+        tool_names=set(),
+        grant=CapabilityGrant(capabilities=grant_caps),
+    )
+    assert err is not None, (
+        f"expected rejection for {denied_module!r} under grant {grant_caps}"
+    )
 
 
 def test_analyze_python_ast_rejects_os_even_with_grant_covering_it() -> None:

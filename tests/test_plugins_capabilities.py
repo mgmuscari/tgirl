@@ -156,6 +156,23 @@ def test_env_proxy_contains_dunder() -> None:
     assert callable(getattr(env_proxy, "__contains__", None))
 
 
+def test_env_proxy_in_operator_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`"FOO" in env_proxy` must actually dispatch through __contains__.
+
+    Without the ModuleType-subclass wrapper (PEP 549), Python's `in` operator
+    looks up __contains__ on the TYPE, not the module instance, and for a
+    regular module that raises `TypeError: argument of type 'module' is not
+    iterable`. The PEP 549 upgrade makes the dispatch work.
+    """
+    from tgirl.plugins.capabilities import env_proxy
+
+    monkeypatch.setenv("TGIRL_ENV_IN_OP_CHECK", "1")
+    assert "TGIRL_ENV_IN_OP_CHECK" in env_proxy
+    assert "NO_SUCH_VAR_QQQ_123" not in env_proxy
+
+
 # ---------------------------------------------------------------------------
 # subprocess_proxy
 # ---------------------------------------------------------------------------
@@ -258,6 +275,19 @@ def test_filesystem_write_capability_maps_to_proxy_module() -> None:
 def test_env_capability_maps_to_proxy_module() -> None:
     proxy_name = "tgirl.plugins.capabilities.env_proxy"
     assert proxy_name in CAPABILITY_MODULES[Capability.ENV]
+
+
+def test_filesystem_read_grant_cannot_write_via_fs_write_proxy() -> None:
+    """FS_READ alone must NOT unlock the fs_write_proxy module.
+
+    PRP §Task 6 test list line 426. Canonical separation-of-concerns check:
+    FS_READ and FS_WRITE are independent; granting only FS_READ must deny
+    the write proxy at Gate 1 / is_allowed_for_grant.
+    """
+    grant = frozenset({Capability.FILESYSTEM_READ})
+    assert not is_allowed_for_grant(
+        "tgirl.plugins.capabilities.fs_write_proxy", grant
+    )
 
 
 # ---------------------------------------------------------------------------

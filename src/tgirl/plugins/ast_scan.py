@@ -28,6 +28,12 @@ from tgirl.plugins.types import Capability
 
 # Name references forbidden in plugin source. Register-time defense-in-depth
 # against dynamic imports and sandbox-escape attempts (PRP Y#11, Y#2).
+#
+# Note: ``getattr`` is listed in PRP §Task 4 §2b. Broadly rejecting it would
+# break legitimate plugin code like ``getattr(obj, "key", default)``. The
+# _check_getattr_call helper narrows the ban to the dunder-string indirection
+# attack (``getattr(x, "__import__")``). That's the real attack path. Kept
+# ``getattr`` out of FORBIDDEN_NAMES deliberately; documented for audit.
 FORBIDDEN_NAMES: frozenset[str] = frozenset(
     {
         "exec",

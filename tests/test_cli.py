@@ -154,6 +154,111 @@ class TestCliHelp:
         assert "Missing option '-T'" not in (result.output or "")
 
 
+class TestAllowCapabilitiesFlag:
+    """PRP §Task 3 test list lines 181-182."""
+
+    @staticmethod
+    def _invoke_capture_flag(
+        monkeypatch: pytest.MonkeyPatch, extra: list[str]
+    ) -> bool:
+        """Run `serve` with a stubbed context and capture allow_capabilities."""
+        from click.testing import CliRunner
+
+        from tgirl.cli import serve
+
+        captured: dict[str, bool] = {}
+
+        def fake_load_context(model: str, **_kw: object) -> object:  # noqa: ARG001
+            class _Ctx:
+                backend = "mlx"
+
+                def __init__(self) -> None:
+                    from tgirl.registry import ToolRegistry
+
+                    self.registry = ToolRegistry()
+
+            return _Ctx()
+
+        def fake_create_app(ctx: object, **_kw: object) -> object:  # noqa: ARG001
+            # Short-circuit — uvicorn.run won't actually start a server.
+            raise SystemExit(0)
+
+        # Intercept the value via the CLI's serve function by inspecting the
+        # closure that calls load_inference_context. Simplest: monkeypatch
+        # uvicorn.run to capture the `app` (but we can't see the flag there).
+        # Use a direct instrumentation approach — patch _validate_source_presence
+        # to observe the whole arg list, OR record via closure.
+        monkeypatch.setattr(
+            "tgirl.serve.load_inference_context", fake_load_context
+        )
+        monkeypatch.setattr("tgirl.serve.create_app", fake_create_app)
+        # Intercept stashed flag via a validation shim.
+        real_validate = __import__(
+            "tgirl.cli", fromlist=["_validate_source_presence"]
+        )._validate_source_presence
+        original = real_validate
+
+        def observe(**kwargs: object) -> None:
+            # Just invoke original; capture done via a different hook.
+            original(**kwargs)  # type: ignore[arg-type]
+
+        # To actually capture `allow_capabilities`, we hook uvicorn.run:
+        # but we never reach it because of fake_create_app. Instead: check
+        # the echo message which contains allow_capabilities=<bool>.
+        runner = CliRunner()
+        result = runner.invoke(
+            serve,
+            ["--model", "dummy", "--plugin", "some_test_plugin_xyz", *extra],
+        )
+        assert result.exit_code == 0, result.output
+        # Parse the "allow_capabilities=..." line from the echo.
+        for line in (result.output or "").splitlines():
+            if "allow_capabilities=" in line:
+                token = line.split("allow_capabilities=")[-1].strip().rstrip(")")
+                captured["flag"] = token == "True"
+                break
+        return captured.get("flag", False)
+
+    def test_cli_allow_capabilities_flag_default_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without the flag, allow_capabilities is False (PRP §Task 3)."""
+        assert (
+            self._invoke_capture_flag(monkeypatch, extra=[]) is False
+        )
+
+    def test_cli_allow_capabilities_flag_sets_true(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With the flag, allow_capabilities is True (PRP §Task 3)."""
+        assert (
+            self._invoke_capture_flag(
+                monkeypatch, extra=["--allow-capabilities"]
+            )
+            is True
+        )
+
+
+class TestCliDuplicatePlugin:
+    def test_cli_cli_duplicate_plugin_fails(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """--plugin math --plugin math → DuplicatePluginNameError."""
+        from tgirl.cli import _collect_plugin_manifests
+        from tgirl.plugins.loader import DuplicatePluginNameError
+
+        with pytest.raises(DuplicatePluginNameError) as exc:
+            _collect_plugin_manifests(
+                plugin_names=("math", "math"),
+                plugin_config_path=None,
+                cwd=tmp_path,
+            )
+        assert "math" in str(exc.value)
+        _ = monkeypatch  # silence unused-arg lint
+
+
 class TestCliInvocation:
     """Integration-ish tests on the CLI that don't require model loading."""
 

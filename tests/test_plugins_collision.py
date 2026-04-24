@@ -202,6 +202,36 @@ def test_sanitized_rule_name_collision_fails_fast() -> None:
         generate(snap)
 
 
+def test_system_prompt_includes_dotted_names_when_namespaced() -> None:
+    """PRP §Task 10 line 582: user-facing name is the dotted form, not sanitized.
+
+    Locks in the invariant that grammar's internal `_sanitize_rule_name` is
+    a pure presentation transform — it must not leak into the model's system
+    prompt. The model still sees `(math.add 1 2)`.
+    """
+    from tgirl.instructions import generate_system_prompt
+
+    reg = ToolRegistry()
+
+    @reg.tool()
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    # Rename to dotted form as the namespacing layer would.
+    original = reg._tools["add"]
+    reg._tools["math.add"] = original.model_copy(update={"name": "math.add"})
+    reg._callables["math.add"] = reg._callables["add"]
+    del reg._tools["add"]
+    del reg._callables["add"]
+
+    snap = reg.snapshot()
+    prompt = generate_system_prompt(snap)
+    assert "math.add" in prompt
+    # The sanitized form must NOT appear verbatim in the user-facing prompt.
+    # (Internal Lark rule names are not exposed to the model.)
+    assert "call_math_add" not in prompt
+
+
 def test_registry_sanitized_rule_names_helper() -> None:
     """`registry.sanitized_rule_names()` returns the canonical mapping."""
     reg = ToolRegistry()
