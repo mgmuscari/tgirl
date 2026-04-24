@@ -362,10 +362,12 @@ def serve(
         model, backend=backend, auto_calibrate=auto_calibrate
     )
 
-    # Stash plugin intent on the context for Task 4 / 9 / 11 to consume.
-    # Task 3 captures and propagates; does NOT load.
-    ctx.plugin_manifests = plugin_manifests  # type: ignore[attr-defined]
-    ctx.allow_capabilities = allow_capabilities  # type: ignore[attr-defined]
+    # Task 4 will load plugins here via load_plugin() from tgirl.plugins.loader.
+    # Task 3 only captures intent; the list + flag drive downstream loading.
+    # They are intentionally NOT stashed on the frozen InferenceContext —
+    # Task 11 wires this through load_inference_context proper.
+    _ = plugin_manifests  # consumed in Task 4+ integration
+    _ = allow_capabilities  # consumed in Task 9+ integration
 
     # Load tools from specified paths (legacy --tools path).
     for tool_path in tools:
