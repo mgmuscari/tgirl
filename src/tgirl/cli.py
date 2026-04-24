@@ -2,16 +2,21 @@
 
 Usage:
     python -m tgirl.cli --model <model_id> --port 8420 --tools my_tools.py
+    python -m tgirl.cli --model <model_id> --plugin math
+    python -m tgirl.cli --model <m> --plugin-config plugins.toml --allow-capabilities
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import click
 import structlog
 
+from tgirl.plugins import PluginManifest
+from tgirl.plugins.config import load_plugin_config
 from tgirl.registry import ToolRegistry
 
 logger = structlog.get_logger()
@@ -91,6 +96,105 @@ def _load_single_module(file_path: str, registry: ToolRegistry) -> None:
     )
 
 
+class DuplicatePluginNameError(ValueError):
+    """Raised when the same plugin name appears in both CLI and TOML config."""
+
+
+def _collect_plugin_manifests(
+    plugin_names: tuple[str, ...],
+    plugin_config_path: str | None,
+    cwd: Path,
+) -> list[PluginManifest]:
+    """Resolve the combined manifest list from CLI flags and config files.
+
+    Discovery precedence (PRP §Task 3):
+      1. If ``plugin_config_path`` is given, use it exclusively (no auto-discover).
+      2. Else, if ``$CWD/tgirl.toml`` exists, auto-load it.
+      3. Else, no config file.
+
+    CLI ``--plugin <name>`` flags append zero-capability manifests onto the
+    list. Duplicate names across CLI + config fast-fail.
+
+    Args:
+        plugin_names: Names from ``--plugin`` flags (may be empty).
+        plugin_config_path: Explicit ``--plugin-config`` path, or None.
+        cwd: Current working directory — auto-discover root.
+
+    Returns:
+        Ordered list of ``PluginManifest``, config-first then CLI.
+
+    Raises:
+        DuplicatePluginNameError: if the same name appears in both sources.
+    """
+    manifests: list[PluginManifest] = []
+    resolved_config: Path | None = None
+
+    if plugin_config_path is not None:
+        resolved_config = Path(plugin_config_path)
+    else:
+        candidate = cwd / "tgirl.toml"
+        if candidate.exists():
+            resolved_config = candidate
+
+    if resolved_config is not None:
+        manifests.extend(load_plugin_config(resolved_config))
+
+    config_names = {m.name for m in manifests}
+    for name in plugin_names:
+        if name in config_names:
+            msg = (
+                f"plugin {name!r} declared twice: once in CLI --plugin and "
+                f"once in config {resolved_config}"
+            )
+            raise DuplicatePluginNameError(msg)
+        manifests.append(
+            PluginManifest(name=name, module=f"tgirl.plugins.stdlib.{name}",
+                           allow=frozenset())
+        )
+
+    # Detect dup CLI-CLI names too
+    seen: set[str] = set()
+    for m in manifests:
+        if m.name in seen:
+            msg = f"plugin {m.name!r} declared twice in CLI --plugin"
+            raise DuplicatePluginNameError(msg)
+        seen.add(m.name)
+
+    return manifests
+
+
+def _validate_source_presence(
+    tools: tuple[str, ...],
+    plugin_names: tuple[str, ...],
+    plugin_config_path: str | None,
+    auto_discovered_config: Path | None,
+    stdlib_autoload: bool,
+) -> None:
+    """Fail-fast when no tool source is declared AND stdlib autoload is off.
+
+    Per PRP §Task 3, at least one of the four sources must be present, unless
+    stdlib-autoload is on (the default, per Task 11):
+      * ``--tools`` paths
+      * ``--plugin`` names
+      * ``--plugin-config`` path
+      * auto-discovered ``tgirl.toml``
+
+    Raises:
+        click.UsageError: when the validation fails.
+    """
+    if stdlib_autoload:
+        return
+    if tools or plugin_names or plugin_config_path or auto_discovered_config:
+        return
+
+    msg = (
+        "No tool sources declared and stdlib autoload is disabled. Provide at "
+        "least one of: --tools <path>, --plugin <name>, --plugin-config <path>, "
+        "or a tgirl.toml in the working directory."
+    )
+    raise click.UsageError(msg)
+
+
 @click.command()
 @click.option(
     "--model",
@@ -118,9 +222,41 @@ def _load_single_module(file_path: str, registry: ToolRegistry) -> None:
 )
 @click.option(
     "--tools",
-    required=True,
+    required=False,
     multiple=True,
+    default=(),
     help="Python module(s) or directory containing tool definitions.",
+)
+@click.option(
+    "--plugin",
+    "plugin",
+    required=False,
+    multiple=True,
+    default=(),
+    help=(
+        "Name of a plugin to load as a zero-capability plugin "
+        "(shorthand for [plugins.<name>] in tgirl.toml). Repeatable."
+    ),
+)
+@click.option(
+    "--plugin-config",
+    "plugin_config",
+    required=False,
+    default=None,
+    help=(
+        "Path to a plugin TOML config. Overrides auto-discovery of "
+        "tgirl.toml in the working directory."
+    ),
+)
+@click.option(
+    "--allow-capabilities/--no-allow-capabilities",
+    "allow_capabilities",
+    default=False,
+    show_default=True,
+    help=(
+        "Honor per-plugin `allow = [...]` declarations at runtime. "
+        "When absent, no capability grants are honored regardless of TOML."
+    ),
 )
 @click.option(
     "--probe-load",
@@ -170,6 +306,9 @@ def serve(
     host: str,
     backend: str,
     tools: tuple[str, ...],
+    plugin: tuple[str, ...],
+    plugin_config: str | None,
+    allow_capabilities: bool,
     probe_load: str | None,
     probe_save_on_shutdown: str | None,
     probe_autosave_interval: float | None,
@@ -193,19 +332,51 @@ def serve(
         )
         raise click.UsageError(msg)
 
+    cwd = Path.cwd()
+    auto_discovered = cwd / "tgirl.toml"
+    auto_discovered_path: Path | None = (
+        auto_discovered if (plugin_config is None and auto_discovered.exists())
+        else None
+    )
+    # Task 3: stdlib autoload default is ON (Task 11 wires it in); Task 3 only
+    # needs an env-var test hook to exercise the failure path. Task 11 replaces
+    # this with the [plugins.stdlib] enabled = false config mechanism.
+    stdlib_autoload = os.environ.get("TGIRL_DISABLE_STDLIB_AUTOLOAD") != "1"
+
+    _validate_source_presence(
+        tools=tools,
+        plugin_names=plugin,
+        plugin_config_path=plugin_config,
+        auto_discovered_config=auto_discovered_path,
+        stdlib_autoload=stdlib_autoload,
+    )
+
+    plugin_manifests = _collect_plugin_manifests(
+        plugin_names=plugin,
+        plugin_config_path=plugin_config,
+        cwd=cwd,
+    )
+
     click.echo(f"Loading model: {model} (backend: {backend})")
     ctx = load_inference_context(
         model, backend=backend, auto_calibrate=auto_calibrate
     )
 
-    # Load tools from specified paths
+    # Stash plugin intent on the context for Task 4 / 9 / 11 to consume.
+    # Task 3 captures and propagates; does NOT load.
+    ctx.plugin_manifests = plugin_manifests  # type: ignore[attr-defined]
+    ctx.allow_capabilities = allow_capabilities  # type: ignore[attr-defined]
+
+    # Load tools from specified paths (legacy --tools path).
     for tool_path in tools:
         click.echo(f"Loading tools from: {tool_path}")
         load_tools_from_path(tool_path, ctx.registry)
 
     click.echo(
         f"Model loaded. Backend: {ctx.backend}, "
-        f"Tools: {len(ctx.registry)}"
+        f"Tools: {len(ctx.registry)}, "
+        f"Plugins: {len(plugin_manifests)}, "
+        f"allow_capabilities={allow_capabilities}"
     )
 
     app = create_app(
