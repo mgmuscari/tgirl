@@ -183,28 +183,16 @@ class TestAllowCapabilitiesFlag:
             # Short-circuit — uvicorn.run won't actually start a server.
             raise SystemExit(0)
 
-        # Intercept the value via the CLI's serve function by inspecting the
-        # closure that calls load_inference_context. Simplest: monkeypatch
-        # uvicorn.run to capture the `app` (but we can't see the flag there).
-        # Use a direct instrumentation approach — patch _validate_source_presence
-        # to observe the whole arg list, OR record via closure.
         monkeypatch.setattr(
             "tgirl.serve.load_inference_context", fake_load_context
         )
         monkeypatch.setattr("tgirl.serve.create_app", fake_create_app)
-        # Intercept stashed flag via a validation shim.
-        real_validate = __import__(
-            "tgirl.cli", fromlist=["_validate_source_presence"]
-        )._validate_source_presence
-        original = real_validate
 
-        def observe(**kwargs: object) -> None:
-            # Just invoke original; capture done via a different hook.
-            original(**kwargs)  # type: ignore[arg-type]
-
-        # To actually capture `allow_capabilities`, we hook uvicorn.run:
-        # but we never reach it because of fake_create_app. Instead: check
-        # the echo message which contains allow_capabilities=<bool>.
+        # Observation channel: `allow_capabilities=<bool>` appears in the CLI's
+        # echo output when serve() constructs the session. Parsing the echo is
+        # brittle — if the message format changes this test silently stops
+        # observing. Tracked for replacement when Task 11 lands a typed
+        # ctx.allow_capabilities field.
         runner = CliRunner()
         result = runner.invoke(
             serve,
@@ -240,11 +228,7 @@ class TestAllowCapabilitiesFlag:
 
 
 class TestCliDuplicatePlugin:
-    def test_cli_cli_duplicate_plugin_fails(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_cli_cli_duplicate_plugin_fails(self, tmp_path: Path) -> None:
         """--plugin math --plugin math → DuplicatePluginNameError."""
         from tgirl.cli import _collect_plugin_manifests
         from tgirl.plugins.loader import DuplicatePluginNameError
@@ -256,7 +240,6 @@ class TestCliDuplicatePlugin:
                 cwd=tmp_path,
             )
         assert "math" in str(exc.value)
-        _ = monkeypatch  # silence unused-arg lint
 
 
 class TestCliInvocation:
