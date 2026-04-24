@@ -27,6 +27,7 @@ from hy.models import Expression, List, Object, Symbol
 from pydantic import BaseModel, ConfigDict
 from RestrictedPython import RestrictingNodeTransformer
 
+from tgirl.plugins.types import CapabilityGrant
 from tgirl.registry import ToolRegistry
 from tgirl.types import PipelineError
 
@@ -64,8 +65,13 @@ class InsufficientResources(BaseModel):
 class CompileConfig(BaseModel):
     """Configuration for the compile pipeline."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
     pipeline_timeout: float = 60.0
+    # PRP Task 5: capability-aware sandbox relaxation.
+    # `None` → treat as `CapabilityGrant.zero()` (backward compat default).
+    # The grant flows into `_analyze_python_ast` (AST import gate) and
+    # `_build_sandbox` (capability-conditional builtins — filled in Task 6).
+    grant: CapabilityGrant | None = None
 
 
 
@@ -440,26 +446,53 @@ class _TgirlNodeTransformer(RestrictingNodeTransformer):  # type: ignore[misc]  
     """Subclass of RestrictingNodeTransformer for tgirl.
 
     Overrides:
-    - Rejects Import/ImportFrom nodes
+    - Rejects Import/ImportFrom nodes (capability-conditional per PRP Task 5)
     - Rejects Global/Nonlocal nodes
     - Allows non-dunder attribute access without _getattr_ wrapping
     - Keeps dunder attribute rejection from parent
     """
 
+    def __init__(
+        self,
+        errors: list[str],
+        warnings: list[str],
+        used_names: dict[str, bool],
+        *,
+        grant: CapabilityGrant | None = None,
+    ) -> None:
+        super().__init__(errors, warnings, used_names)
+        # Task 5: capability grant flows through; `None` → zero.
+        self._grant: CapabilityGrant = grant or CapabilityGrant.zero()
+
+    def _is_import_allowed(self, module_name: str) -> bool:
+        """Consult the capability mapping; allow iff module's cap is granted."""
+        from tgirl.plugins.capability_modules import is_allowed_for_grant
+
+        return is_allowed_for_grant(
+            module_name, self._grant.capabilities
+        )
+
     def visit_Import(  # noqa: N802
         self, node: ast.Import
     ) -> ast.Import:
-        self.errors.append(
-            f"Line {node.lineno}: Import statements are not allowed"
-        )
+        for alias in node.names:
+            if not self._is_import_allowed(alias.name):
+                self.errors.append(
+                    f"Line {node.lineno}: import {alias.name!r} is not "
+                    "allowed at the current capability grant"
+                )
+                return node
         return node
 
     def visit_ImportFrom(  # noqa: N802
         self, node: ast.ImportFrom
     ) -> ast.ImportFrom:
-        self.errors.append(
-            f"Line {node.lineno}: Import statements are not allowed"
-        )
+        module_name = node.module or ""
+        if not module_name or not self._is_import_allowed(module_name):
+            self.errors.append(
+                f"Line {node.lineno}: import {module_name!r} is not "
+                "allowed at the current capability grant"
+            )
         return node
 
     def visit_Global(  # noqa: N802
@@ -510,17 +543,21 @@ class _TgirlNodeTransformer(RestrictingNodeTransformer):  # type: ignore[misc]  
 
 
 def _analyze_python_ast(
-    tree: ast.Module, tool_names: set[str]
+    tree: ast.Module,
+    tool_names: set[str],
+    grant: CapabilityGrant | None = None,
 ) -> PipelineError | None:
     """Run RestrictedPython analysis on a Python AST.
 
-    Uses a tgirl-specific subclass of RestrictingNodeTransformer
-    that rejects imports, global/nonlocal, and dunder attributes
-    while allowing non-dunder attribute access.
+    Uses a tgirl-specific subclass of RestrictingNodeTransformer that:
+    - gates imports against the capability grant (Task 5)
+    - rejects global/nonlocal
+    - rejects dunder attribute access
+    - allows non-dunder attribute access without _getattr_ wrapping
     """
     errors: list[str] = []
     transformer = _TgirlNodeTransformer(
-        errors=errors, warnings=[], used_names={}
+        errors=errors, warnings=[], used_names={}, grant=grant
     )
 
     try:
@@ -600,7 +637,10 @@ def _wrap_with_timeout(
     return wrapper
 
 
-def _build_sandbox(registry: ToolRegistry) -> dict[str, Any]:
+def _build_sandbox(
+    registry: ToolRegistry,
+    grant: CapabilityGrant | None = None,  # noqa: ARG001
+) -> dict[str, Any]:
     """Build a restricted namespace for sandboxed execution.
 
     Contains only:
@@ -608,6 +648,10 @@ def _build_sandbox(registry: ToolRegistry) -> dict[str, Any]:
     - pmap and insufficient_resources implementations
     - _tgirl_result_ sentinel for result capture
     - Empty __builtins__ to prevent builtins access
+
+    Task 5 adds a ``grant`` kwarg (shape-only); Task 6 uses it to add
+    capability-conditional builtins such as ``open`` when FILESYSTEM_*
+    is granted.
     """
     sandbox: dict[str, Any] = {}
 
@@ -763,7 +807,7 @@ def run_pipeline(
 
     # Stage 4: Python AST security analysis
     logger.debug("pipeline_ast_analysis")
-    py_err = _analyze_python_ast(py_tree, tool_names)
+    py_err = _analyze_python_ast(py_tree, tool_names, grant=cfg.grant)
     if py_err is not None:
         return py_err
 
@@ -782,7 +826,7 @@ def run_pipeline(
         )
 
     # Stage 7: Build sandbox
-    sandbox = _build_sandbox(registry)
+    sandbox = _build_sandbox(registry, grant=cfg.grant)
 
     # Apply per-tool timeouts
     for name in registry.names():

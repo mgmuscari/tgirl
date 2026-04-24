@@ -72,12 +72,12 @@ class TestCompileTypes:
         c = CompileConfig(pipeline_timeout=30.0)
         assert c.pipeline_timeout == 30.0
 
-    def test_compile_config_has_only_pipeline_timeout(self) -> None:
-        """max_depth was dead config — CompileConfig has only pipeline_timeout."""
+    def test_compile_config_has_pipeline_timeout_and_grant(self) -> None:
+        """CompileConfig exposes pipeline_timeout and (PRP Task 5) grant."""
         from tgirl.compile import CompileConfig
 
         fields = set(CompileConfig.model_fields.keys())
-        assert fields == {"pipeline_timeout"}
+        assert fields == {"pipeline_timeout", "grant"}
 
 
 class TestCompileStubs:
