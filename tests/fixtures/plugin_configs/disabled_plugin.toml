@@ -1,0 +1,6 @@
+[plugins.math]
+module = "tgirl.plugins.stdlib.math"
+
+[plugins.disabled_one]
+module = "tgirl.plugins.stdlib.whatever"
+enabled = false

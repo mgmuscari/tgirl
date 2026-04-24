@@ -1,0 +1,3 @@
+[plugins.bad]
+module = "something.bad"
+allow = ["banana"]

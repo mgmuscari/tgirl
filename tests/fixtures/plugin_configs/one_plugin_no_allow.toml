@@ -1,0 +1,2 @@
+[plugins.math]
+module = "tgirl.plugins.stdlib.math"

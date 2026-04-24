@@ -1,0 +1,5 @@
+[plugins.math]
+module = "tgirl.plugins.stdlib.math"
+
+[future_feature]
+enabled = true

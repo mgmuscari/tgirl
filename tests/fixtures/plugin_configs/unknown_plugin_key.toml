@@ -1,0 +1,3 @@
+[plugins.x]
+module = "x"
+foo = "bar"

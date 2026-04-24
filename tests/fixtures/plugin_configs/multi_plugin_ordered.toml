@@ -1,0 +1,10 @@
+[plugins.zulu]
+module = "tgirl.plugins.stdlib.zulu"
+
+[plugins.alpha]
+module = "tgirl.plugins.stdlib.alpha"
+allow = ["network"]
+
+[plugins.mike]
+module = "tgirl.plugins.stdlib.mike"
+allow = ["clock", "random"]
