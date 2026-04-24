@@ -35,6 +35,37 @@ from tgirl.types import (
 logger = structlog.get_logger()
 
 
+class SanitizedRuleNameCollisionError(ValueError):
+    """Raised when two tool names sanitize to the same Lark rule name.
+
+    PRP: plugin-architecture Task 10 / Y#4.
+
+    Example: ``math.add`` and ``math_add`` both sanitize to ``math_add``, and
+    thus both ``call_math_add`` productions would clash. Fail-fast per
+    Acceptance Criterion #9.
+    """
+
+
+# Lark rule names must match ``[a-z_][a-z_0-9]*``; any other character is
+# replaced by ``_``. The rule BODY keeps the original (dotted) tool name as a
+# quoted terminal — only rule-name slots are sanitized.
+_RULE_NAME_SUB = re.compile(r"[^a-z0-9_]")
+
+
+def _sanitize_rule_name(name: str) -> str:
+    """Return a Lark-safe rule-name slug for a (possibly dotted) tool name.
+
+    PRP Task 10 / Y#4. Pure presentation transform — the registered tool
+    name is never changed; only the internal production rule-name slot.
+
+    >>> _sanitize_rule_name("math.add")
+    'math_add'
+    >>> _sanitize_rule_name("user-plugin.foo")
+    'user_plugin_foo'
+    """
+    return _RULE_NAME_SUB.sub("_", name.lower())
+
+
 class Production(BaseModel):
     """A single grammar production rule."""
 
@@ -267,6 +298,11 @@ def _tool_to_rules(
     tag_map = dict(tool.param_tags)
     tg = type_grammars or {}
 
+    # PRP Task 10: Lark rule names cannot contain dots or most non-alnum chars.
+    # Use the sanitized tool-name slug wherever a rule-name slot appears; keep
+    # the original dotted tool name as a quoted string terminal in rule bodies.
+    sanitized = _sanitize_rule_name(tool.name)
+
     # Split required and optional parameters
     required = [p for p in tool.parameters if not p.has_default]
     optional = [p for p in tool.parameters if p.has_default]
@@ -282,14 +318,14 @@ def _tool_to_rules(
             # The actual rule definition is emitted once (deduped later)
             prods.append(Production(name=rule_name, rule=tg[tag]))
         else:
-            type_name = f"param_{tool.name}_{param.name}".lower()
+            type_name = f"param_{sanitized}_{param.name}".lower()
             param_type_names.append(type_name)
             prods.extend(_type_to_rule(param.type_repr, type_name, config))
 
     if not tool.parameters:
         # No parameters: (tool_name)
         rule = f'"(" "{tool.name}" ")"'
-        prods.insert(0, Production(name=f"call_{tool.name}".lower(), rule=rule))
+        prods.insert(0, Production(name=f"call_{sanitized}", rule=rule))
         return prods
 
     # Build the args portion with trailing optional chain
@@ -323,8 +359,30 @@ def _tool_to_rules(
     else:
         # All-optional: space is part of the optional group
         rule = f'"(" "{tool.name}" {args} ")"'
-    prods.insert(0, Production(name=f"call_{tool.name}".lower(), rule=rule))
+    prods.insert(0, Production(name=f"call_{sanitized}", rule=rule))
     return prods
+
+
+def _check_sanitized_collisions(snapshot: RegistrySnapshot) -> None:
+    """Fail-fast if any two tool names sanitize to the same rule slug.
+
+    PRP Task 10 / Y#4 option (b).
+
+    The error message lists both offending names so the user can resolve the
+    clash at the registry layer (rename one, or explicitly namespace).
+    """
+    buckets: dict[str, list[str]] = {}
+    for tool in snapshot.tools:
+        key = _sanitize_rule_name(tool.name)
+        buckets.setdefault(key, []).append(tool.name)
+    for sanitized, names in sorted(buckets.items()):
+        if len(names) > 1:
+            conflict = ", ".join(sorted(names))
+            msg = (
+                f"sanitized grammar rule name collision: {{{conflict}}} all "
+                f"map to `call_{sanitized}`; rename one of the tools"
+            )
+            raise SanitizedRuleNameCollisionError(msg)
 
 
 def _load_templates() -> jinja2.Environment:
@@ -348,6 +406,11 @@ def _render_grammar(
         Complete grammar text in Lark EBNF format.
     """
     env = _load_templates()
+
+    # PRP Task 10: detect sanitized-rule-name collisions across tools before
+    # rendering. `math.add` and `math_add` both sanitize to `math_add`; the
+    # resulting duplicate `call_math_add` productions would be invalid Lark.
+    _check_sanitized_collisions(snapshot)
 
     # Collect all productions
     tool_prods: list[Production] = []
@@ -449,9 +512,9 @@ def generate(
     for tool in snapshot.tools:
         all_prods.extend(_tool_to_rules(tool, cfg, type_grammars=tg))
 
-    # Also collect type productions from return types
+    # Also collect type productions from return types (use sanitized slug)
     for tool in snapshot.tools:
-        ret_name = f"ret_{tool.name}".lower()
+        ret_name = f"ret_{_sanitize_rule_name(tool.name)}"
         all_prods.extend(_type_to_rule(tool.return_type, ret_name, cfg))
 
     # Deduplicate by name (keep first occurrence)

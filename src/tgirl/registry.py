@@ -97,6 +97,10 @@ class ToolRegistry:
         self._tools: dict[str, ToolDefinition] = {}
         self._callables: dict[str, Callable[..., Any]] = {}
         self._type_grammars: dict[str, str] = {}
+        # Parallel dict: tool_name → source plugin name (or "inline" / "at_tool_kwarg").
+        # PRP Task 10 §"Approach" — enables plugin-level dedup and Task 11
+        # `/telemetry` `source` field.
+        self._sources: dict[str, str] = {}
 
     def tool(
         self,
@@ -397,6 +401,15 @@ class ToolRegistry:
         if name not in self._callables:
             raise KeyError(name)
         return self._callables[name]
+
+    def sanitized_rule_names(self) -> dict[str, str]:
+        """Return ``{tool_name: sanitized_rule_slug}`` for every registered tool.
+
+        Shared source of truth for grammar and instructions modules. Used to
+        detect sanitized-name collisions symmetrically (PRP Task 10, Y#4).
+        """
+        from tgirl.grammar import _sanitize_rule_name
+        return {name: _sanitize_rule_name(name) for name in self._tools}
 
     def names(self) -> list[str]:
         """Return sorted list of registered tool names."""

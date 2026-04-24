@@ -39,9 +39,20 @@ from tgirl.plugins.guard import guard_scope, install_finder
 from tgirl.plugins.types import CapabilityGrant, PluginManifest
 from tgirl.registry import ToolRegistry
 
+
+class DuplicatePluginNameError(PluginLoadError):
+    """Raised when a plugin with the same name is loaded twice into one registry.
+
+    Distinct from a tool-name collision, which is resolved by namespacing.
+    This is a plugin-level identity collision and must fail-fast per PRP
+    Task 10 §"Approach".
+    """
+
+
 # Re-export so callers can `from tgirl.plugins.loader import PluginLoadError`.
 __all__ = [
     "CapabilityDeniedError",
+    "DuplicatePluginNameError",
     "PluginASTRejectedError",
     "PluginLoadError",
     "load_plugin",
@@ -136,33 +147,68 @@ def _import_plugin_module(
         ) from exc
 
 
-def _register_tools(module: types.ModuleType, target: ToolRegistry) -> int:
-    """Integrate plugin tools into ``target`` registry.
+def _register_tools(
+    module: types.ModuleType,
+    target: ToolRegistry,
+    plugin_name: str,
+) -> int:
+    """Integrate plugin tools into ``target`` registry with collision namespacing.
 
     Supports the two existing strategies:
       1. ``module.register(registry)`` callable.
       2. ``module.registry: ToolRegistry`` module-level attribute.
+
+    Task 10 namespacing: when a `register()` function or a module-level
+    registry introduces a tool name that already exists in ``target``, the
+    new tool is namespaced as ``<plugin_name>.<function>``. If the namespaced
+    form also collides, a ``DuplicatePluginNameError`` is raised — this can
+    only happen if two plugins with the same name are loaded.
     """
+    # For the register()-callable strategy we can't intercept each tool
+    # registration, so we register into a scratch registry and merge.
+    scratch: ToolRegistry
     register_fn = getattr(module, "register", None)
     if callable(register_fn):
-        register_fn(target)
-        return len(target)
+        scratch = ToolRegistry()
+        register_fn(scratch)
+    else:
+        mod_registry = getattr(module, "registry", None)
+        if isinstance(mod_registry, ToolRegistry):
+            scratch = mod_registry
+        else:
+            # Neither strategy — warn but don't error (matches legacy behavior).
+            logger.warning("plugin_no_tools_found", module=module.__name__)
+            return len(target)
 
-    mod_registry = getattr(module, "registry", None)
-    if isinstance(mod_registry, ToolRegistry):
-        for name in mod_registry.names():
-            if name in target._tools:
-                msg = (
-                    f"tool name collision: {name!r} already registered "
-                    "(plugin namespacing is Task 10)"
-                )
-                raise ValueError(msg)
-            target._tools[name] = mod_registry._tools[name]
-            target._callables[name] = mod_registry.get_callable(name)
-        return len(target)
+    for name in scratch.names():
+        tool_def = scratch._tools[name]
+        callable_fn = scratch.get_callable(name)
+        if name not in target._tools:
+            target._tools[name] = tool_def
+            target._callables[name] = callable_fn
+            target._sources[name] = plugin_name
+            continue
 
-    # Neither strategy — warn but don't error (matches legacy cli behavior).
-    logger.warning("plugin_no_tools_found", module=module.__name__)
+        # Collision → promote to <plugin>.<name>.
+        namespaced = f"{plugin_name}.{name}"
+        if namespaced in target._tools:
+            msg = (
+                f"plugin name collision: plugin {plugin_name!r} is already "
+                f"loaded (tool {namespaced!r} is already registered)"
+            )
+            raise DuplicatePluginNameError(msg)
+        # Rewrite the ToolDefinition with the namespaced name.
+        namespaced_def = tool_def.model_copy(update={"name": namespaced})
+        target._tools[namespaced] = namespaced_def
+        target._callables[namespaced] = callable_fn
+        target._sources[namespaced] = plugin_name
+        logger.info(
+            "plugin_tool_namespaced_on_collision",
+            original=name,
+            promoted_to=namespaced,
+            plugin=plugin_name,
+        )
+
     return len(target)
 
 
@@ -192,6 +238,13 @@ def load_plugin(
     # Install the finder once. It is a no-op outside guard scope.
     install_finder()
 
+    # Plugin-level dedup (PRP Task 10): a registry can only have one tool set
+    # from a given plugin name. The parallel _sources dict tracks this.
+    if manifest.name in set(registry._sources.values()):
+        raise DuplicatePluginNameError(
+            f"plugin {manifest.name!r} is already loaded into this registry"
+        )
+
     resolved_kind = _detect_kind(manifest)
     source, module_name = _read_plugin_source(manifest, resolved_kind)
 
@@ -206,7 +259,7 @@ def load_plugin(
     # --- Gate 2 + 3 ---
     with guard_scope(grant):
         module = _import_plugin_module(manifest, resolved_kind, module_name)
-        _register_tools(module, registry)
+        _register_tools(module, registry, manifest.name)
 
     logger.info(
         "plugin_loaded",
