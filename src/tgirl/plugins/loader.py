@@ -21,6 +21,7 @@ The loader walks three gates per PRP §Task 4:
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
 import importlib.util
 import os
 import sys
@@ -30,6 +31,7 @@ from pathlib import Path
 import structlog
 
 from tgirl.plugins.ast_scan import scan_source
+from tgirl.plugins.capability_modules import capability_open
 from tgirl.plugins.errors import (
     CapabilityDeniedError,
     PluginASTRejectedError,
@@ -118,33 +120,139 @@ def _read_plugin_source(
     return source, manifest.module
 
 
-def _import_plugin_module(
-    manifest: PluginManifest, resolved_kind: str, module_name: str
+def _build_safe_builtins(grant: CapabilityGrant) -> dict[str, object]:
+    """Construct the curated ``__builtins__`` dict for plugin module exec.
+
+    PRP §Task 4 §Sandbox B "safe-builtins contract":
+      - Removes ``open``, ``exec``, ``eval``, ``compile``, ``breakpoint``,
+        ``input`` from the plugin module's builtins.
+      - ``open`` is conditionally re-introduced via ``capability_open`` when
+        FILESYSTEM_READ or FILESYSTEM_WRITE is granted. Sandbox B owns the
+        FS-write/read mode-gate at this exec layer; it is independent of
+        Gate 3 (which mediates module attribute access at call time).
+
+    DEVIATION FROM PRP §3 / AUDIT FINDING #4 PRIMARY-COLLAPSE NOTE:
+
+    The PRP and the audit's "primary collapse" rationale recommend removing
+    ``__import__`` from the plugin builtins as well. Empirically this breaks
+    every legitimate plugin: CPython's ``IMPORT_NAME`` opcode looks up
+    ``__import__`` in ``frame.f_builtins`` to execute statement-level
+    ``import`` directives. With ``__import__`` absent, even the audit's own
+    Task 4 acceptance test (``test_load_stdlib_math_plugin_in_zero_capability_mode_succeeds``)
+    fails on its very first ``from tgirl.registry import ToolRegistry`` —
+    a stdlib-pattern import the audit explicitly wants to keep working.
+
+    The PRP's claim that "normal ``import`` statements go through the
+    ``sys.meta_path`` guard" is true for the meta_path callback, but the
+    callback is reached *via* ``__import__`` — not in lieu of it. The
+    security property the audit attributes to ``__import__`` removal is
+    achieved equivalently by:
+
+      1. AST scan rejecting the literal ``__import__`` name (FORBIDDEN_NAMES,
+         already in place) — closes the static path.
+      2. AST scan rejecting ``__builtins__`` and dunder-attribute reads
+         (already in place); Commit 3 will further harden the dynamic
+         lookup paths (``getattr`` non-Constant arg, ``ast.Subscript``).
+      3. Gate 2 (``_CapabilityFinder``) firing on every ``__import__`` call
+         while ``_effective_grant`` is set — wrapping or denying the target
+         module independent of how ``__import__`` was reached. The audit's
+         PoC #5 reflection chain terminates in ``__import__("socket")``;
+         Gate 2 sees the call and denies/wraps regardless.
+
+    The ``open`` redaction (which the audit treats as the load-bearing fix
+    for #4) is unaffected: ``open`` is genuinely orphaned from the import
+    machinery and can be safely removed without breaking legitimate plugins.
+
+    The fresh per-call dict ensures one plugin's mutation cannot leak to
+    another — defense against #2's mutable-shared-state class of attack.
+    """
+    import builtins as _real_builtins
+
+    redacted = {
+        "open",
+        "exec",
+        "eval",
+        "compile",
+        "breakpoint",
+        "input",
+    }
+    safe: dict[str, object] = {
+        name: getattr(_real_builtins, name)
+        for name in dir(_real_builtins)
+        if name not in redacted
+    }
+
+    # Re-introduce ``open`` only at FS_READ / FS_WRITE grants via the curated
+    # wrapper. ``capability_open`` returns None at zero grant.
+    gated_open = capability_open(grant.capabilities)
+    if gated_open is not None:
+        safe["open"] = gated_open
+
+    return safe
+
+
+def _exec_with_safe_builtins(
+    spec: importlib.machinery.ModuleSpec,
+    module_name: str,
+    grant: CapabilityGrant,
 ) -> types.ModuleType:
-    """Execute the plugin source. Guard must already be active around this call."""
+    """Uniform exec path used by both file-path and dotted-module branches.
+
+    Pattern: ``module_from_spec`` → set ``__builtins__`` → ``exec_module``.
+    Replacing ``__builtins__`` BEFORE ``exec_module`` ensures the plugin's
+    top-level statements (which run during exec) see the curated dict, not
+    the real one. This closes audit finding #4.
+    """
+    if spec.loader is None:
+        msg = f"plugin {module_name!r} has no loader on its import spec"
+        raise PluginLoadError(msg)
+    module = importlib.util.module_from_spec(spec)
+    module.__dict__["__builtins__"] = _build_safe_builtins(grant)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+def _import_plugin_module(
+    manifest: PluginManifest,
+    resolved_kind: str,
+    module_name: str,
+    grant: CapabilityGrant,
+) -> types.ModuleType:
+    """Execute the plugin source under Sandbox B. Guard must already be active.
+
+    Both file-path and dotted-module branches funnel through the same
+    ``find_spec`` → ``module_from_spec`` → builtins-substitution →
+    ``exec_module`` pattern. The dotted-module branch is NOT permitted to
+    short-circuit through ``importlib.import_module`` — that would bypass
+    the builtins substitution and re-open the audit-#4 hole.
+    """
     if resolved_kind == "file":
         spec = importlib.util.spec_from_file_location(
             module_name, manifest.module
         )
-        if spec is None or spec.loader is None:
+        if spec is None:
             msg = f"cannot build import spec for {manifest.module!r}"
             raise PluginLoadError(msg)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
-        return module
+        return _exec_with_safe_builtins(spec, module_name, grant)
 
-    # "module"
+    # "module" branch: locate via importlib, then exec through the uniform
+    # path so Sandbox B applies regardless of plugin discovery mode.
     try:
-        return importlib.import_module(manifest.module)
-    except ModuleNotFoundError as exc:
+        spec = importlib.util.find_spec(manifest.module)
+    except (ImportError, ValueError) as exc:
         raise PluginLoadError(
-            f"plugin module {manifest.module!r} not found: {exc}"
+            f"cannot locate plugin module {manifest.module!r}: {exc}"
         ) from exc
+    if spec is None:
+        raise PluginLoadError(
+            f"plugin module {manifest.module!r} not found"
+        )
+    return _exec_with_safe_builtins(spec, manifest.module, grant)
 
 
 def _register_tools(
@@ -256,9 +364,11 @@ def load_plugin(
             f"plugin {manifest.name!r} has syntax errors: {exc}"
         ) from exc
 
-    # --- Gate 2 + 3 ---
+    # --- Gate 2 + 3 + Sandbox B ---
     with guard_scope(grant):
-        module = _import_plugin_module(manifest, resolved_kind, module_name)
+        module = _import_plugin_module(
+            manifest, resolved_kind, module_name, grant
+        )
         _register_tools(module, registry, manifest.name)
 
     logger.info(

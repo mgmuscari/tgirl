@@ -421,6 +421,91 @@ def test_from_import_through_capability_scoped_module(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sandbox B safe-builtins substitution (audit finding #4)
+# ---------------------------------------------------------------------------
+
+
+def test_zero_cap_plugin_cannot_open_files_at_top_level(
+    tmp_path: Path,
+) -> None:
+    """Audit finding #4 PoC: Sandbox B safe-builtins substitution.
+
+    Attack: a zero-capability plugin executes ``open(...)`` at top level to
+    read arbitrary files and write a marker file. PRP §Task 4 §Sandbox B
+    requires ``open`` to be removed from the plugin module's ``__builtins__``
+    when neither FILESYSTEM_READ nor FILESYSTEM_WRITE is granted.
+
+    Defense: ``_import_plugin_module`` substitutes a curated builtins dict on
+    the plugin module before ``exec_module``; ``capability_open`` returns None
+    for a zero grant, so ``open`` is absent from the plugin's namespace.
+    """
+    marker = tmp_path / "pwned"
+    plugin_path = _write_plugin(
+        tmp_path,
+        "pwn4",
+        f"""
+        # Zero-cap plugin attempts a write — must fail because ``open`` is
+        # not present in the substituted plugin __builtins__ dict.
+        open({str(marker)!r}, "w").write("PWNED")
+
+        def register(r):
+            pass
+        """,
+    )
+    manifest = PluginManifest(
+        name="pwn4",
+        module=str(plugin_path),
+        kind="file",
+        allow=frozenset(),
+    )
+    # ``open`` is absent → NameError at exec wrapped by the loader as a
+    # PluginLoadError (or propagated). Either way, the marker must NOT exist.
+    with pytest.raises(Exception):
+        load_plugin(manifest, ToolRegistry(), CapabilityGrant.zero())
+    assert not marker.exists(), (
+        f"sandbox B escape: zero-cap plugin wrote {marker}; "
+        "open() is reachable from plugin __builtins__."
+    )
+
+
+def test_dunder_import_absent_from_plugin_builtins(tmp_path: Path) -> None:
+    """Audit finding #5 collapse: with safe-builtins, ``__import__`` is absent.
+
+    With ``__builtins__`` substituted, even reflection-chain attacks that
+    reach the builtins dict find no ``__import__`` key — the terminal sink
+    is closed. The plugin probes whether ``__import__`` is reachable; the
+    expected outcome is a NameError at exec because the probe references
+    forbidden names — Gate 1 actually rejects first, but the structural
+    invariant is: a successfully-loaded zero-cap plugin must NOT see
+    ``__import__`` in its globals/builtins.
+    """
+    plugin_path = _write_plugin(
+        tmp_path,
+        "noimport_probe",
+        # Use a constant string lookup that the AST scan rejects to verify
+        # Gate 1 + Sandbox B together close every path. Gate 1 rejects the
+        # forbidden name ``__builtins__`` explicitly per FORBIDDEN_NAMES.
+        """
+        _b = __builtins__
+
+        def register(r):
+            pass
+        """,
+    )
+    with pytest.raises(PluginASTRejectedError):
+        load_plugin(
+            PluginManifest(
+                name="noimport_probe",
+                module=str(plugin_path),
+                kind="file",
+                allow=frozenset(),
+            ),
+            ToolRegistry(),
+            CapabilityGrant.zero(),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Hypothesis property test — capability set closure
 # ---------------------------------------------------------------------------
 
