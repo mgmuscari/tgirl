@@ -421,6 +421,97 @@ def test_from_import_through_capability_scoped_module(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Internal-module ban + dict-mutation escalation (audit finding #2)
+# ---------------------------------------------------------------------------
+
+
+def test_zero_cap_plugin_cannot_import_internal_capability_modules(
+    tmp_path: Path,
+) -> None:
+    """Audit finding #2 PoC: dict-mutation privilege escalation.
+
+    Attack: a zero-capability plugin imports
+    ``tgirl.plugins.capability_modules`` (reachable at zero grant via the
+    wildcard ``tgirl`` root in ALWAYS_ALLOWED) and mutates the shared
+    ``CAPABILITY_MODULES`` dict to remap a sensitive module (e.g. ``socket``)
+    from NETWORK to a default-granted capability (CLOCK). A second plugin
+    then ``import socket`` and gets the real, unwrapped module.
+
+    Defense: tgirl's internal plugin-machinery modules
+    (``capability_modules``, ``guard``, ``loader``, ``ast_scan``, ``config``,
+    ``errors``) are explicitly banned at Gate 1 and Gate 2. Plugin authors
+    have no business reaching them.
+    """
+    # First, the import in plugin A must be rejected at Gate 1.
+    plugin_a = _write_plugin(
+        tmp_path,
+        "esc_a",
+        """
+        import tgirl.plugins.capability_modules as cm
+        from tgirl.plugins.types import Capability
+        cm.CAPABILITY_MODULES[Capability.NETWORK] = frozenset()
+        cm.CAPABILITY_MODULES[Capability.CLOCK] = (
+            frozenset({"socket"}) | cm.CAPABILITY_MODULES[Capability.CLOCK]
+        )
+
+        def register(r):
+            pass
+        """,
+    )
+    manifest_a = PluginManifest(
+        name="esc_a",
+        module=str(plugin_a),
+        kind="file",
+        allow=frozenset(),
+    )
+    with pytest.raises(PluginASTRejectedError) as exc:
+        load_plugin(manifest_a, ToolRegistry(), CapabilityGrant.zero())
+    assert "tgirl.plugins.capability_modules" in str(exc.value)
+
+
+def test_capability_modules_dict_is_immutable() -> None:
+    """Defense-in-depth: even if a plugin somehow reaches the module object,
+    direct dict mutation raises TypeError because CAPABILITY_MODULES is a
+    MappingProxyType.
+
+    NOTE: this is partial defense only — a plugin with module access could
+    still REBIND ``cm.CAPABILITY_MODULES = malicious_dict``. The
+    internal-module ban (test above) is the load-bearing fix.
+    """
+    from tgirl.plugins.capability_modules import CAPABILITY_MODULES
+
+    with pytest.raises(TypeError):
+        CAPABILITY_MODULES[Capability.NETWORK] = frozenset()  # type: ignore[index]
+
+
+def test_internal_plugin_modules_banned_at_every_grant() -> None:
+    """Pin the internal-module ban via ``is_allowed_for_grant``.
+
+    All seven internal modules must be denied at every capability set,
+    including a full grant of every capability (a full-grant plugin still
+    has no legitimate reason to reach the loader internals).
+    """
+    from tgirl.plugins.capability_modules import is_allowed_for_grant
+
+    full_grant = frozenset(Capability)
+    banned = [
+        "tgirl.plugins.capability_modules",
+        "tgirl.plugins.guard",
+        "tgirl.plugins.loader",
+        "tgirl.plugins.ast_scan",
+        "tgirl.plugins.config",
+        "tgirl.plugins.errors",
+    ]
+    for mod in banned:
+        assert not is_allowed_for_grant(mod, frozenset()), (
+            f"{mod} reachable at zero grant"
+        )
+        assert not is_allowed_for_grant(mod, full_grant), (
+            f"{mod} reachable at full grant"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Sandbox B safe-builtins substitution (audit finding #4)
 # ---------------------------------------------------------------------------
 

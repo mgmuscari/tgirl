@@ -17,11 +17,9 @@ import ast
 from dataclasses import dataclass
 
 from tgirl.plugins.capability_modules import (
-    ALWAYS_ALLOWED_MODULES,
-    BANNED_MODULES,
     CAPABILITY_MODULES,
-    capability_for_module,
-    root_module,
+    _ImportClassification,
+    classify_import,
 )
 from tgirl.plugins.errors import PluginASTRejectedError
 from tgirl.plugins.types import Capability
@@ -178,25 +176,30 @@ def _check_one_import(
 ) -> None:
     """Validate one import target against the declared allow-set.
 
-    Raises ``PluginASTRejectedError`` if the import is banned OR if it requires
-    a capability not in ``allow``. CLOCK/RANDOM are always granted — they need
-    no explicit declaration.
+    Routes the import through the single consolidated ``classify_import``
+    helper (audit finding #2: previously ``_check_one_import`` and
+    ``is_allowed_for_grant`` had divergent ``tgirl`` root-match logic). Any
+    future change to the classification rules updates both gate paths
+    simultaneously.
+
+    Raises ``PluginASTRejectedError`` if the import is banned OR if it
+    requires a capability not in ``allow``. CLOCK/RANDOM are always granted
+    — they need no explicit declaration.
     """
-    root = root_module(dotted)
-    if dotted in BANNED_MODULES or root in BANNED_MODULES:
+    cls = classify_import(dotted)
+
+    if cls is _ImportClassification.BANNED:
         raise PluginASTRejectedError(
             plugin_name,
             "banned_module",
             f"line {lineno}: module {dotted!r} is banned at every capability "
             "tier (use a tgirl proxy module instead)",
         )
-    if dotted in ALWAYS_ALLOWED_MODULES or root in ALWAYS_ALLOWED_MODULES:
+
+    if cls is _ImportClassification.ALWAYS_ALLOWED:
         return
-    cap = capability_for_module(dotted)
-    if cap is None:
-        # Unknown module, not covered by any capability. We conservatively
-        # reject unknown modules unless the plugin lives in the stdlib pack
-        # (handled by the caller allowing an explicit override — future work).
+
+    if cls is _ImportClassification.UNKNOWN:
         raise PluginASTRejectedError(
             plugin_name,
             "unknown_module",
@@ -204,12 +207,15 @@ def _check_one_import(
             "capability; plugin authors must use a capability-mapped module "
             "or an always-allowed stdlib module",
         )
+
+    # Capability-gated. cls is a Capability enum here.
+    assert isinstance(cls, Capability)
+    cap = cls
     # CLOCK and RANDOM are always granted — no declaration needed.
     if cap in (Capability.CLOCK, Capability.RANDOM):
         caps_needed.add(cap)
         return
     if cap not in allow:
-        # Construct a helpful message listing the remedy.
         raise PluginASTRejectedError(
             plugin_name,
             "undeclared_capability",

@@ -24,6 +24,7 @@ Task 6 adds purpose-built proxy modules (``env_proxy``, ``subprocess_proxy``,
 
 from __future__ import annotations
 
+import types
 from typing import Any
 
 from tgirl.plugins.types import Capability
@@ -31,7 +32,15 @@ from tgirl.plugins.types import Capability
 # Task 4 ships the CLOCK/RANDOM defaults and an empty/partial mapping for the
 # remaining capabilities; Task 6 fills in the rest. See PRP Task 5 →
 # Task 6 explicit contract (Y10): neither is a shim.
-CAPABILITY_MODULES: dict[Capability, frozenset[str]] = {
+#
+# The dict is wrapped in ``types.MappingProxyType`` below as defense-in-depth
+# against audit finding #2 (dict-mutation privilege escalation). The proxy
+# raises TypeError on direct mutation (``CAPABILITY_MODULES[X] = Y``). It does
+# NOT defend against module-level rebinding
+# (``cm.CAPABILITY_MODULES = malicious_dict``) — that path is closed by the
+# explicit ban on importing ``tgirl.plugins.capability_modules`` from any
+# plugin (BANNED_MODULES below + Gate 1 + Gate 2 enforcement).
+_CAPABILITY_MODULES_INNER: dict[Capability, frozenset[str]] = {
     # FS_READ: only the purpose-built proxy, no raw pathlib/io (Y3).
     Capability.FILESYSTEM_READ: frozenset(
         {"tgirl.plugins.capabilities.fs_read_proxy"}
@@ -70,9 +79,36 @@ CAPABILITY_MODULES: dict[Capability, frozenset[str]] = {
     Capability.RANDOM: frozenset({"random", "secrets", "uuid"}),
 }
 
+CAPABILITY_MODULES: types.MappingProxyType[Capability, frozenset[str]] = (
+    types.MappingProxyType(_CAPABILITY_MODULES_INNER)
+)
+
 # Hardcoded banned-everywhere modules. These must never appear in
 # `CAPABILITY_MODULES` values; a regression test pins this in Task 6.
-BANNED_MODULES: frozenset[str] = frozenset({"os", "os.path", "pathlib", "io", "shutil"})
+#
+# Beyond the OS-level dangerous modules (``os``, ``pathlib``, etc.) this set
+# includes tgirl's own plugin-machinery modules. A plugin author has no
+# legitimate reason to reach loader/guard/ast_scan/etc., and reachability via
+# the wildcard ``tgirl`` root in ALWAYS_ALLOWED_MODULES is exactly the path
+# that audit finding #2 exploits. Bans are EXACT-name (not prefix) so legitimate
+# user modules cannot be accidentally caught — see ``is_allowed_for_grant``.
+BANNED_MODULES: frozenset[str] = frozenset(
+    {
+        # OS / FS escapes (Y3 / Task 6 spec).
+        "os",
+        "os.path",
+        "pathlib",
+        "io",
+        "shutil",
+        # tgirl-internal plugin machinery — closes audit finding #2 vector.
+        "tgirl.plugins.capability_modules",
+        "tgirl.plugins.guard",
+        "tgirl.plugins.loader",
+        "tgirl.plugins.ast_scan",
+        "tgirl.plugins.config",
+        "tgirl.plugins.errors",
+    }
+)
 
 # Modules that are always safe to import regardless of grant — stdlib modules
 # a typical `@tool()`-decorated plugin needs to compile. Does NOT include
@@ -194,27 +230,87 @@ def capability_open(
     return _gated_open
 
 
-def is_allowed_for_grant(
-    dotted: str, granted: frozenset[Capability]
-) -> bool:
-    """Check if ``dotted`` is importable given the set of granted capabilities.
+class _ImportClassification:
+    """Marker types for ``classify_import``'s return value.
 
-    Banned modules are NEVER allowed. Always-allowed modules are allowed at
-    zero grant (EXACT match only — e.g. ``tgirl`` is allowed, but not every
-    ``tgirl.*`` submodule; proxy modules must be reached by capability grant).
-    Otherwise the module's capability must be in ``granted``.
+    Sentinels are class attributes (not instances) so identity comparisons
+    work cleanly with ``is``. Capability-mapped imports return the
+    ``Capability`` enum directly — no wrapping needed.
+    """
+
+    BANNED = "BANNED"
+    ALWAYS_ALLOWED = "ALWAYS_ALLOWED"
+    UNKNOWN = "UNKNOWN"
+
+
+def classify_import(dotted: str) -> str | Capability:
+    """Single source of truth for "what is this import?"
+
+    Returns one of:
+      - ``_ImportClassification.BANNED`` — never importable, any grant.
+      - ``_ImportClassification.ALWAYS_ALLOWED`` — importable at any grant.
+      - ``Capability(...)`` — gated by the named capability.
+      - ``_ImportClassification.UNKNOWN`` — not in any classification bucket;
+        callers MUST reject (Gate 1) — unknown stdlib reaches an unknown
+        module, which historically has surfaced as a bypass.
+
+    The ``tgirl`` wildcard root match in ALWAYS_ALLOWED_MODULES is encoded
+    here exactly once: ``tgirl`` (the root) and the named ``tgirl.*`` entries
+    are allowed; arbitrary ``tgirl.*`` submodules are NOT (per Y3 design —
+    proxy modules must be reached via capability mapping, internal modules
+    are banned). Previously this rule was duplicated in
+    ``ast_scan._check_one_import`` and ``is_allowed_for_grant`` with subtle
+    divergence — ast_scan permitted any ``tgirl.*``, while is_allowed_for_grant
+    excluded them. The audit's finding #2 surfaced this directly.
     """
     root = root_module(dotted)
+
+    # Bans are exact-or-root match; any stdlib OS escape and any tgirl-internal
+    # plugin module trips here first, before reaching the allow paths.
     if dotted in BANNED_MODULES or root in BANNED_MODULES:
-        return False
+        return _ImportClassification.BANNED
+
     # Capability-mapped modules take precedence over the always-allowed list
     # so that proxy modules under tgirl.plugins.capabilities are gated by
     # capability rather than always-allowed by the root `tgirl` match.
     cap = capability_for_module(dotted)
     if cap is not None:
-        return cap in granted
+        return cap
+
+    # ALWAYS_ALLOWED matches:
+    # 1. Exact match on the named entry (covers `tgirl`, `tgirl.registry`,
+    #    `tgirl.types`, `tgirl.plugins`, `tgirl.plugins.types`).
+    # 2. Root-package match for non-tgirl roots (covers `collections.abc`
+    #    via root `collections`, etc.). The non-tgirl exclusion prevents
+    #    arbitrary `tgirl.<anything>` from being reachable via the wildcard
+    #    root match — closes audit finding #2's reach vector at the source.
     if dotted in ALWAYS_ALLOWED_MODULES:
+        return _ImportClassification.ALWAYS_ALLOWED
+    if root in ALWAYS_ALLOWED_MODULES and root != "tgirl":
+        return _ImportClassification.ALWAYS_ALLOWED
+
+    return _ImportClassification.UNKNOWN
+
+
+def is_allowed_for_grant(
+    dotted: str, granted: frozenset[Capability]
+) -> bool:
+    """Check if ``dotted`` is importable given the set of granted capabilities.
+
+    Thin wrapper over ``classify_import`` — preserves the existing public
+    API and uses the consolidated classification helper as its only source
+    of truth.
+    """
+    cls = classify_import(dotted)
+    if cls is _ImportClassification.BANNED:
+        return False
+    if cls is _ImportClassification.ALWAYS_ALLOWED:
         return True
-    # For non-tgirl submodules, allow root-package match (e.g. `collections.abc`
-    # → root `collections` → ALWAYS_ALLOWED).
-    return root in ALWAYS_ALLOWED_MODULES and root != "tgirl"
+    if cls is _ImportClassification.UNKNOWN:
+        # Unknown imports are NOT allowed for runtime grants either — the
+        # Gate 1 author-hygiene scan rejects them; if we somehow reach here
+        # with one, fail-closed.
+        return False
+    # Otherwise it's a Capability enum — gate by the grant.
+    assert isinstance(cls, Capability)
+    return cls in granted
