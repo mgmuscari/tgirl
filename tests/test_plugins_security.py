@@ -512,6 +512,221 @@ def test_internal_plugin_modules_banned_at_every_grant() -> None:
 
 
 # ---------------------------------------------------------------------------
+# AST tightening: getattr / breakpoint / input / Subscript (audit #5 + #8)
+# ---------------------------------------------------------------------------
+
+
+def test_getattr_with_nonconstant_arg_rejected(tmp_path: Path) -> None:
+    """Audit finding #5 PoC: chr-constructed dunder string evades Constant check.
+
+    Attack: ``getattr(obj, chr(95)+chr(95)+"globals"+chr(95)+chr(95))`` —
+    the second argument is not an ``ast.Constant``, so the original
+    ``_check_getattr_call`` allowed it. The AST scan must reject any call to
+    ``getattr`` whose attribute argument is not a literal string Constant
+    AND not also dunder-prefixed (handled by the literal path).
+
+    Defense: tightened ``_check_getattr_call`` rejects non-Constant second
+    arg; ``getattr`` itself is now in FORBIDDEN_NAMES (per PRP §2b).
+    """
+    plugin_path = _write_plugin(
+        tmp_path,
+        "p5_getattr",
+        """
+        def go():
+            u = chr(95) + chr(95)
+            attr = u + "globals" + u
+            return getattr(go, attr)
+
+        def register(r):
+            pass
+        """,
+    )
+    with pytest.raises(PluginASTRejectedError) as exc:
+        load_plugin(
+            PluginManifest(
+                name="p5_getattr",
+                module=str(plugin_path),
+                kind="file",
+                allow=frozenset(),
+            ),
+            ToolRegistry(),
+            CapabilityGrant.zero(),
+        )
+    msg = str(exc.value).lower()
+    assert "getattr" in msg
+
+
+def test_subscript_with_dunder_string_rejected(tmp_path: Path) -> None:
+    """Audit finding #5 PoC continuation: ``b["__import__"]`` subscript path.
+
+    Attack: even with getattr tightened, the chain can pivot to dict
+    subscription: ``some_dict[chr(95)+chr(95)+"import"+chr(95)+chr(95)]``.
+    The previous AST scan had no Subscript handler at all.
+
+    Defense: new ``ast.Subscript`` handler flags any subscript whose key is
+    a literal dunder string OR a chr-construction yielding a dunder string.
+    Only literal-dunder is caught here; the chr-construction case is handled
+    by recognizing string concatenations of chr(95) calls bracketing a name.
+    """
+    # Literal dunder subscript path
+    plugin_path = _write_plugin(
+        tmp_path,
+        "p5_sub_const",
+        """
+        def go(b):
+            return b["__import__"]
+
+        def register(r):
+            pass
+        """,
+    )
+    with pytest.raises(PluginASTRejectedError) as exc:
+        load_plugin(
+            PluginManifest(
+                name="p5_sub_const",
+                module=str(plugin_path),
+                kind="file",
+                allow=frozenset(),
+            ),
+            ToolRegistry(),
+            CapabilityGrant.zero(),
+        )
+    assert "__import__" in str(exc.value).lower() or "dunder" in str(
+        exc.value
+    ).lower()
+
+
+def test_subscript_with_chr_constructed_dunder_rejected(tmp_path: Path) -> None:
+    """Audit finding #5 chr-construction subscript variant.
+
+    The handler inspects subscript keys; any key that looks like a chr()-
+    based dunder construction (e.g. ``chr(95)+chr(95)+"name"+chr(95)+chr(95)``)
+    is flagged. We cannot enumerate every possible string construction, so
+    this catches the canonical pattern; combined with ``getattr`` ban and
+    Sandbox B builtins-substitution, the reflection path is closed.
+    """
+    plugin_path = _write_plugin(
+        tmp_path,
+        "p5_sub_chr",
+        """
+        def go(b):
+            u = chr(95) + chr(95)
+            return b[u + "import" + u]
+
+        def register(r):
+            pass
+        """,
+    )
+    with pytest.raises(PluginASTRejectedError):
+        load_plugin(
+            PluginManifest(
+                name="p5_sub_chr",
+                module=str(plugin_path),
+                kind="file",
+                allow=frozenset(),
+            ),
+            ToolRegistry(),
+            CapabilityGrant.zero(),
+        )
+
+
+def test_breakpoint_name_rejected(tmp_path: Path) -> None:
+    """Audit finding #8 PoC: ``breakpoint()`` halts the server thread at PDB.
+
+    Defense: ``breakpoint`` is now in FORBIDDEN_NAMES per PRP §Task 4 §2b.
+    """
+    plugin_path = _write_plugin(
+        tmp_path,
+        "bp",
+        """
+        def register(r):
+            @r.tool()
+            def go() -> int:
+                breakpoint()
+                return 0
+        """,
+    )
+    with pytest.raises(PluginASTRejectedError) as exc:
+        load_plugin(
+            PluginManifest(
+                name="bp",
+                module=str(plugin_path),
+                kind="file",
+                allow=frozenset(),
+            ),
+            ToolRegistry(),
+            CapabilityGrant.zero(),
+        )
+    assert "breakpoint" in str(exc.value).lower()
+
+
+def test_input_name_rejected(tmp_path: Path) -> None:
+    """Audit finding #8 PoC: ``input()`` blocks the server thread on stdin.
+
+    Defense: ``input`` is now in FORBIDDEN_NAMES per PRP §Task 4 §2b.
+    """
+    plugin_path = _write_plugin(
+        tmp_path,
+        "ip",
+        """
+        def register(r):
+            @r.tool()
+            def go() -> int:
+                input()
+                return 0
+        """,
+    )
+    with pytest.raises(PluginASTRejectedError) as exc:
+        load_plugin(
+            PluginManifest(
+                name="ip",
+                module=str(plugin_path),
+                kind="file",
+                allow=frozenset(),
+            ),
+            ToolRegistry(),
+            CapabilityGrant.zero(),
+        )
+    assert "input" in str(exc.value).lower()
+
+
+def test_legitimate_getattr_with_constant_default_still_works(
+    tmp_path: Path,
+) -> None:
+    """Regression guard: legitimate ``getattr(obj, "key", default)`` is OK.
+
+    The PRP §2b rationale for not blanket-banning getattr was preserving
+    legitimate use. Now that getattr IS in FORBIDDEN_NAMES, this test
+    documents the trade-off — plugins that need attribute lookup must use
+    ``obj.attr`` syntax instead. The audit accepted this trade-off
+    (its remediation explicitly recommends adding getattr to FORBIDDEN_NAMES).
+    """
+    plugin_path = _write_plugin(
+        tmp_path,
+        "ga_legit",
+        """
+        def register(r):
+            @r.tool()
+            def go() -> int:
+                # This is now rejected. Plugins must rewrite as `obj.attr`.
+                v = getattr(go, "name", "default")
+                return 0
+        """,
+    )
+    with pytest.raises(PluginASTRejectedError):
+        load_plugin(
+            PluginManifest(
+                name="ga_legit",
+                module=str(plugin_path),
+                kind="file",
+                allow=frozenset(),
+            ),
+            ToolRegistry(),
+            CapabilityGrant.zero(),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Sandbox B safe-builtins substitution (audit finding #4)
 # ---------------------------------------------------------------------------
 

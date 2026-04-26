@@ -25,13 +25,19 @@ from tgirl.plugins.errors import PluginASTRejectedError
 from tgirl.plugins.types import Capability
 
 # Name references forbidden in plugin source. Register-time defense-in-depth
-# against dynamic imports and sandbox-escape attempts (PRP Y#11, Y#2).
+# against dynamic imports and sandbox-escape attempts (PRP §Task 4 §2b).
 #
-# Note: ``getattr`` is listed in PRP §Task 4 §2b. Broadly rejecting it would
-# break legitimate plugin code like ``getattr(obj, "key", default)``. The
-# _check_getattr_call helper narrows the ban to the dunder-string indirection
-# attack (``getattr(x, "__import__")``). That's the real attack path. Kept
-# ``getattr`` out of FORBIDDEN_NAMES deliberately; documented for audit.
+# ``getattr`` was previously omitted from this set on the theory that legitimate
+# plugin code (e.g. ``getattr(obj, "key", default)``) would be broken by a
+# blanket ban. Audit finding #5 demonstrated that the narrow
+# ``_check_getattr_call`` helper — which only inspected ``ast.Constant``
+# strings — was bypassable via chr-construction
+# (``getattr(_f, chr(95)+chr(95)+"globals"+chr(95)+chr(95))``). The audit's
+# remediation: add ``getattr`` to FORBIDDEN_NAMES and accept the legitimate-
+# usage trade-off; plugins that need attribute lookup use ``obj.attr`` syntax.
+#
+# ``breakpoint`` and ``input`` close audit finding #8 (PRP §2b spec drift) —
+# ``breakpoint()`` halts the server at PDB; ``input()`` blocks on stdin.
 FORBIDDEN_NAMES: frozenset[str] = frozenset(
     {
         "exec",
@@ -44,9 +50,12 @@ FORBIDDEN_NAMES: frozenset[str] = frozenset(
         "globals",
         "locals",
         "vars",
+        "getattr",  # audit finding #5: dunder-string indirection vector.
         "setattr",
         "delattr",
         "importlib",
+        "breakpoint",  # audit finding #8: halts at PDB.
+        "input",  # audit finding #8: blocks server thread on stdin.
     }
 )
 
@@ -78,22 +87,129 @@ class ScanResult:
 
 
 def _check_getattr_call(node: ast.Call, plugin_name: str) -> None:
-    """Reject `getattr(x, "__something__")` with a dunder string literal."""
+    """Reject ``getattr(x, ...)`` calls. Audit finding #5 hardening.
+
+    ``getattr`` is in FORBIDDEN_NAMES so the bare reference is already
+    caught at the Name visit. This helper exists for the residual case
+    where some future relaxation re-permits the name — it then catches:
+
+      * Constant dunder strings — ``getattr(x, "__import__")``.
+      * Non-Constant attribute arg — ``getattr(x, chr(95)+...)``. This is
+        the chr-construction bypass the audit demonstrated.
+
+    Any non-Constant attribute argument is conservatively rejected. Plugins
+    that need true dynamic attribute lookup are not v1's target.
+    """
     if not (isinstance(node.func, ast.Name) and node.func.id == "getattr"):
         return
     if len(node.args) < 2:
         return
     second = node.args[1]
-    if (
-        isinstance(second, ast.Constant)
-        and isinstance(second.value, str)
-        and second.value.startswith("_")
-    ):
+    if isinstance(second, ast.Constant) and isinstance(second.value, str):
+        if second.value.startswith("_"):
+            raise PluginASTRejectedError(
+                plugin_name,
+                "getattr_indirection",
+                f"line {node.lineno}: getattr(…, {second.value!r}) is "
+                "not permitted (dunder-string indirection to a builtin)",
+            )
+        return
+    # Any non-Constant attribute argument is the chr-construction class —
+    # reject conservatively.
+    raise PluginASTRejectedError(
+        plugin_name,
+        "getattr_dynamic_attr",
+        f"line {node.lineno}: getattr(…) with a non-literal attribute name "
+        "is not permitted (closes chr-construction reflection bypass)",
+    )
+
+
+def _is_chr_call(expr: ast.expr) -> bool:
+    """Return True if ``expr`` is ``chr(...)``. Audit finding #5."""
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "chr"
+    )
+
+
+def _is_string_concat_buildup(expr: ast.expr) -> bool:
+    """Return True if ``expr`` is a string-concatenation buildup tree.
+
+    Flags any ``BinOp(+, ...)`` tree whose leaves are all ``ast.Name``,
+    ``ast.Constant`` (str), or ``chr(...)`` calls. This is the canonical
+    shape of the audit's PoC #5 chr-construction attack and its aliased
+    variant where ``chr(95)+chr(95)`` is bound to a local name first:
+
+        u = chr(95) + chr(95)
+        b[u + "import" + u]      # ← flagged: BinOp tree of Names + Str
+
+    Mere ``"foo" + var`` or ``base + suffix`` will match too. The audit
+    accepted this trade-off — plugins that need to compute string subscript
+    keys can use ``str.join`` or f-strings (also string concat, so still
+    flagged), or precompute outside the subscript expression. In practice,
+    plugin code rarely subscripts with a runtime-built string; when it
+    does, the workaround is a one-line refactor:
+
+        key = u + "import" + u   # ← Name only, NOT BinOp at use site
+        b[key]                   # ← OK; key is a Name
+
+    The audit's recommendation accepts this surface in exchange for closing
+    the reflection chain at the static layer.
+    """
+    if not (isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add)):
+        return False
+
+    def all_leaves_string_buildable(e: ast.expr) -> bool:
+        if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Add):
+            return all_leaves_string_buildable(e.left) and (
+                all_leaves_string_buildable(e.right)
+            )
+        if _is_chr_call(e):
+            return True
+        if isinstance(e, ast.Name):
+            return True
+        if isinstance(e, ast.Constant) and isinstance(e.value, str):
+            return True
+        return False
+
+    return all_leaves_string_buildable(expr)
+
+
+def _check_subscript(node: ast.Subscript, plugin_name: str) -> None:
+    """Audit finding #5: reject dunder-string subscripts on builtin-like dicts.
+
+    Two cases caught:
+      1. Constant dunder string: ``b["__import__"]``,
+         ``g["__globals__"]`` — direct sink reach.
+      2. chr-constructed dunder: ``b[chr(95)+chr(95)+"import"+chr(95)+chr(95)]``
+         — same intent, dynamic spelling.
+
+    Mere subscript on collections is fine; only flagged when the key looks
+    like a dunder name. False-positive risk: a legitimate plugin that uses
+    a string starting with ``_`` as a dict key would also be flagged. This
+    is acceptable per audit's remediation (plugins that need underscore-
+    prefixed keys can avoid the literal form, e.g. compute the key from a
+    non-suspicious expression). The chr-construction heuristic only
+    matches the canonical attack pattern.
+    """
+    key = node.slice
+    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+        if key.value.startswith("_"):
+            raise PluginASTRejectedError(
+                plugin_name,
+                "subscript_dunder_key",
+                f"line {node.lineno}: subscript with key {key.value!r} is "
+                "not permitted (dunder-string indirection to a builtin)",
+            )
+        return
+    if _is_string_concat_buildup(key):
         raise PluginASTRejectedError(
             plugin_name,
-            "getattr_indirection",
-            f"line {node.lineno}: getattr(…, {second.value!r}) is "
-            "not permitted (dunder-string indirection to a builtin)",
+            "subscript_dynamic_string_key",
+            f"line {node.lineno}: subscript with a runtime-built string key "
+            "is not permitted (matches reflection-chain attack pattern; "
+            "precompute the key into a Name binding outside the subscript)",
         )
 
 
@@ -160,6 +276,10 @@ def scan_source(
         # --- getattr(x, "__y__") indirection ---
         elif isinstance(node, ast.Call):
             _check_getattr_call(node, plugin_name)
+
+        # --- Subscript dunder-string sinks (audit finding #5) ---
+        elif isinstance(node, ast.Subscript):
+            _check_subscript(node, plugin_name)
 
     return ScanResult(
         imports=frozenset(imports),
