@@ -56,6 +56,18 @@ FORBIDDEN_NAMES: frozenset[str] = frozenset(
         "importlib",
         "breakpoint",  # audit finding #8: halts at PDB.
         "input",  # audit finding #8: blocks server thread on stdin.
+        # ``chr`` and ``ord`` are the leaf primitives of every dunder-string
+        # construction class (concat, ``str.join``, f-strings). Without them,
+        # there is no integer→character primitive available to a plugin, so
+        # the only path to a string starting with ``_`` is a literal string
+        # — which the AST scan already catches via dunder-attr / dunder-key
+        # rules (FORBIDDEN_ATTRIBUTES, ``_check_subscript``). Audit Finding
+        # #5 reviewer Sig 4/5: closes the chr-construction Name-binding
+        # workaround AND the ``str.join``/f-string variants in one cut.
+        # Plugins have no legitimate need for character-arithmetic — Y3
+        # proxy modules pre-format anything character-related.
+        "chr",
+        "ord",
     }
 )
 
@@ -138,24 +150,15 @@ def _is_string_concat_buildup(expr: ast.expr) -> bool:
 
     Flags any ``BinOp(+, ...)`` tree whose leaves are all ``ast.Name``,
     ``ast.Constant`` (str), or ``chr(...)`` calls. This is the canonical
-    shape of the audit's PoC #5 chr-construction attack and its aliased
-    variant where ``chr(95)+chr(95)`` is bound to a local name first:
+    shape of the audit's PoC #5 chr-construction attack:
 
-        u = chr(95) + chr(95)
-        b[u + "import" + u]      # ← flagged: BinOp tree of Names + Str
+        b[chr(95)+chr(95)+"import"+chr(95)+chr(95)]   # ← flagged
 
-    Mere ``"foo" + var`` or ``base + suffix`` will match too. The audit
-    accepted this trade-off — plugins that need to compute string subscript
-    keys can use ``str.join`` or f-strings (also string concat, so still
-    flagged), or precompute outside the subscript expression. In practice,
-    plugin code rarely subscripts with a runtime-built string; when it
-    does, the workaround is a one-line refactor:
-
-        key = u + "import" + u   # ← Name only, NOT BinOp at use site
-        b[key]                   # ← OK; key is a Name
-
-    The audit's recommendation accepts this surface in exchange for closing
-    the reflection chain at the static layer.
+    The aliased variant where ``chr(95)+chr(95)`` is bound to a local Name
+    first is now closed at a different layer: ``chr`` and ``ord`` are in
+    FORBIDDEN_NAMES, so the construction primitives don't compile. This
+    handler retains the BinOp catch as defense-in-depth in case a future
+    relaxation re-permits the leaf primitives.
     """
     if not (isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add)):
         return False

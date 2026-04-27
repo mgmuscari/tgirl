@@ -87,42 +87,32 @@ def test_register_from_schema_accepts_legitimate_names(good_name: str) -> None:
     assert good_name in reg.names()
 
 
-def test_tool_decorator_rejects_bad_function_name() -> None:
+def test_tool_decorator_rejects_renamed_function_with_bad_name() -> None:
     """The ``@tool()`` decorator path also enforces the charset.
 
-    Python identifiers already exclude quotes and most special characters,
-    but the validator runs uniformly so the same audit-grade guarantee
-    applies regardless of registration path.
+    Python identifiers can't contain quotes at lex time, so the realistic
+    threat model for the decorator path is post-definition ``__name__``
+    rewriting (a host-app or framework that monkey-patches function names
+    before registration). This test pins that surface: even when
+    ``__name__`` is reassigned to a charset-violating value BEFORE the
+    decorator runs, the validator rejects.
+
+    Reviewer follow-up to Commit 5 Minor: the original test had no
+    assertions and was a non-test per audit Finding #12.
     """
     reg = ToolRegistry()
 
-    def make_bad() -> None:
-        # We simulate a function name that violates the charset by using
-        # __name__ assignment after decoration — the validator catches it.
-        @reg.tool()
-        def good_name() -> int:
-            return 0
+    def f() -> int:
+        return 0
 
-        # Now rename retroactively and re-register through the decorator
-        # path — must reject. (In practice Python identifiers can't contain
-        # quotes, so this is a pin against future name-rewriting paths.)
-        good_name.__name__ = 'bad" "name'
+    # Monkey-patch __name__ before decoration — the decorator reads
+    # ``func.__name__`` to compute the registration key, so the validator
+    # will see the bad name.
+    f.__name__ = 'bad" "name'  # type: ignore[attr-defined]
 
-        @reg.tool()
-        def bad_func() -> int:
-            return 0
-
-        # Force the renamed registration via duplicate detection bypass — the
-        # charset validator should catch the original function's renamed
-        # state. We test the simpler path: any direct construction with a
-        # bad name fails.
-
-    # The realistic path is `register_from_schema(name=...)`, covered above.
-    # `@tool()` derives name from `__name__` which is a Python identifier;
-    # Python's lexer prevents quotes here. We document this and skip the
-    # synthetic case — the pin lives at the registry boundary regardless of
-    # entry path.
-    make_bad()  # exercises decorator path with valid names; no explicit assert.
+    with pytest.raises(ValueError) as exc:
+        reg.tool()(f)
+    assert "invalid" in str(exc.value).lower()
 
 
 def test_grammar_emission_escapes_tool_name_metacharacters() -> None:

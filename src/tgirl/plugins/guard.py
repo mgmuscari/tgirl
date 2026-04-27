@@ -78,13 +78,44 @@ def guard_scope(grant: CapabilityGrant) -> Iterator[None]:
     finally:
         _effective_grant.reset(token)
         # Remove any wrappers that got installed during the scope.
+        # Two paths to clean up — both are necessary because CPython's import
+        # machinery caches submodule references in BOTH sys.modules AND on
+        # the parent package's __dict__ (the latter is set as a side effect
+        # of importing a submodule, so that ``parent.child`` works without
+        # triggering another import). If we only clean sys.modules, the next
+        # ``from parent import child`` finds the wrapper as an attribute on
+        # parent and bypasses meta_path entirely.
         for name in gated:
             current = sys.modules.get(name)
             if isinstance(current, CapabilityScopedModule):
                 del sys.modules[name]
-        # Restore real modules that were present before the scope.
+                # Clean parent-package attribute side effect.
+                if "." in name:
+                    parent_name, _, child_name = name.rpartition(".")
+                    parent = sys.modules.get(parent_name)
+                    if parent is not None and isinstance(
+                        getattr(parent, child_name, None),
+                        CapabilityScopedModule,
+                    ):
+                        try:
+                            delattr(parent, child_name)
+                        except AttributeError:
+                            pass
+        # Restore real modules that were present before the scope. Also
+        # restore the parent-attribute side effect so cached references
+        # outside the guard see the real module again.
         for name, mod in saved.items():
             sys.modules[name] = mod
+            if "." in name:
+                parent_name, _, child_name = name.rpartition(".")
+                parent = sys.modules.get(parent_name)
+                if parent is not None:
+                    try:
+                        setattr(parent, child_name, mod)
+                    except (AttributeError, TypeError):
+                        # Some module-types (e.g. extension modules) refuse
+                        # attribute assignment. Best-effort restoration only.
+                        pass
 
 
 class CapabilityScopedModule(types.ModuleType):

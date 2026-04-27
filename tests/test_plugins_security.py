@@ -555,6 +555,55 @@ def test_from_import_capability_gated_submodule_requires_allow(
     assert "network" in msg or "urllib" in msg
 
 
+def test_from_import_capability_gated_submodule_loads_with_grant(
+    tmp_path: Path,
+) -> None:
+    """Grant counterpart for ``test_from_import_capability_gated_submodule_requires_allow``.
+
+    Audit Cross-Cutting Recommendation #3 doubling rule: ``from urllib
+    import request`` resolves to ``urllib.request`` (NETWORK-gated). With
+    NETWORK in both manifest.allow AND the runtime grant, the import
+    succeeds and the wrapped module attribute access is permitted.
+
+    Pins that the from-form Gate-1 child-classifier in Commit baeb6c6
+    correctly admits capability-gated submodules under matching grants —
+    NOT just rejecting them.
+    """
+    plugin = _write_plugin(
+        tmp_path,
+        "fromnet_ok",
+        """
+        from urllib import request
+
+        def register(r):
+            @r.tool()
+            def go() -> str:
+                # Mere reference is enough — Gate 3 only fires on call;
+                # we don't want to actually hit the network in tests.
+                _ = request
+                return "ok"
+        """,
+    )
+    grant = CapabilityGrant(
+        capabilities=frozenset(
+            {Capability.NETWORK, Capability.CLOCK, Capability.RANDOM}
+        )
+    )
+    reg = ToolRegistry()
+    load_plugin(
+        PluginManifest(
+            name="fromnet_ok",
+            module=str(plugin),
+            kind="file",
+            allow=frozenset({Capability.NETWORK}),
+        ),
+        reg,
+        grant,
+    )
+    fn = reg.get_callable("go")
+    assert fn() == "ok"
+
+
 def test_from_import_attr_of_allowed_module_still_works(
     tmp_path: Path,
 ) -> None:
@@ -852,6 +901,120 @@ def test_legitimate_getattr_with_constant_default_still_works(
 # ---------------------------------------------------------------------------
 # Sandbox B safe-builtins substitution (audit finding #4)
 # ---------------------------------------------------------------------------
+
+
+def test_fs_write_grant_plugin_can_open_files_at_top_level(
+    tmp_path: Path,
+) -> None:
+    """Grant counterpart for ``test_zero_cap_plugin_cannot_open_files_at_top_level``.
+
+    Audit Cross-Cutting Recommendation #3 doubling rule: a plugin granted
+    FILESYSTEM_WRITE successfully writes a file at top level via the
+    capability-conditional ``open`` rebinding in ``_build_safe_builtins``.
+
+    Pins that the deny path is selective — Sandbox B's redaction is keyed
+    to the grant, not blanket-removed.
+    """
+    marker = tmp_path / "wrote_with_grant"
+    plugin_path = _write_plugin(
+        tmp_path,
+        "fswrite_ok",
+        f"""
+        # FS_WRITE-granted plugin writes a marker file at top level.
+        open({str(marker)!r}, "w").write("ok")
+
+        def register(r):
+            pass
+        """,
+    )
+    grant = CapabilityGrant(
+        capabilities=frozenset(
+            {
+                Capability.FILESYSTEM_WRITE,
+                Capability.CLOCK,
+                Capability.RANDOM,
+            }
+        )
+    )
+    load_plugin(
+        PluginManifest(
+            name="fswrite_ok",
+            module=str(plugin_path),
+            kind="file",
+            allow=frozenset({Capability.FILESYSTEM_WRITE}),
+        ),
+        ToolRegistry(),
+        grant,
+    )
+    assert marker.exists() and marker.read_text() == "ok"
+
+
+def test_fs_read_grant_plugin_can_open_files_for_read_but_not_write(
+    tmp_path: Path,
+) -> None:
+    """FS_READ grant gives a wrapper ``open`` that rejects write modes.
+
+    Defense-in-depth pin: the capability_open helper returns a gated
+    wrapper at FS_READ-only grant; write attempts raise
+    CapabilityDeniedError. Documents the FS_READ < FS_WRITE relationship
+    encoded in capability_open.
+    """
+    target = tmp_path / "readable.txt"
+    target.write_text("hello")
+
+    plugin_path = _write_plugin(
+        tmp_path,
+        "fsread_ok",
+        f"""
+        _content = open({str(target)!r}, "r").read()
+
+        def register(r):
+            pass
+        """,
+    )
+    grant = CapabilityGrant(
+        capabilities=frozenset(
+            {
+                Capability.FILESYSTEM_READ,
+                Capability.CLOCK,
+                Capability.RANDOM,
+            }
+        )
+    )
+    load_plugin(
+        PluginManifest(
+            name="fsread_ok",
+            module=str(plugin_path),
+            kind="file",
+            allow=frozenset({Capability.FILESYSTEM_READ}),
+        ),
+        ToolRegistry(),
+        grant,
+    )
+    # Now confirm a write attempt at FS_READ-only grant raises.
+    target_write = tmp_path / "should_fail.txt"
+    plugin_path_w = _write_plugin(
+        tmp_path,
+        "fsread_write",
+        f"""
+        open({str(target_write)!r}, "w").write("denied")
+
+        def register(r):
+            pass
+        """,
+    )
+    with pytest.raises(CapabilityDeniedError):
+        load_plugin(
+            PluginManifest(
+                name="fsread_write",
+                module=str(plugin_path_w),
+                kind="file",
+                allow=frozenset({Capability.FILESYSTEM_READ}),
+            ),
+            ToolRegistry(),
+            grant,
+        )
+    assert not target_write.exists()
 
 
 def test_zero_cap_plugin_cannot_open_files_at_top_level(
