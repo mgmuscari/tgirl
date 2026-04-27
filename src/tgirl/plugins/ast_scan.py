@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from tgirl.plugins.capability_modules import (
     CAPABILITY_MODULES,
-    _ImportClassification,
+    ImportClassification,
     classify_import,
 )
 from tgirl.plugins.errors import PluginASTRejectedError
@@ -247,6 +247,65 @@ def scan_source(
             imports.add(name)
             _check_one_import(plugin_name, name, node.lineno, allow, caps_needed)
 
+            # AUDIT FINDING #2 BLOCKING-FOLLOWUP: ``from X import Y`` may be
+            # importing a SUBMODULE Y, not just an attribute of X. CPython's
+            # `from X import Y` semantics try ``X.Y`` as a submodule when Y
+            # isn't an attribute. Pre-fix, the AST scan only validated X
+            # against ``allow`` — the submodule path Y was unchecked, allowing
+            # ``from tgirl.plugins import capability_modules`` to evade the
+            # ban on ``tgirl.plugins.capability_modules``.
+            #
+            # Asymmetric handling required:
+            #   - BANNED submodule path → reject (covers the bypass).
+            #   - Capability-gated submodule path → reject if not in `allow`
+            #     (covers ``from urllib import request`` at zero NETWORK).
+            #   - ALWAYS_ALLOWED / UNKNOWN child of an allowed parent → permit
+            #     (covers ``from collections import abc`` where ``abc`` is
+            #     just a submodule of always-allowed ``collections``, AND
+            #     covers ``from registry import ToolRegistry`` where the
+            #     name is an attribute, not a submodule).
+            for alias in node.names:
+                if alias.name == "*":
+                    raise PluginASTRejectedError(
+                        plugin_name,
+                        "wildcard_import",
+                        f"line {node.lineno}: `from {node.module} import *` "
+                        "is not permitted (uncontrolled namespace pollution; "
+                        "name every imported binding explicitly)",
+                    )
+                candidate = f"{node.module}.{alias.name}"
+                child_cls = classify_import(candidate)
+                if child_cls is ImportClassification.BANNED:
+                    raise PluginASTRejectedError(
+                        plugin_name,
+                        "banned_module",
+                        f"line {node.lineno}: `from {node.module} import "
+                        f"{alias.name}` resolves to banned module "
+                        f"{candidate!r}",
+                    )
+                if isinstance(child_cls, Capability):
+                    # The submodule needs a capability — fold into the same
+                    # checks as a top-level import of the dotted path.
+                    if child_cls in (Capability.CLOCK, Capability.RANDOM):
+                        caps_needed.add(child_cls)
+                    elif child_cls not in allow:
+                        raise PluginASTRejectedError(
+                            plugin_name,
+                            "undeclared_capability",
+                            f"line {node.lineno}: `from {node.module} "
+                            f"import {alias.name}` resolves to {candidate!r} "
+                            f"which requires capability "
+                            f"{child_cls.value!r}; declare "
+                            f"'allow = [..., {child_cls.value!r}]' in the "
+                            "plugin's TOML manifest",
+                        )
+                    else:
+                        caps_needed.add(child_cls)
+                # ALWAYS_ALLOWED or UNKNOWN: do not reject. UNKNOWN here is
+                # likely an attribute of an allowed module (the common case),
+                # not a submodule import — the parent classification already
+                # gave the green light.
+
         # --- Forbidden name references ---
         elif isinstance(node, ast.Name):
             if node.id in FORBIDDEN_NAMES:
@@ -308,7 +367,7 @@ def _check_one_import(
     """
     cls = classify_import(dotted)
 
-    if cls is _ImportClassification.BANNED:
+    if cls is ImportClassification.BANNED:
         raise PluginASTRejectedError(
             plugin_name,
             "banned_module",
@@ -316,10 +375,10 @@ def _check_one_import(
             "tier (use a tgirl proxy module instead)",
         )
 
-    if cls is _ImportClassification.ALWAYS_ALLOWED:
+    if cls is ImportClassification.ALWAYS_ALLOWED:
         return
 
-    if cls is _ImportClassification.UNKNOWN:
+    if cls is ImportClassification.UNKNOWN:
         raise PluginASTRejectedError(
             plugin_name,
             "unknown_module",
@@ -328,8 +387,14 @@ def _check_one_import(
             "or an always-allowed stdlib module",
         )
 
-    # Capability-gated. cls is a Capability enum here.
-    assert isinstance(cls, Capability)
+    # Capability-gated. cls is a Capability enum here. Use a real type check
+    # rather than ``assert`` so the behavior is preserved under ``python -O``.
+    if not isinstance(cls, Capability):
+        msg = (
+            f"classify_import returned unexpected type {type(cls).__name__} "
+            f"for {dotted!r}; this indicates a logic error in the classifier"
+        )
+        raise RuntimeError(msg)
     cap = cls
     # CLOCK and RANDOM are always granted — no declaration needed.
     if cap in (Capability.CLOCK, Capability.RANDOM):

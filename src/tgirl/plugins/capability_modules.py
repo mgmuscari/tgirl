@@ -24,6 +24,7 @@ Task 6 adds purpose-built proxy modules (``env_proxy``, ``subprocess_proxy``,
 
 from __future__ import annotations
 
+import enum
 import types
 from typing import Any
 
@@ -230,12 +231,17 @@ def capability_open(
     return _gated_open
 
 
-class _ImportClassification:
-    """Marker types for ``classify_import``'s return value.
+class ImportClassification(str, enum.Enum):
+    """Marker enum for non-capability return values from ``classify_import``.
 
-    Sentinels are class attributes (not instances) so identity comparisons
-    work cleanly with ``is``. Capability-mapped imports return the
-    ``Capability`` enum directly — no wrapping needed.
+    Singleton members enable safe ``is``-comparison. Capability-mapped
+    imports return the ``Capability`` enum directly; non-capability
+    classifications use this enum.
+
+    Public (no leading underscore) because both ``ast_scan`` (Gate 1) and
+    ``is_allowed_for_grant`` (Gate 2 helper) reference these members across
+    module boundaries — the original ``_ImportClassification`` private name
+    was a code smell flagged in code review.
     """
 
     BANNED = "BANNED"
@@ -243,14 +249,18 @@ class _ImportClassification:
     UNKNOWN = "UNKNOWN"
 
 
-def classify_import(dotted: str) -> str | Capability:
+# Backwards-compatibility alias. Drop after one release cycle.
+_ImportClassification = ImportClassification
+
+
+def classify_import(dotted: str) -> ImportClassification | Capability:
     """Single source of truth for "what is this import?"
 
     Returns one of:
-      - ``_ImportClassification.BANNED`` — never importable, any grant.
-      - ``_ImportClassification.ALWAYS_ALLOWED`` — importable at any grant.
+      - ``ImportClassification.BANNED`` — never importable, any grant.
+      - ``ImportClassification.ALWAYS_ALLOWED`` — importable at any grant.
       - ``Capability(...)`` — gated by the named capability.
-      - ``_ImportClassification.UNKNOWN`` — not in any classification bucket;
+      - ``ImportClassification.UNKNOWN`` — not in any classification bucket;
         callers MUST reject (Gate 1) — unknown stdlib reaches an unknown
         module, which historically has surfaced as a bypass.
 
@@ -268,7 +278,7 @@ def classify_import(dotted: str) -> str | Capability:
     # Bans are exact-or-root match; any stdlib OS escape and any tgirl-internal
     # plugin module trips here first, before reaching the allow paths.
     if dotted in BANNED_MODULES or root in BANNED_MODULES:
-        return _ImportClassification.BANNED
+        return ImportClassification.BANNED
 
     # Capability-mapped modules take precedence over the always-allowed list
     # so that proxy modules under tgirl.plugins.capabilities are gated by
@@ -285,11 +295,11 @@ def classify_import(dotted: str) -> str | Capability:
     #    arbitrary `tgirl.<anything>` from being reachable via the wildcard
     #    root match — closes audit finding #2's reach vector at the source.
     if dotted in ALWAYS_ALLOWED_MODULES:
-        return _ImportClassification.ALWAYS_ALLOWED
+        return ImportClassification.ALWAYS_ALLOWED
     if root in ALWAYS_ALLOWED_MODULES and root != "tgirl":
-        return _ImportClassification.ALWAYS_ALLOWED
+        return ImportClassification.ALWAYS_ALLOWED
 
-    return _ImportClassification.UNKNOWN
+    return ImportClassification.UNKNOWN
 
 
 def is_allowed_for_grant(
@@ -302,15 +312,22 @@ def is_allowed_for_grant(
     of truth.
     """
     cls = classify_import(dotted)
-    if cls is _ImportClassification.BANNED:
+    if cls is ImportClassification.BANNED:
         return False
-    if cls is _ImportClassification.ALWAYS_ALLOWED:
+    if cls is ImportClassification.ALWAYS_ALLOWED:
         return True
-    if cls is _ImportClassification.UNKNOWN:
+    if cls is ImportClassification.UNKNOWN:
         # Unknown imports are NOT allowed for runtime grants either — the
         # Gate 1 author-hygiene scan rejects them; if we somehow reach here
         # with one, fail-closed.
         return False
-    # Otherwise it's a Capability enum — gate by the grant.
-    assert isinstance(cls, Capability)
+    # Otherwise it's a Capability enum — gate by the grant. Use a real
+    # type-check rather than ``assert`` so the behavior is preserved
+    # under ``python -O`` (asserts are stripped at optimization level 1+).
+    if not isinstance(cls, Capability):
+        msg = (
+            f"classify_import returned unexpected type {type(cls).__name__}; "
+            "this indicates a logic error in the classifier"
+        )
+        raise RuntimeError(msg)
     return cls in granted

@@ -425,48 +425,171 @@ def test_from_import_through_capability_scoped_module(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "import_stmt",
+    [
+        "import tgirl.plugins.capability_modules as cm",
+        "from tgirl.plugins import capability_modules as cm",
+        "from tgirl.plugins import capability_modules",
+        "from tgirl.plugins.capability_modules import CAPABILITY_MODULES",
+    ],
+)
 def test_zero_cap_plugin_cannot_import_internal_capability_modules(
-    tmp_path: Path,
+    tmp_path: Path, import_stmt: str
 ) -> None:
     """Audit finding #2 PoC: dict-mutation privilege escalation.
 
-    Attack: a zero-capability plugin imports
-    ``tgirl.plugins.capability_modules`` (reachable at zero grant via the
-    wildcard ``tgirl`` root in ALWAYS_ALLOWED) and mutates the shared
-    ``CAPABILITY_MODULES`` dict to remap a sensitive module (e.g. ``socket``)
-    from NETWORK to a default-granted capability (CLOCK). A second plugin
-    then ``import socket`` and gets the real, unwrapped module.
+    Attack: a zero-capability plugin reaches
+    ``tgirl.plugins.capability_modules`` (reachable via the wildcard
+    ``tgirl`` root in ALWAYS_ALLOWED in the pre-fix state) and mutates the
+    shared ``CAPABILITY_MODULES`` dict — or rebinds it as a module attribute —
+    to remap a sensitive module (e.g. ``socket``) from NETWORK to a default-
+    granted capability (CLOCK). A second plugin then ``import socket`` and
+    receives the real, unwrapped module.
 
     Defense: tgirl's internal plugin-machinery modules
     (``capability_modules``, ``guard``, ``loader``, ``ast_scan``, ``config``,
-    ``errors``) are explicitly banned at Gate 1 and Gate 2. Plugin authors
-    have no business reaching them.
+    ``errors``) are explicitly banned at Gate 1 and Gate 2. Both ``import``
+    and ``from``-form imports must reject; wildcard imports must reject.
+    Parametrized over the four canonical reach forms — Commit 2's first
+    iteration only closed the ``import X`` form, leaving the ``from`` paths
+    open. Reviewer reproduced the bypass on 9bb808b. Re-closed in this
+    follow-up.
     """
-    # First, the import in plugin A must be rejected at Gate 1.
-    plugin_a = _write_plugin(
+    plugin = _write_plugin(
         tmp_path,
-        "esc_a",
-        """
-        import tgirl.plugins.capability_modules as cm
-        from tgirl.plugins.types import Capability
-        cm.CAPABILITY_MODULES[Capability.NETWORK] = frozenset()
-        cm.CAPABILITY_MODULES[Capability.CLOCK] = (
-            frozenset({"socket"}) | cm.CAPABILITY_MODULES[Capability.CLOCK]
-        )
+        "esc",
+        f"""
+        {import_stmt}
 
         def register(r):
             pass
         """,
     )
-    manifest_a = PluginManifest(
-        name="esc_a",
-        module=str(plugin_a),
+    manifest = PluginManifest(
+        name="esc",
+        module=str(plugin),
         kind="file",
         allow=frozenset(),
     )
     with pytest.raises(PluginASTRejectedError) as exc:
-        load_plugin(manifest_a, ToolRegistry(), CapabilityGrant.zero())
-    assert "tgirl.plugins.capability_modules" in str(exc.value)
+        load_plugin(manifest, ToolRegistry(), CapabilityGrant.zero())
+    # The plugin name is rejected via either the parent-module path or the
+    # banned-submodule path; either way, ``capability_modules`` appears in
+    # the error context.
+    assert "capability_modules" in str(exc.value)
+
+
+def test_wildcard_from_import_rejected(tmp_path: Path) -> None:
+    """``from X import *`` permits uncontrolled namespace pollution.
+
+    Even when X is ALWAYS_ALLOWED, a wildcard-import dumps every public
+    name into the plugin's globals. If any future stdlib re-export shape
+    introduces a sensitive binding by accident (e.g. an alias to a forbidden
+    name), the plugin gets it. Reject across the board; plugins must name
+    every binding explicitly.
+
+    Reviewer-flagged hardening alongside the from-form bypass fix.
+    """
+    plugin = _write_plugin(
+        tmp_path,
+        "wild",
+        """
+        from collections import *
+
+        def register(r):
+            pass
+        """,
+    )
+    with pytest.raises(PluginASTRejectedError) as exc:
+        load_plugin(
+            PluginManifest(
+                name="wild",
+                module=str(plugin),
+                kind="file",
+                allow=frozenset(),
+            ),
+            ToolRegistry(),
+            CapabilityGrant.zero(),
+        )
+    assert "wildcard_import" in str(exc.value) or "*" in str(exc.value)
+
+
+def test_from_import_capability_gated_submodule_requires_allow(
+    tmp_path: Path,
+) -> None:
+    """Reviewer-flagged correctness: ``from urllib import request`` resolves
+    to the capability-gated submodule ``urllib.request`` (NETWORK).
+
+    Pre-fix, only ``urllib`` (the parent) was checked — and ``urllib`` is
+    in CAPABILITY_MODULES[NETWORK], so the parent check already required
+    NETWORK. But for cases where the parent is ALWAYS_ALLOWED and the child
+    is capability-gated (no current example, but a future
+    ``CAPABILITY_MODULES`` entry could create one), the child also needs
+    classification. This test pins the child-classification path against
+    that class of regression.
+    """
+    # Without NETWORK in allow, this must reject.
+    plugin = _write_plugin(
+        tmp_path,
+        "fromnet",
+        """
+        from urllib import request
+
+        def register(r):
+            pass
+        """,
+    )
+    with pytest.raises(PluginASTRejectedError) as exc:
+        load_plugin(
+            PluginManifest(
+                name="fromnet",
+                module=str(plugin),
+                kind="file",
+                allow=frozenset(),
+            ),
+            ToolRegistry(),
+            CapabilityGrant.zero(),
+        )
+    msg = str(exc.value).lower()
+    assert "network" in msg or "urllib" in msg
+
+
+def test_from_import_attr_of_allowed_module_still_works(
+    tmp_path: Path,
+) -> None:
+    """Regression guard: legitimate ``from collections import OrderedDict``
+    must NOT be rejected. ``OrderedDict`` is an attribute of the always-
+    allowed ``collections`` module, not a submodule. The classifier returns
+    UNKNOWN for ``collections.OrderedDict`` (no such submodule); the
+    asymmetric-handling path treats UNKNOWN children of ALWAYS_ALLOWED
+    parents as permitted.
+
+    Pins the from-form fix's "do not reject UNKNOWN children" rule —
+    over-tightening here would break every legitimate ``from X import name``
+    usage.
+    """
+    plugin = _write_plugin(
+        tmp_path,
+        "fromcoll",
+        """
+        from collections import OrderedDict
+
+        def register(r):
+            pass
+        """,
+    )
+    # No exception expected.
+    load_plugin(
+        PluginManifest(
+            name="fromcoll",
+            module=str(plugin),
+            kind="file",
+            allow=frozenset(),
+        ),
+        ToolRegistry(),
+        CapabilityGrant.zero(),
+    )
 
 
 def test_capability_modules_dict_is_immutable() -> None:
@@ -764,9 +887,12 @@ def test_zero_cap_plugin_cannot_open_files_at_top_level(
         kind="file",
         allow=frozenset(),
     )
-    # ``open`` is absent → NameError at exec wrapped by the loader as a
-    # PluginLoadError (or propagated). Either way, the marker must NOT exist.
-    with pytest.raises(Exception):
+    # ``open`` is absent → NameError at exec; CPython wraps this as a
+    # NameError that propagates out of ``spec.loader.exec_module``. We
+    # match against NameError specifically — any broader
+    # ``pytest.raises(Exception)`` would silently swallow regressions
+    # (e.g. a SyntaxError from a fixture indentation bug). Reviewer Minor 1.
+    with pytest.raises(NameError):
         load_plugin(manifest, ToolRegistry(), CapabilityGrant.zero())
     assert not marker.exists(), (
         f"sandbox B escape: zero-cap plugin wrote {marker}; "
@@ -774,23 +900,19 @@ def test_zero_cap_plugin_cannot_open_files_at_top_level(
     )
 
 
-def test_dunder_import_absent_from_plugin_builtins(tmp_path: Path) -> None:
-    """Audit finding #5 collapse: with safe-builtins, ``__import__`` is absent.
+def test_gate1_rejects_explicit_builtins_name_reference(
+    tmp_path: Path,
+) -> None:
+    """Gate 1 rejects ``__builtins__`` as a Name reference.
 
-    With ``__builtins__`` substituted, even reflection-chain attacks that
-    reach the builtins dict find no ``__import__`` key — the terminal sink
-    is closed. The plugin probes whether ``__import__`` is reachable; the
-    expected outcome is a NameError at exec because the probe references
-    forbidden names — Gate 1 actually rejects first, but the structural
-    invariant is: a successfully-loaded zero-cap plugin must NOT see
-    ``__import__`` in its globals/builtins.
+    Defends the Sandbox B substitution from being introspected: even if a
+    plugin somehow obtains the substituted dict, AST scan refuses to let
+    them write the literal ``__builtins__`` to begin with. Pin via
+    FORBIDDEN_NAMES coverage.
     """
     plugin_path = _write_plugin(
         tmp_path,
-        "noimport_probe",
-        # Use a constant string lookup that the AST scan rejects to verify
-        # Gate 1 + Sandbox B together close every path. Gate 1 rejects the
-        # forbidden name ``__builtins__`` explicitly per FORBIDDEN_NAMES.
+        "stash_builtins",
         """
         _b = __builtins__
 
@@ -801,7 +923,7 @@ def test_dunder_import_absent_from_plugin_builtins(tmp_path: Path) -> None:
     with pytest.raises(PluginASTRejectedError):
         load_plugin(
             PluginManifest(
-                name="noimport_probe",
+                name="stash_builtins",
                 module=str(plugin_path),
                 kind="file",
                 allow=frozenset(),
@@ -809,6 +931,84 @@ def test_dunder_import_absent_from_plugin_builtins(tmp_path: Path) -> None:
             ToolRegistry(),
             CapabilityGrant.zero(),
         )
+
+
+def test_safe_builtins_redactions_and_retentions() -> None:
+    """Encode the Sandbox B safe-builtins contract as an executable test.
+
+    PRP §Task 4 §Sandbox B specifies the redacted-and-retained sets. This
+    test pins the contract — including the deliberate ``__import__``
+    DEVIATION from PRP. A future agent who tries to "fix" the deviation
+    by removing ``__import__`` from ``_build_safe_builtins`` will see this
+    test fail with a docstring pointing at the Sandbox B helper for the
+    rationale.
+
+    Audit finding #4 / Commit 1 deviation pin (reviewer Sig 1).
+    """
+    from tgirl.plugins.loader import _build_safe_builtins
+
+    # At zero grant, the redacted set is at its minimum size.
+    safe = _build_safe_builtins(CapabilityGrant.zero())
+
+    # PRP-mandated redactions:
+    redacted = ("open", "exec", "eval", "compile", "breakpoint", "input")
+    for name in redacted:
+        assert name not in safe, (
+            f"PRP §Sandbox B violated: {name!r} must NOT be in plugin builtins "
+            "at zero grant."
+        )
+
+    # DEVIATION FROM PRP §3 — see _build_safe_builtins docstring for the
+    # full rationale. Removing ``__import__`` breaks every legitimate
+    # plugin because CPython's IMPORT_NAME opcode looks it up in
+    # f_builtins. The security property attributed to its removal is
+    # preserved via Gate 2 (meta_path) and AST FORBIDDEN_NAMES on the
+    # literal name.
+    assert "__import__" in safe, (
+        "DELIBERATE DEVIATION: `__import__` MUST remain in plugin builtins. "
+        "See _build_safe_builtins docstring before changing this test or "
+        "the implementation. Removing __import__ breaks every legitimate "
+        "plugin (IMPORT_NAME opcode requires it)."
+    )
+
+    # Sanity: legitimate names are present.
+    for name in ("len", "range", "isinstance", "print", "list", "dict"):
+        assert name in safe, f"safe builtins missing legitimate name {name!r}"
+
+
+def test_safe_builtins_open_grants() -> None:
+    """The capability-conditional ``open`` rebinding works at FS_READ /
+    FS_WRITE / both / neither.
+
+    Pins the wiring of ``capability_open`` into ``_build_safe_builtins``.
+    """
+    from tgirl.plugins.loader import _build_safe_builtins
+
+    # Zero grant → no `open`.
+    safe = _build_safe_builtins(CapabilityGrant.zero())
+    assert "open" not in safe
+
+    # FS_READ → `open` present, but writes denied (gated wrapper).
+    safe_r = _build_safe_builtins(
+        CapabilityGrant(
+            capabilities=frozenset(
+                {Capability.FILESYSTEM_READ, Capability.CLOCK, Capability.RANDOM}
+            )
+        )
+    )
+    assert "open" in safe_r
+    assert callable(safe_r["open"])
+
+    # FS_WRITE → `open` present (raw builtin per capability_open semantics).
+    safe_w = _build_safe_builtins(
+        CapabilityGrant(
+            capabilities=frozenset(
+                {Capability.FILESYSTEM_WRITE, Capability.CLOCK, Capability.RANDOM}
+            )
+        )
+    )
+    assert "open" in safe_w
+    assert callable(safe_w["open"])
 
 
 # ---------------------------------------------------------------------------
