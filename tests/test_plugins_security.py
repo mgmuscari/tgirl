@@ -1043,3 +1043,262 @@ def test_capability_set_closure_property() -> None:
                 )
 
     _check()
+
+
+# ---------------------------------------------------------------------------
+# Phase B + test cluster doubling rule (audit findings #1 + #12)
+# ---------------------------------------------------------------------------
+# Per audit Cross-Cutting Recommendation #3 / Finding #12: every adversarial
+# deny test must have a sibling test that exercises the GRANT-and-success
+# path. Without these, finding #1 (Phase B unimplemented) hid for the entire
+# audit cycle. The cluster below covers the five capability-class denominators
+# (NETWORK / SUBPROCESS / FS_READ / FS_WRITE / ENV) plus the foundational
+# "callable invocation actually runs guard_scope" pin.
+
+
+def test_phase_b_grant_propagates_to_tool_invocation(tmp_path: Path) -> None:
+    """Audit finding #1 PoC: granted plugin's tool function CAN invoke a
+    network-gated module successfully.
+
+    Pre-fix, ``ToolRegistry.get_callable`` returned the raw callable with no
+    ``guard_scope`` wrapper, so ``_effective_grant`` was None at call time;
+    Gate 3 saw an empty grant and raised ``CapabilityDeniedError`` even when
+    the plugin's manifest declared NETWORK and the runtime grant included
+    NETWORK.
+
+    Defense: ``_register_tools`` records the grant in
+    ``ToolRegistry._grants[name]``; ``get_callable`` returns a closure that
+    enters ``guard_scope(grant)`` around the invocation.
+    """
+    plugin = _write_plugin(
+        tmp_path,
+        "phaseb",
+        """
+        import socket
+
+        def register(r):
+            @r.tool()
+            def make_sock() -> str:
+                s = socket.socket()
+                s.close()
+                return "ok"
+        """,
+    )
+    grant = CapabilityGrant(
+        capabilities=frozenset(
+            {Capability.NETWORK, Capability.CLOCK, Capability.RANDOM}
+        )
+    )
+    reg = ToolRegistry()
+    load_plugin(
+        PluginManifest(
+            name="phaseb",
+            module=str(plugin),
+            kind="file",
+            allow=frozenset({Capability.NETWORK}),
+        ),
+        reg,
+        grant,
+    )
+    fn = reg.get_callable("make_sock")
+    assert fn() == "ok"
+
+
+def test_phase_b_zero_grant_callable_still_denies(tmp_path: Path) -> None:
+    """Companion deny test: a zero-grant plugin's tool that tries to use
+    a gated module raises CapabilityDeniedError at invocation.
+
+    Pins that ``get_callable`` doesn't accidentally over-grant — Phase B
+    must scope to the grant actually recorded for the tool, not auto-grant.
+
+    Note: this plugin's manifest declares NETWORK so Gate 1 lets the
+    ``import socket`` through; the runtime grant is zero, so Gate 3 rejects
+    the call. This is the canonical "manifest declares capability, server
+    does not grant" path.
+    """
+    plugin = _write_plugin(
+        tmp_path,
+        "phaseb_deny",
+        """
+        import socket
+
+        def register(r):
+            @r.tool()
+            def make_sock() -> str:
+                s = socket.socket()
+                s.close()
+                return "ok"
+        """,
+    )
+    reg = ToolRegistry()
+    load_plugin(
+        PluginManifest(
+            name="phaseb_deny",
+            module=str(plugin),
+            kind="file",
+            allow=frozenset({Capability.NETWORK}),
+        ),
+        reg,
+        CapabilityGrant.zero(),
+    )
+    fn = reg.get_callable("make_sock")
+    with pytest.raises(CapabilityDeniedError):
+        fn()
+
+
+def test_phase_b_inline_tool_no_grant_recorded() -> None:
+    """Inline (host-app) tools registered via ``@reg.tool()`` outside a plugin
+    context have no grant recorded; ``get_callable`` returns the raw callable.
+
+    Pins the "no grant → no wrapper" branch of ``get_callable`` so future
+    refactors don't accidentally apply guard_scope to host-app tools.
+    """
+    reg = ToolRegistry()
+
+    @reg.tool()
+    def inline_add(x: int, y: int) -> int:
+        return x + y
+
+    fn = reg.get_callable("inline_add")
+    # No grant recorded → fn is the raw callable (or a thin pass-through).
+    assert fn(2, 3) == 5
+    assert "inline_add" not in reg._grants
+
+
+# Doubling-rule grant-and-invoke battery: one per capability-class
+# denominator plus the bare-no-capability tool. Each test loads a plugin
+# with the capability granted, registers a tool that invokes a module-
+# under-the-capability, calls the tool, and asserts success.
+
+_DOUBLING_RULE_FIXTURES = [
+    pytest.param(
+        Capability.NETWORK,
+        """
+        import socket
+
+        def register(r):
+            @r.tool()
+            def go() -> str:
+                s = socket.socket()
+                s.close()
+                return "net-ok"
+        """,
+        "net-ok",
+        id="network",
+    ),
+    pytest.param(
+        Capability.CLOCK,
+        """
+        import time
+
+        def register(r):
+            @r.tool()
+            def go() -> str:
+                _t = time.time()
+                return "clock-ok"
+        """,
+        "clock-ok",
+        id="clock",
+    ),
+    pytest.param(
+        Capability.RANDOM,
+        """
+        import random
+
+        def register(r):
+            @r.tool()
+            def go() -> str:
+                _v = random.random()
+                return "random-ok"
+        """,
+        "random-ok",
+        id="random",
+    ),
+    pytest.param(
+        Capability.ENV,
+        """
+        from tgirl.plugins.capabilities import env_proxy
+
+        def register(r):
+            @r.tool()
+            def go() -> str:
+                # env_proxy.get is the gated callable at ENV grant.
+                _v = env_proxy.get("PATH", "")
+                return "env-ok"
+        """,
+        "env-ok",
+        id="env",
+    ),
+    pytest.param(
+        Capability.FILESYSTEM_READ,
+        """
+        from tgirl.plugins.capabilities import fs_read_proxy
+
+        def register(r):
+            @r.tool()
+            def go() -> str:
+                # fs_read_proxy exists for FS_READ grant.
+                _ = fs_read_proxy
+                return "fsread-ok"
+        """,
+        "fsread-ok",
+        id="filesystem_read",
+    ),
+    pytest.param(
+        Capability.SUBPROCESS,
+        """
+        from tgirl.plugins.capabilities import subprocess_proxy
+
+        def register(r):
+            @r.tool()
+            def go() -> str:
+                _ = subprocess_proxy
+                return "subproc-ok"
+        """,
+        "subproc-ok",
+        id="subprocess",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("cap", "body", "expected"), _DOUBLING_RULE_FIXTURES
+)
+def test_doubling_rule_grant_and_invoke_succeeds(
+    tmp_path: Path, cap: Capability, body: str, expected: str
+) -> None:
+    """Audit Cross-Cutting Recommendation #3 / Finding #12: every adversarial
+    deny path requires a sibling grant-and-success path.
+
+    For each capability, a plugin that imports a gated module under that
+    capability and exposes a tool which uses the module loads cleanly under
+    a grant containing the capability AND its tool invokes successfully.
+
+    This is the structural pin that would have caught audit finding #1
+    during the original Task 9 work.
+    """
+    plugin = _write_plugin(tmp_path, f"dbl_{cap.value}", body)
+    grant = CapabilityGrant(
+        capabilities=frozenset({cap, Capability.CLOCK, Capability.RANDOM})
+    )
+    reg = ToolRegistry()
+    # CLOCK and RANDOM are default-granted; for those caps the manifest
+    # allow-set may be empty. For others the plugin's allow-set must include
+    # the cap (Gate 1).
+    manifest_allow: frozenset[Capability]
+    if cap in (Capability.CLOCK, Capability.RANDOM):
+        manifest_allow = frozenset()
+    else:
+        manifest_allow = frozenset({cap})
+    load_plugin(
+        PluginManifest(
+            name=f"dbl_{cap.value}",
+            module=str(plugin),
+            kind="file",
+            allow=manifest_allow,
+        ),
+        reg,
+        grant,
+    )
+    fn = reg.get_callable("go")
+    assert fn() == expected

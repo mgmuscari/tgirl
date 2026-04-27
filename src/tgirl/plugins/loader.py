@@ -259,6 +259,7 @@ def _register_tools(
     module: types.ModuleType,
     target: ToolRegistry,
     plugin_name: str,
+    grant: CapabilityGrant,
 ) -> int:
     """Integrate plugin tools into ``target`` registry with collision namespacing.
 
@@ -271,6 +272,12 @@ def _register_tools(
     new tool is namespaced as ``<plugin_name>.<function>``. If the namespaced
     form also collides, a ``DuplicatePluginNameError`` is raised — this can
     only happen if two plugins with the same name are loaded.
+
+    Audit finding #1 / Phase B: ``grant`` is recorded into
+    ``target._grants[name]`` for every tool sourced from this plugin so
+    that ``ToolRegistry.get_callable`` can wrap invocation in
+    ``guard_scope(grant)``. Without this, granted plugins fail-closed at
+    the first capability-gated call.
     """
     # For the register()-callable strategy we can't intercept each tool
     # registration, so we register into a scratch registry and merge.
@@ -290,11 +297,12 @@ def _register_tools(
 
     for name in scratch.names():
         tool_def = scratch._tools[name]
-        callable_fn = scratch.get_callable(name)
+        callable_fn = scratch._callables[name]  # raw, NOT through get_callable
         if name not in target._tools:
             target._tools[name] = tool_def
             target._callables[name] = callable_fn
             target._sources[name] = plugin_name
+            target._grants[name] = grant
             continue
 
         # Collision → promote to <plugin>.<name>.
@@ -310,6 +318,7 @@ def _register_tools(
         target._tools[namespaced] = namespaced_def
         target._callables[namespaced] = callable_fn
         target._sources[namespaced] = plugin_name
+        target._grants[namespaced] = grant
         logger.info(
             "plugin_tool_namespaced_on_collision",
             original=name,
@@ -369,7 +378,7 @@ def load_plugin(
         module = _import_plugin_module(
             manifest, resolved_kind, module_name, grant
         )
-        _register_tools(module, registry, manifest.name)
+        _register_tools(module, registry, manifest.name, grant)
 
     logger.info(
         "plugin_loaded",

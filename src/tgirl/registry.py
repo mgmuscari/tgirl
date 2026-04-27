@@ -130,6 +130,19 @@ class ToolRegistry:
         # PRP Task 10 §"Approach" — enables plugin-level dedup and Task 11
         # `/telemetry` `source` field.
         self._sources: dict[str, str] = {}
+        # Parallel dict: tool_name → CapabilityGrant. Audit finding #1 / Phase B.
+        # When a tool is registered with a grant (i.e. via plugin loading), the
+        # grant is recorded here so ``get_callable`` can scope ``guard_scope``
+        # around invocation. Tools registered via the ``@tool()`` decorator
+        # without plugin context (e.g. host-app inline registration) have no
+        # entry — ``get_callable`` returns the raw callable in that case.
+        from tgirl.plugins.types import (  # local import: avoids cycle
+            CapabilityGrant,
+        )
+
+        self._grants: dict[str, CapabilityGrant] = {}
+        # Forward-declare the ImportError-pinned cycle so mypy sees the type.
+        _ = CapabilityGrant
 
     def tool(
         self,
@@ -426,14 +439,45 @@ class ToolRegistry:
         return self._tools[name]
 
     def get_callable(self, name: str) -> Callable[..., Any]:
-        """Get the original callable for a registered tool.
+        """Get the registered callable for a tool.
+
+        Audit finding #1 / Phase B: if the tool was registered with a
+        ``CapabilityGrant`` (i.e. via plugin loading), the returned callable
+        wraps the underlying invocation in a ``guard_scope(grant)`` block so
+        that Gate 2 (meta_path finder) and Gate 3 (CapabilityScopedModule)
+        observe the grant during execution.
+
+        Tools registered via the bare ``@tool()`` decorator without plugin
+        context have no recorded grant; ``get_callable`` returns the raw
+        callable for them — preserving the host-app convention of
+        unconstrained inline tools.
 
         Raises:
             KeyError: If the tool is not registered.
         """
         if name not in self._callables:
             raise KeyError(name)
-        return self._callables[name]
+        raw = self._callables[name]
+        grant = self._grants.get(name)
+        if grant is None:
+            return raw
+
+        # Phase B wrapper: enter guard_scope around every invocation. The
+        # wrapper preserves the original callable's signature transparently;
+        # callers receive the same return value, with the same exception
+        # propagation semantics.
+        from tgirl.plugins.guard import guard_scope  # local: avoids cycle
+
+        def _grant_scoped(*args: Any, **kwargs: Any) -> Any:
+            with guard_scope(grant):
+                return raw(*args, **kwargs)
+
+        # Surface the wrapped callable's identity so introspection still
+        # shows the underlying name. Defensive — registry callers that
+        # rely on ``__name__`` won't be surprised.
+        _grant_scoped.__name__ = getattr(raw, "__name__", name)
+        _grant_scoped.__qualname__ = getattr(raw, "__qualname__", name)
+        return _grant_scoped
 
     def sanitized_rule_names(self) -> dict[str, str]:
         """Return ``{tool_name: sanitized_rule_slug}`` for every registered tool.

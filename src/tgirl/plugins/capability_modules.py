@@ -121,6 +121,17 @@ ALWAYS_ALLOWED_MODULES: frozenset[str] = frozenset(
         "tgirl.types",
         "tgirl.plugins",
         "tgirl.plugins.types",
+        # Proxy-package namespace. Plugins reach the leaf proxies via
+        # ``from tgirl.plugins.capabilities import fs_read_proxy`` (or
+        # similar); the leaf modules themselves are capability-gated in
+        # CAPABILITY_MODULES, so the package-level import is just a
+        # pass-through. Bare ``import tgirl.plugins.capabilities`` does
+        # not grant access to the submodules — Python only triggers
+        # submodule import when the attribute is referenced via an
+        # explicit ``import`` or ``from`` statement, which Gate 2 then
+        # wraps. Adding this entry resolves the from-form parent check
+        # without weakening the leaf gating.
+        "tgirl.plugins.capabilities",
         "typing",
         "collections",
         "collections.abc",
