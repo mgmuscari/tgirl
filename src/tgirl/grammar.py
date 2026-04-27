@@ -66,6 +66,32 @@ def _sanitize_rule_name(name: str) -> str:
     return _RULE_NAME_SUB.sub("_", name.lower())
 
 
+def _escape_lark_string_terminal(s: str) -> str:
+    """Escape a string for emission inside a Lark ``"..."`` terminal.
+
+    Audit finding #6: tool names land inside Lark string terminals
+    (e.g. ``"(" "tool_name" ")"``). A name containing a literal ``"`` would
+    split one terminal into multiple terminals + bare identifiers, opening
+    grammar-drift attacks. The registry's charset validator
+    (``_validate_tool_name``) prevents quote characters from reaching here
+    in normal operation, but this helper is the defense-in-depth backstop:
+    even if a future loader path bypasses the registry validator, every
+    grammar emission goes through this escape.
+
+    Lark string-terminal escape contract:
+      - ``\\``  → ``\\\\``  (escape the escape character first)
+      - ``"``   → ``\\"``   (escape the terminator)
+
+    >>> _escape_lark_string_terminal("plain")
+    'plain'
+    >>> _escape_lark_string_terminal('a"b')
+    'a\\\\"b'
+    >>> _escape_lark_string_terminal('a\\\\b')
+    'a\\\\\\\\b'
+    """
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 class Production(BaseModel):
     """A single grammar production rule."""
 
@@ -322,9 +348,16 @@ def _tool_to_rules(
             param_type_names.append(type_name)
             prods.extend(_type_to_rule(param.type_repr, type_name, config))
 
+    # Audit finding #6: every emission of tool.name into a Lark string
+    # terminal goes through _escape_lark_string_terminal. The registry's
+    # charset validator prevents quote characters from reaching here in
+    # normal operation; this is defense-in-depth for any path that might
+    # bypass registry validation in the future.
+    name_terminal = _escape_lark_string_terminal(tool.name)
+
     if not tool.parameters:
         # No parameters: (tool_name)
-        rule = f'"(" "{tool.name}" ")"'
+        rule = f'"(" "{name_terminal}" ")"'
         prods.insert(0, Production(name=f"call_{sanitized}", rule=rule))
         return prods
 
@@ -355,10 +388,10 @@ def _tool_to_rules(
         args = " SPACE ".join(parts)
 
     if req_count > 0:
-        rule = f'"(" "{tool.name}" SPACE {args} ")"'
+        rule = f'"(" "{name_terminal}" SPACE {args} ")"'
     else:
         # All-optional: space is part of the optional group
-        rule = f'"(" "{tool.name}" {args} ")"'
+        rule = f'"(" "{name_terminal}" {args} ")"'
     prods.insert(0, Production(name=f"call_{sanitized}", rule=rule))
     return prods
 
@@ -470,7 +503,10 @@ def generate_routing_grammar(
     if not snapshot.tools:
         msg = "Cannot generate routing grammar for empty snapshot"
         raise ValueError(msg)
-    alternatives = " | ".join(f'"{tool.name}"' for tool in snapshot.tools)
+    alternatives = " | ".join(
+        f'"{_escape_lark_string_terminal(tool.name)}"'
+        for tool in snapshot.tools
+    )
     if top_k <= 1:
         return f"start: tool_choice\ntool_choice: {alternatives}\n"
     # Build trailing optional chain for bounded repetition.

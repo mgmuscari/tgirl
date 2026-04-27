@@ -15,11 +15,20 @@ Semantics (per PRP §Task 2):
 - Unknown capability in ``allow`` → ``InvalidPluginConfigError``.
 - File-declared order preserved (``tomllib`` returns insertion-ordered dicts).
 - Disabled plugins excluded from the returned list.
+
+Audit finding #7: ``module`` field validation. The original parser accepted
+arbitrary strings, including ``../../../tmp/attacker.py`` — a path-traversal
+vector if config authorship is hostile. Validator now requires either:
+  - A dotted Python identifier (``a.b.c`` where each segment is identifier-safe).
+  - A config-relative path (POSIX-style; no ``..`` segments; no absolute paths;
+    no Windows-style drive prefixes).
 """
 
 from __future__ import annotations
 
+import re
 import tomllib
+from pathlib import PurePosixPath
 from pathlib import Path
 from typing import Any
 
@@ -34,9 +43,77 @@ _ALLOWED_PLUGIN_KEYS: frozenset[str] = frozenset(
 )
 _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset({"plugins"})
 
+# Audit finding #7: dotted Python identifier — each segment must be a valid
+# Python identifier. This admits ``tgirl.plugins.stdlib.math`` and
+# ``my_plugin`` but rejects ``a/b`` and ``../sneaky``.
+_DOTTED_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+# Windows drive-letter prefix (``C:\...``) — rejected explicitly so the
+# absolute-path check works on every platform.
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
 
 class InvalidPluginConfigError(ValueError):
     """Raised for any structural error in a plugin TOML config file."""
+
+
+def _validate_module_field(name: str, value: str) -> None:
+    """Validate the ``module`` field per audit finding #7.
+
+    Accepts:
+      - Dotted Python identifier (``a.b.c``).
+      - Config-relative POSIX-style path with no ``..`` segments.
+      - Bare filename (``plugin.py``) or relative path (``subdir/plugin.py``).
+
+    Rejects:
+      - Absolute paths (``/etc/passwd``, ``C:\\windows\\…``).
+      - Any path containing a ``..`` segment.
+      - Any path with backslashes (Windows path separators) — config files
+        must use POSIX-style paths for cross-platform consistency.
+    """
+    if _DOTTED_IDENT_RE.match(value):
+        return  # dotted Python identifier — fine
+    # Reject Windows drive prefixes (``C:\path`` or ``C:/path``).
+    if _WINDOWS_DRIVE_RE.match(value):
+        msg = (
+            f"[plugins.{name}] module {value!r} is an absolute path "
+            "(Windows drive prefix); plugin paths must be config-relative"
+        )
+        raise InvalidPluginConfigError(msg)
+    # Reject backslash separators outright — POSIX-only contract.
+    if "\\" in value:
+        msg = (
+            f"[plugins.{name}] module {value!r} contains a backslash; "
+            "plugin paths must use POSIX-style forward slashes"
+        )
+        raise InvalidPluginConfigError(msg)
+    # Reject absolute paths.
+    if value.startswith("/"):
+        msg = (
+            f"[plugins.{name}] module {value!r} is an absolute path; "
+            "plugin paths must be config-relative"
+        )
+        raise InvalidPluginConfigError(msg)
+    # Reject any segment that is exactly ".." — covers leading,
+    # middle, and trailing path-traversal attempts. Use PurePosixPath to
+    # split rather than ``str.split("/")`` so we honor the POSIX semantics.
+    parts = PurePosixPath(value).parts
+    if any(part == ".." for part in parts):
+        msg = (
+            f"[plugins.{name}] module {value!r} contains '..' path-traversal; "
+            "plugin paths must not escape the config directory"
+        )
+        raise InvalidPluginConfigError(msg)
+    # If we got here, it's neither a dotted identifier nor a clean relative
+    # path. Examples of what reaches here: empty strings, paths with weird
+    # whitespace, etc. Reject.
+    if not value or value.strip() != value:
+        msg = (
+            f"[plugins.{name}] module {value!r} has invalid leading/trailing "
+            "whitespace or is empty"
+        )
+        raise InvalidPluginConfigError(msg)
+    # Otherwise: a relative POSIX path with at least one segment, no ``..``,
+    # no absolute prefix. Accept.
 
 
 def _capability_from_str(value: str, plugin_name: str) -> Capability:
@@ -76,6 +153,8 @@ def _parse_one_plugin(
     if not isinstance(module, str):
         msg = f"[plugins.{name}] module must be str, got {type(module).__name__}"
         raise InvalidPluginConfigError(msg)
+    # Audit finding #7: validate the path/module shape before downstream use.
+    _validate_module_field(name, module)
 
     allow_raw = raw.get("allow", [])
     if not isinstance(allow_raw, list):

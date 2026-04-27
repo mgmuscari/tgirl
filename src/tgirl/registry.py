@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -22,6 +23,34 @@ from tgirl.types import (
     ToolDefinition,
     TypeRepr,
 )
+
+# Audit finding #6: tool names appear as quoted Lark string terminals in
+# generated grammars. A name containing a quote character splits one
+# terminal into multiple, opening grammar-drift attacks. Validate at
+# registration time with a charset that's safe to drop into a Lark
+# string-terminal slot AND legible as an s-expression head identifier.
+#
+# Pattern: leading letter (matches Python identifier shape and avoids leading
+# digits that would be ambiguous with grammar rule numerics), followed by
+# letters / digits / underscore / dot / hyphen. Plugins commonly use dotted
+# (``<plugin>.<tool>``) and hyphenated names; both are admitted.
+_TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_.-]*$")
+
+
+def _validate_tool_name(name: str) -> None:
+    """Reject tool names that aren't safe to emit as Lark string terminals.
+
+    Single source of truth for the tool-name charset; called from both
+    ``ToolRegistry.tool()`` and ``ToolRegistry.register_from_schema()``.
+    """
+    if not isinstance(name, str) or not _TOOL_NAME_RE.match(name):
+        msg = (
+            f"Tool name {name!r} is invalid; must match "
+            f"{_TOOL_NAME_RE.pattern!r} (start with a letter; allowed "
+            "characters: letters, digits, underscore, dot, hyphen). "
+            "This rule prevents Lark grammar terminal-injection."
+        )
+        raise ValueError(msg)
 
 logger = structlog.get_logger()
 
@@ -139,6 +168,7 @@ class ToolRegistry:
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             name = func.__name__
 
+            _validate_tool_name(name)
             if name in self._tools:
                 msg = f"Tool '{name}' is already registered"
                 raise ValueError(msg)
@@ -202,8 +232,11 @@ class ToolRegistry:
             callable_fn: Execution callable. Defaults to no-op.
 
         Raises:
-            ValueError: If a tool with the same name is already registered.
+            ValueError: If a tool with the same name is already registered,
+                or if the name violates the registration-charset rule
+                (audit finding #6).
         """
+        _validate_tool_name(name)
         if name in self._tools:
             msg = f"Tool '{name}' is already registered"
             raise ValueError(msg)
