@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import re
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -23,6 +24,11 @@ from tgirl.types import (
     ToolDefinition,
     TypeRepr,
 )
+
+if TYPE_CHECKING:
+    # Annotation-only import — runtime cycle avoided via PEP 563
+    # (``from __future__ import annotations``).
+    from tgirl.plugins.types import CapabilityGrant
 
 # Audit finding #6: tool names appear as quoted Lark string terminals in
 # generated grammars. A name containing a quote character splits one
@@ -136,13 +142,10 @@ class ToolRegistry:
         # around invocation. Tools registered via the ``@tool()`` decorator
         # without plugin context (e.g. host-app inline registration) have no
         # entry — ``get_callable`` returns the raw callable in that case.
-        from tgirl.plugins.types import (  # local import: avoids cycle
-            CapabilityGrant,
-        )
-
+        # The ``CapabilityGrant`` type is imported under TYPE_CHECKING above;
+        # the annotation is a forward-string at runtime per ``from __future__
+        # import annotations``.
         self._grants: dict[str, CapabilityGrant] = {}
-        # Forward-declare the ImportError-pinned cycle so mypy sees the type.
-        _ = CapabilityGrant
 
     def tool(
         self,
@@ -465,18 +468,16 @@ class ToolRegistry:
         # Phase B wrapper: enter guard_scope around every invocation. The
         # wrapper preserves the original callable's signature transparently;
         # callers receive the same return value, with the same exception
-        # propagation semantics.
+        # propagation semantics. ``functools.wraps`` copies ``__name__``,
+        # ``__qualname__``, ``__doc__``, ``__module__``, ``__dict__``, and
+        # sets ``__wrapped__`` for ``inspect.unwrap`` chain support.
         from tgirl.plugins.guard import guard_scope  # local: avoids cycle
 
+        @functools.wraps(raw)
         def _grant_scoped(*args: Any, **kwargs: Any) -> Any:
             with guard_scope(grant):
                 return raw(*args, **kwargs)
 
-        # Surface the wrapped callable's identity so introspection still
-        # shows the underlying name. Defensive — registry callers that
-        # rely on ``__name__`` won't be surprised.
-        _grant_scoped.__name__ = getattr(raw, "__name__", name)
-        _grant_scoped.__qualname__ = getattr(raw, "__qualname__", name)
         return _grant_scoped
 
     def sanitized_rule_names(self) -> dict[str, str]:
