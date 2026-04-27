@@ -19,6 +19,7 @@ pass through untouched).
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import importlib.abc
 import importlib.machinery
@@ -97,10 +98,8 @@ def guard_scope(grant: CapabilityGrant) -> Iterator[None]:
                         getattr(parent, child_name, None),
                         CapabilityScopedModule,
                     ):
-                        try:
+                        with contextlib.suppress(AttributeError):
                             delattr(parent, child_name)
-                        except AttributeError:
-                            pass
         # Restore real modules that were present before the scope. Also
         # restore the parent-attribute side effect so cached references
         # outside the guard see the real module again.
@@ -110,12 +109,10 @@ def guard_scope(grant: CapabilityGrant) -> Iterator[None]:
                 parent_name, _, child_name = name.rpartition(".")
                 parent = sys.modules.get(parent_name)
                 if parent is not None:
-                    try:
+                    # Some module types (e.g. extension modules) refuse
+                    # attribute assignment. Best-effort restoration only.
+                    with contextlib.suppress(AttributeError, TypeError):
                         setattr(parent, child_name, mod)
-                    except (AttributeError, TypeError):
-                        # Some module-types (e.g. extension modules) refuse
-                        # attribute assignment. Best-effort restoration only.
-                        pass
 
 
 class CapabilityScopedModule(types.ModuleType):

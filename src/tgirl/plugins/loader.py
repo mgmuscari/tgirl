@@ -138,7 +138,8 @@ def _build_safe_builtins(grant: CapabilityGrant) -> dict[str, object]:
     every legitimate plugin: CPython's ``IMPORT_NAME`` opcode looks up
     ``__import__`` in ``frame.f_builtins`` to execute statement-level
     ``import`` directives. With ``__import__`` absent, even the audit's own
-    Task 4 acceptance test (``test_load_stdlib_math_plugin_in_zero_capability_mode_succeeds``)
+    Task 4 acceptance test
+    (``test_load_stdlib_math_plugin_in_zero_capability_mode_succeeds``)
     fails on its very first ``from tgirl.registry import ToolRegistry`` —
     a stdlib-pattern import the audit explicitly wants to keep working.
 

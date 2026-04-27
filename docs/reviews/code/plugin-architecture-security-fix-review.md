@@ -19,6 +19,7 @@ This review covers the security-fix interstitial commits between PRP Tasks 7 and
 | 4 | `baeb6c6` | Close `from`-form import bypass + Sandbox B test contract + Sig items | LGTM (closes BLOCKING) | #2 complete |
 | 5 | `fc042f1` | Tool-name validator + Lark string-terminal escape + TOML module path | LGTM | #6, #7 |
 | 6 | `4fa9c35` | Phase B grant propagation + #12 doubling-rule test battery | LGTM with 1 Significant test-isolation issue | #1, #12 |
+| 7 | `683e236` | Reviewer-followup hardening across commits 3/5/6 (post-review) | Closes 2 of 3 tracked follow-ups | tightens #3, #5 residual |
 
 ## PRP / Audit Compliance (per finding)
 
@@ -75,6 +76,12 @@ This review covers the security-fix interstitial commits between PRP Tasks 7 and
 
 The security-fix interstitial structurally closes all seven audit-PoC attack chains and the dev-readiness gap from Finding #12. The two open Significants are documented as deferred (#1's sys.modules choice surfacing as #3's test-ordering regression) or acceptable residual (chr-binding bypass collapsed by the runtime sink). Neither blocks merge.
 
-**Verdict: APPROVED for merge** with three tracked follow-ups: (a) Phase B clean-rewrite to eliminate sys.modules mutation; (b) `chr`/`ord` to FORBIDDEN_NAMES; (c) Gate 2 deny-by-default for unmapped modules during plugin context (originally Sig 2 in commit 1's review).
+**Verdict: APPROVED for merge.** Of the three tracked follow-ups, two were closed by the proposer in commit `683e236` after this review was filed:
+
+- (a) ~~Phase B clean-rewrite~~ — partially addressed: `guard_scope` now also walks parent-package `__dict__` and removes cached `CapabilityScopedModule` attributes on exit, hardening the cleanup boundary that surfaced as the test-ordering regression in Issue #1 above. The structural rewrite eliminating sys.modules mutation is still deferred (Task #3 in the running task list, originally audit Finding #3).
+- (b) ~~`chr`/`ord` to FORBIDDEN_NAMES~~ **CLOSED** — added in `683e236`, collapsing the entire string-construction class (Name-binding workaround, `str.join` Call form, f-string `JoinedStr` form) at the AST scan layer. The acceptable residual from Issue #2 is now hardened in depth.
+- (c) Gate 2 deny-by-default for unmapped modules during plugin context — still open (tracked as Task #3 in the team task list).
+
+Test count post-followup: 1682 (the +91 figure cited above was at `4fa9c35`; `683e236` replaced one no-assertion test and added 3 grant-counterparts, net +3 from a different baseline). All 7 audit PoCs remain verifiably closed at HEAD. mypy 0 → 0 maintained.
 
 The original audit's REJECT verdict is overturned by this interstitial. The branch is ready to resume PRP Tasks 8–14 once these commits merge or are confirmed as acceptable on the working branch.

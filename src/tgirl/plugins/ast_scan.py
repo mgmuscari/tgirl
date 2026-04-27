@@ -172,9 +172,7 @@ def _is_string_concat_buildup(expr: ast.expr) -> bool:
             return True
         if isinstance(e, ast.Name):
             return True
-        if isinstance(e, ast.Constant) and isinstance(e.value, str):
-            return True
-        return False
+        return isinstance(e, ast.Constant) and isinstance(e.value, str)
 
     return all_leaves_string_buildable(expr)
 
